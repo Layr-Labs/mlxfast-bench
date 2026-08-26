@@ -1,0 +1,8 @@
+{
+  "version": "0.0.0",
+  "branch": "gemma4-26b-a4b-mlx-v1",
+  "source_commit": "99a75228184b4abb31ad1249adb4fb9970ce6752",
+  "target_triple": "aarch64-apple-darwin",
+  "sha256": "e044e1f43f21a2efd6ae5ee7799c912c2723da600d6e0a3adca95e5629fde4f4",
+  "bytes": 2528464
+}

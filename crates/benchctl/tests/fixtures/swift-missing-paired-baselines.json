@@ -1,0 +1,33 @@
+{
+  "_comment": [
+    "#62 — the §F2 missing-paired-baselines refusal, CAPTURED FROM THE SWIFT SOURCE rather",
+    "than restated in a Rust literal. benchd must emit these bytes exactly; Swift is the",
+    "reference, so anything else is a parity bug.",
+    "",
+    "In Swift the message is three concatenated string literals, which is precisely why a",
+    "prefix-only assertion could not see tail drift:",
+    "",
+    "    throw MLXFastError.invalidInput(",
+    "        \"\\(context) requires external Qwen benchmark baselines for \"",
+    "            + \"both prefill and decode; Gemma baseline constants are \"",
+    "            + \"not valid for Qwen\"",
+    "    )",
+    "",
+    "`context` is the caller's mode name (Swift `options.modeName`), interpolated at the",
+    "FRONT — so one message per mode below, each asserted in full.",
+    "",
+    "Re-capture with:",
+    "  sed -n '346,358p' <reference-harness>/Sources/MLXFastHarness/QwenRuntime.swift"
+  ],
+  "source_file": "Sources/MLXFastHarness/QwenRuntime.swift",
+  "source_symbol": "QwenRuntime.requiredGoldenBenchmarkBaselines(_:context:)",
+  "source_lines": "346-358",
+  "source_commit": "242b19dda0c1a15efce4e921acf030c86fd1fc8d",
+  "source_file_sha256": "2caa233827f889b0827a8f24d2b4d3783bda0196de25c223350002efd2c87ac0",
+  "captured": "2026-08-20",
+  "messages": {
+    "local-iterate": "local-iterate requires external Qwen benchmark baselines for both prefill and decode; Gemma baseline constants are not valid for Qwen",
+    "local-submit": "local-submit requires external Qwen benchmark baselines for both prefill and decode; Gemma baseline constants are not valid for Qwen",
+    "official": "official requires external Qwen benchmark baselines for both prefill and decode; Gemma baseline constants are not valid for Qwen"
+  }
+}

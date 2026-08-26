@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+#
+# pre-commit -- refuse a dist publish whose binary the current source does not
+# produce.
+#
+# Consumers never build benchctl. They resolve a {branch, commit, sha256, bytes}
+# pin and download the bytes in dist/benchctl. The pin is a claim that those
+# bytes are this source, built for this triple. A stale or hand-placed binary
+# makes the claim false, and nothing downstream can detect it. This hook
+# rebuilds from the working tree and byte-compares before the commit exists.
+#
+# Only dist publishes pay the build cost. Commits that leave dist/ alone exit
+# immediately.
+#
+# Enable once per clone:
+#
+#     git config core.hooksPath .githooks
+#
+# Bypass for a deliberate non-publish edit: git commit --no-verify
+set -euo pipefail
+
+staged="$(git diff --cached --name-only)"
+if ! grep -qE '^dist/benchctl(\.manifest\.json)?$' <<< "${staged}"; then
+  exit 0
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "${TMP_DIR}"' EXIT
+
+# Build to a scratch directory. dist/ holds the staged bytes under test, so the
+# default output path would overwrite the very thing being verified.
+BUILD_LOG="${TMP_DIR}/build.log"
+if ! BENCHD_DIST_OUT="${TMP_DIR}/build" "${REPO_ROOT}/scripts/build-dist.sh" \
+      > "${BUILD_LOG}" 2>&1; then
+  cat "${BUILD_LOG}" >&2
+  echo "pre-commit: dist publish refused -- scripts/build-dist.sh failed (output above)." >&2
+  exit 1
+fi
+
+# Compare against the INDEX, not the worktree: the staged bytes are what the
+# commit would carry.
+STAGED_BIN="${TMP_DIR}/staged-benchctl"
+if ! git show :dist/benchctl > "${STAGED_BIN}" 2>/dev/null; then
+  echo "pre-commit: dist publish refused -- dist/benchctl is not in the index." >&2
+  exit 1
+fi
+
+if ! cmp -s "${TMP_DIR}/build/benchctl" "${STAGED_BIN}"; then
+  echo "pre-commit: dist publish refused -- staged dist/benchctl is not what this source builds; re-run scripts/build-dist.sh and stage its output." >&2
+  exit 1
+fi

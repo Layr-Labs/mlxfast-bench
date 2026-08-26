@@ -1,0 +1,435 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mlxfast-bench/schema/engine-protocol-v1.schema.json",
+  "title": "Engine Protocol v1",
+  "description": "Newline-delimited JSON (NDJSON) wire between the trusted benchmarker and an untrusted inference engine, over stdio (co-located) or localhost TCP (via bench-agent / compose network). Every line is exactly one WorkerRequest or one WorkerResponse. Ported from the Swift RuntimeWorkerRequest / RuntimeWorkerResponse Codable structs (Sources/MLXFastHarness/QwenRuntimeWorker.swift) plus the Phase-0 hello handshake fields (docs/architecture.md §3).",
+  "oneOf": [
+    { "$ref": "#/$defs/WorkerRequest" },
+    { "$ref": "#/$defs/WorkerResponse" }
+  ],
+  "$defs": {
+    "WorkerRequest": {
+      "type": "object",
+      "description": "Benchmarker -> engine. Ported from Swift RuntimeWorkerRequest. `id` correlates the response; `kind` selects the message. Optional fields are present only for the kinds that use them and are OMITTED (not null) when unused, matching Swift's encodeIfPresent.",
+      "additionalProperties": false,
+      "required": ["id", "kind"],
+      "properties": {
+        "id": {
+          "type": "integer",
+          "description": "Monotonic request id echoed back on the response. 64-bit signed."
+        },
+        "kind": {
+          "type": "string",
+          "description": "Message kind.",
+          "enum": [
+            "prefill",
+            "decode_begin",
+            "decode_step",
+            "correctness",
+            "correctness_begin",
+            "correctness_step",
+            "phase_diagnostics",
+            "free_decode_begin",
+            "free_decode_run"
+          ]
+        },
+        "prompt_tokens": {
+          "type": "array",
+          "description": "Prompt token IDs. Used by prefill, correctness, correctness_begin.",
+          "items": { "type": "integer" }
+        },
+        "token": {
+          "type": "integer",
+          "description": "Single input token ID. Used by decode_step and correctness_step."
+        },
+        "seed_tokens": {
+          "type": "array",
+          "description": "Whole-prompt seed token IDs for the single charged seed forward. Used by decode_begin.",
+          "items": { "type": "integer" }
+        },
+        "steps": {
+          "type": "integer",
+          "description": "Number of free-run greedy steps. Used by correctness."
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "NEW in v1.1 (additive). Number of committed tokens N the engine must free-run and return. Used by free_decode_run. Appended last; a v1-only request omits it."
+        },
+        "spec": {
+          "$ref": "#/$defs/SpecConfig",
+          "description": "Wire-additive (docs/spec-config-design.md). Per-module speculative configuration for the timed decode window. Carried on decode_begin / free_decode_begin; absent means the engine default. Appended last; a pre-spec request omits it."
+        },
+        "seed_tokens_by_stream": {
+          "type": "array",
+          "description": "NEW in v1.2 (additive, COHORT). Per-stream seed token IDs for a batched free_decode_begin: B inner arrays, one per cohort slot, in SLOT ORDER. The single-stream v1.1 form uses seed_tokens instead; a request carries one or the other, never both. Appended last; a pre-v1.2 request omits it.",
+          "items": {
+            "type": "array",
+            "items": { "type": "integer" }
+          }
+        },
+        "batch_size": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "NEW in v1.2 (additive, COHORT). The explicit cohort width B, carried on free_decode_begin and free_decode_run. Never inferred from an array length; the engine must echo it as effective_batch_size and benchd rejects a divergent echo fail-closed. Presence selects the cohort form of the verb. Appended last."
+        },
+        "replay_seeds_by_stream": {
+          "type": "array",
+          "description": "NEW in (b) admission (engine #35). Per-stream SEED token lists for a cohort_reference_replay: B inner arrays in SLOT ORDER. A dedicated field distinct from seed_tokens_by_stream; the trusted oracle replays teacher-forced and needs each stream's seed context. Rides only on cohort_reference_replay. Appended last.",
+          "items": {
+            "type": "array",
+            "items": { "type": "integer" }
+          }
+        },
+        "committed_by_stream": {
+          "type": "array",
+          "description": "NEW in (b) admission (engine #35). The candidate's COMMITTED token journals to replay teacher-forced: B inner arrays in SLOT ORDER, with committed_by_stream.length == replay_seeds_by_stream.length. Rides only on cohort_reference_replay. Appended last.",
+          "items": {
+            "type": "array",
+            "items": { "type": "integer" }
+          }
+        },
+        "logit_top_k": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "NEW in (b) admission (engine #35). The oracle's logit top-K depth (engine default 16). Audit-only under (b); benchd consumes only sequential_argmax. Appended last."
+        },
+        "rel_envelope": {
+          "type": "number",
+          "description": "NEW in (b) admission (engine #35). The oracle's relative-envelope threshold (engine default 0.05). Audit-only under (b). Appended last."
+        },
+        "replay_width": {
+          "type": "string",
+          "enum": ["cohort", "canonical"],
+          "description": "NEW in (b) admission (engine #37). The reference's replay WIDTH for cohort_reference_replay: 'cohort' replays the B streams batched at the scored candidate's geometry, 'canonical' is the per-stream width-1 diagnostic. The engine refuses any other value. benchd always sends 'cohort' explicitly rather than inheriting the engine-side default: the enforced reference geometry is pinned by the request. Rides only on cohort_reference_replay. Appended last."
+        }
+      }
+    },
+    "WorkerResponse": {
+      "type": "object",
+      "description": "Engine -> benchmarker. Ported from Swift RuntimeWorkerResponse. `id` echoes the request (-1 for a response to an unparseable line); `ok` is the success flag. Optional fields are present only for the kinds that produce them and are OMITTED (not null) when unused, matching Swift's encodeIfPresent. protocol_version / backend / device are new in v1 and meaningful only on the hello (id=0) message.",
+      "additionalProperties": false,
+      "required": ["id", "ok"],
+      "properties": {
+        "id": {
+          "type": "integer",
+          "description": "Echoes the request id; -1 when the request line could not be parsed."
+        },
+        "nonce": {
+          "type": "string",
+          "description": "Per-session nonce established on the hello; echoed on every subsequent response and validated by the parent."
+        },
+        "ok": {
+          "type": "boolean",
+          "description": "True on success. On false the session for that phase is discarded."
+        },
+        "error": {
+          "type": "string",
+          "description": "Human-readable error string, present only when ok is false."
+        },
+        "token": {
+          "type": "integer",
+          "description": "Materialized output token ID. Produced by prefill, decode_step, correctness_begin, correctness_step."
+        },
+        "top_logits": {
+          "type": "array",
+          "description": "Top-K (K=8) logits for the teacher-forced anchor gate. Produced by correctness_begin / correctness_step.",
+          "items": { "$ref": "#/$defs/CorrectnessTraceLogit" }
+        },
+        "seed_token": {
+          "type": "integer",
+          "description": "Token from the single seed forward. Produced by decode_begin."
+        },
+        "tokens": {
+          "type": "array",
+          "description": "Free-run greedy token IDs. Produced by correctness.",
+          "items": { "type": "integer" }
+        },
+        "expert_stats": {
+          "$ref": "#/$defs/ExpertStreamingStats",
+          "description": "Expert-streaming counters. Produced by hello, correctness_begin, correctness_step, phase_diagnostics (NOT plain correctness, which returns only tokens + peak_ram_gb — see PROTOCOL.md). Zeroed for the RAM-resident dense runtime."
+        },
+        "peak_ram_gb": {
+          "type": "number",
+          "description": "Peak resident set size in GB, engine-reported and distrusted for scoring. Produced by correctness, correctness_begin, correctness_step, phase_diagnostics."
+        },
+        "protocol_version": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "NEW in v1. Engine's implemented protocol version (currently 1). Meaningful only on the hello."
+        },
+        "backend": {
+          "type": "string",
+          "description": "NEW in v1. Compute backend, e.g. \"mlx\" or \"cuda\". Meaningful only on the hello."
+        },
+        "device": {
+          "type": "string",
+          "description": "NEW in v1. Device identity, e.g. \"m5\" or \"gb10\". Meaningful only on the hello."
+        },
+        "completed_work": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "NEW in v1. Monotonic count of timed step-requests the engine completed in the current phase, reported on phase_diagnostics. The parent fails the run if it does not equal the number of timed steps it issued (architecture §3, phase-close barrier)."
+        },
+        "cache_memory": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "NEW in v1 (#54). MLX allocator free-buffer cache size in bytes at the phase boundary, mirroring Swift Memory.cacheMemory in resetRuntimeWorkerAllocatorForPhaseStart. Reported on phase_diagnostics; the parent fails the run CLOSED unless it is exactly 0 (Swift's fail-closed drain postcondition). Appended last, back-compat: absent means not asserted; present must be 0."
+        },
+        "capabilities": {
+          "type": "array",
+          "description": "NEW in v1.1 (additive). Capability flags the engine advertises, meaningful only on the hello. Carries \"free_run_decode\" for an engine implementing the oracle-verified free-run timed decode mode. Appended last; a v1-only engine omits it.",
+          "items": { "type": "string" }
+        },
+        "acceptance_lengths": {
+          "type": "array",
+          "description": "NEW in v1.1 (additive). Per verify-round committed count from free_decode_run; length is the round count R. AUDIT-only (never scored), persisted verbatim and cross-checked by the §2.6 consistency triple.",
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "drafted_total": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "NEW in v1.1 (additive). Total draft tokens proposed across all free_decode_run rounds (>= accepted_total; fallback position counts as drafted). AUDIT-only, self-reported."
+        },
+        "accepted_total": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "NEW in v1.1 (additive). Total drafts that passed internal verification and were committed. AUDIT-only, self-reported and distrusted for scoring."
+        },
+        "committed_total": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "NEW in v1.1 (additive). Total committed tokens from free_decode_run; MUST equal N and tokens.len(). Externally anchored by benchd's exact-match verification."
+        },
+        "effective_spec": {
+          "$ref": "#/$defs/SpecConfig",
+          "description": "Wire-additive (docs/spec-config-design.md). The module-parsed, default-filled speculative config the engine will actually run, echoed on the decode_begin / free_decode_begin response. benchd seals only this echo and rejects a leg whose echo diverges from the request. Appended last; a pre-spec engine omits it."
+        },
+        "spec_modes": {
+          "type": "array",
+          "description": "Wire-additive (docs/spec-config-design.md). The runnable speculative modes the engine advertises, meaningful only on the hello. Stub modules are not listed. Appended last; a pre-spec engine omits it.",
+          "items": { "type": "string" }
+        },
+        "head_provenance": {
+          "$ref": "#/$defs/HeadProvenance",
+          "description": "NEW in #106 (passthrough MODEL). The engine's loaded-head provenance (sha256 + byte size + shard file count), emitted on the hello. MODELED so benchd stops rejecting the real engine line under the closed envelope; AUDIT-only. Appended last; a pre-#106 engine omits it."
+        },
+        "mlx_active_memory_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "NEW in #106 (passthrough MODEL). MLX allocator ACTIVE (in-use) memory in bytes, read PRE-DRAIN on phase_diagnostics (distinct from the POST-drain cache_memory). AUDIT-only. Appended last."
+        },
+        "mlx_cache_memory_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "NEW in #106 (passthrough MODEL). MLX allocator free-buffer CACHE memory in bytes, read PRE-DRAIN on phase_diagnostics. Distinct from the post-drain cache_memory (which must be 0 after the drain). AUDIT-only."
+        },
+        "mlx_peak_memory_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "NEW in #106 (passthrough MODEL). MLX allocator PEAK memory watermark in bytes, read PRE-DRAIN on phase_diagnostics. AUDIT-only. Appended last."
+        },
+        "top_logit_margin": {
+          "type": "number",
+          "description": "NEW in #106 (passthrough MODEL). The ALWAYS-present top-logit margin (gap between the top and second logit) on the correctness_* teacher-forced steps. AUDIT-only. Appended last."
+        },
+        "expected_token_logit": {
+          "type": "number",
+          "description": "NEW in #106 (passthrough MODEL). The CONDITIONAL logit of the expected (teacher-forced) token on the correctness_* steps; present only when there is an expected token. AUDIT-only."
+        },
+        "expected_token_rank": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "NEW in #106 (passthrough MODEL). The CONDITIONAL rank of the expected token in the engine's logit ordering on the correctness_* steps; present only alongside expected_token_logit. AUDIT-only. Appended last."
+        },
+        "spec_decoder": {
+          "type": "string",
+          "description": "Decoder-neutral spec-decode abstraction (additive). The name of the speculative decoder that produced this round's data (e.g. mtp / dflash / dspark), emitted on the free_decode_run response so per-round data is self-describing about which decoder generated it, independent of the request's spec.mode. AUDIT-only, never scored. Appended last; an engine that omits it round-trips unchanged."
+        },
+        "max_batch_size": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "NEW in v1.2 (additive, COHORT). The largest cohort width B the engine can serve, advertised on the hello, so benchd can refuse an over-wide cohort pre-GPU. Absent means not advertised. Appended last."
+        },
+        "seed_token_by_stream": {
+          "type": "array",
+          "description": "NEW in v1.2 (additive, COHORT). The B seed-forward token IDs from a batched free_decode_begin, one per cohort slot in SLOT ORDER, each oracle-checked against that slot's expected seed token. The single-stream v1.1 form uses seed_token instead.",
+          "items": { "type": "integer" }
+        },
+        "effective_batch_size": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "NEW in v1.2 (additive, COHORT). The cohort width the engine will actually run, echoed on free_decode_begin / free_decode_run. NEVER-IGNORED like effective_spec: benchd compares it to the requested batch_size and discards the leg fail-closed on divergence."
+        },
+        "tokens_by_stream": {
+          "type": "array",
+          "description": "NEW in v1.2 (additive, COHORT). Committed token IDs from a batched free_decode_run: B inner arrays of N tokens each, in SLOT ORDER, every token exact-matched benchd-side against that slot's golden continuation. Replaces (never accompanies) tokens in the cohort form.",
+          "items": {
+            "type": "array",
+            "items": { "type": "integer" }
+          }
+        },
+        "natural_accepted_by_stream": {
+          "type": "array",
+          "description": "NEW in v1.2 (additive, COHORT). Each row's PRE-min natural accept-walk length per round: B inner arrays of R counts, in SLOT ORDER. AUDIT-only, never scored. The cohort commits one common width per round (the min across rows), so this is what makes straggler throttling visible instead of silently folded into the committed width.",
+          "items": {
+            "type": "array",
+            "items": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "rounds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "NEW in v1.2 (additive, COHORT). The round count R the engine ran. Redundant with acceptance_lengths.len() by design; benchd cross-checks the two and refuses a response that disagrees with itself."
+        },
+        "active_streams_by_round": {
+          "type": "array",
+          "description": "NEW in v1.2 (additive, COHORT). Number of streams still generating at each round, length R. Under the closed fixed-N cohort policy this must be non-increasing. AUDIT-only, never scored.",
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "depth_clamp_reasons": {
+          "type": "object",
+          "description": "NEW in v1.2 (additive, COHORT). Histogram of the engine's depth-clamp reasons over the window (e.g. automatic_rectangular_limit, tail_depth, batch_gate, step_kv_headroom, rectangular_cache_unsupported). AUDIT-only, never scored, sealed verbatim; this is what makes 'did it actually speculate?' checkable rather than trusted.",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        },
+        "prefill_ns_by_stream": {
+          "type": "array",
+          "description": "Per-stream timing instrumentation (per-stream-instrumentation-spec.md step 1, additive COHORT). Per-slot monotonic nanoseconds from cohort-prefill start to that slot's seed commit, one per cohort slot in SLOT ORDER, on a batched free_decode_begin response. Gated by the per_stream_timing hello capability. RAW engine clock reads only; UNTRUSTED for scoring until benchd's attestation admits them. Currently REPORT-ONLY.",
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "decode_ns_by_stream": {
+          "type": "array",
+          "description": "Per-stream timing instrumentation (per-stream-instrumentation-spec.md step 1, additive COHORT). Per-slot monotonic nanoseconds from decode-phase start to that slot's final-token commit, one per cohort slot in SLOT ORDER, on a batched free_decode_run response. Same capability gate and untrusted-until-attested posture as prefill_ns_by_stream.",
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "cohort_reference_replay": {
+          "$ref": "#/$defs/CohortReferenceReplayReport",
+          "description": "NEW in (b) admission (engine #35). The TRUSTED oracle's cohort_reference_replay report: the per-stream reference argmax for each replayed position. Present only on a cohort_reference_replay response. benchd consumes committed_token (N2 echo integrity) and sequential_argmax (the reference argmax for the <=10% per-stream tolerance gate). Appended last."
+        }
+      }
+    },
+    "CohortReferenceReplayReport": {
+      "type": "object",
+      "description": "(b) admission (engine #35). The trusted oracle's per-stream reference-argmax report. Not additionalProperties:false: the engine may emit a richer audit payload than (b) reads; the two load-bearing position fields (committed_token, sequential_argmax) are required.",
+      "required": ["streams"],
+      "properties": {
+        "logit_provenance": { "type": "string", "description": "Logit provenance tag (e.g. post_softcap). Audit-only." },
+        "logit_topk": { "type": "integer", "description": "Logit top-K the oracle ran. Audit-only." },
+        "rel_envelope": { "type": "number", "description": "Relative envelope the oracle ran. Audit-only." },
+        "replay_width": { "type": "string", "enum": ["cohort", "canonical"], "description": "NEW in (b) admission (engine #37). The replay WIDTH the oracle actually ran at, echoed back. NOT audit-only: when present benchd asserts it against the width the request pinned, fail-closed. Absent on an engine that does not yet stamp it; the assertion is presence-conditioned and arms itself when the stamp lands." },
+        "streams": {
+          "type": "array",
+          "description": "Per-stream replay results, in SLOT ORDER.",
+          "items": { "$ref": "#/$defs/CohortReferenceReplayStream" }
+        }
+      }
+    },
+    "CohortReferenceReplayStream": {
+      "type": "object",
+      "description": "(b) admission. One cohort stream's replay results: its slot index plus per-position reference data.",
+      "required": ["slot", "positions"],
+      "properties": {
+        "slot": { "type": "integer", "description": "The cohort slot this stream occupies (SLOT ORDER identity)." },
+        "positions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/CohortReferenceReplayPosition" }
+        }
+      }
+    },
+    "CohortReferenceReplayPosition": {
+      "type": "object",
+      "description": "(b) admission. One replayed position's reference data. committed_token + sequential_argmax are required (the two fields (b) consumes); everything else is audit-only. NOT additionalProperties:false: a richer engine payload must decode without failing.",
+      "required": ["committed_token", "sequential_argmax"],
+      "properties": {
+        "committed_token": { "type": "integer", "description": "The candidate's committed token the oracle replayed, echoed back. benchd verifies this equals the candidate's own tokens_by_stream (byte/id) BEFORE counting mismatches (N2)." },
+        "sequential_argmax": { "type": "integer", "description": "The reference argmax at this position (== ranked_tokens[0]) — the reference token the committed token is compared against for the <=10% per-stream tolerance gate." },
+        "ranked_tokens": { "type": "array", "items": { "type": "integer" }, "description": "Audit-only." },
+        "ranked_logits": { "type": "array", "items": { "type": "number" }, "description": "Audit-only." },
+        "ranked_relative_gaps": { "type": "array", "items": { "type": "number" }, "description": "Audit-only." },
+        "committed_token_logit": { "type": "number", "description": "Audit-only." },
+        "committed_relative_gap": { "type": "number", "description": "Audit-only." },
+        "within_envelope_depth": { "type": "integer", "description": "Audit-only." }
+      }
+    },
+    "SpecConfig": {
+      "type": "object",
+      "description": "Per-module speculative configuration (docs/spec-config-design.md). Exactly one mode; the per-mode block is nested under the mode key. serial carries no block. Depth is a module field (mtp.depth), never a top-level flag.",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "description": "The selected speculative mode.",
+          "enum": ["serial", "mtp", "dflash", "dspark"]
+        },
+        "mtp": {
+          "$ref": "#/$defs/MtpSpec",
+          "description": "The mtp module block; present only when mode is mtp."
+        },
+        "dflash": {
+          "type": "object",
+          "description": "The dflash module block; opaque to benchd, present only when mode is dflash."
+        },
+        "dspark": {
+          "type": "object",
+          "description": "The dspark module block; opaque to benchd (reserved), present only when mode is dspark."
+        }
+      }
+    },
+    "MtpSpec": {
+      "type": "object",
+      "description": "The mtp module config block. Depth is the module's field; benchd carries it and bounds-checks it against the anti-DDoS cap before spawning.",
+      "additionalProperties": false,
+      "required": ["depth"],
+      "properties": {
+        "depth": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The MTP draft depth the module runs."
+        }
+      }
+    },
+    "HeadProvenance": {
+      "type": "object",
+      "description": "NEW in #106 (passthrough MODEL). The engine's loaded-head provenance emitted on the hello: the sha256 of the head bytes the engine loaded, the total on-disk byte size, and the shard file count. All three are required inside the object; AUDIT/provenance only (never scored).",
+      "additionalProperties": false,
+      "required": ["sha256", "bytes", "file_count"],
+      "properties": {
+        "sha256": { "type": "string", "description": "Sha256 of the head bytes the engine loaded." },
+        "bytes": { "type": "integer", "minimum": 0, "description": "Total on-disk byte size of the head." },
+        "file_count": { "type": "integer", "minimum": 0, "description": "Number of shard files comprising the head." }
+      }
+    },
+    "CorrectnessTraceLogit": {
+      "type": "object",
+      "description": "Ported from Swift CorrectnessTraceLogit (Sources/MLXFastHarness/QwenRuntime.swift). No CodingKeys, so JSON keys are literally token/logit.",
+      "additionalProperties": false,
+      "required": ["token", "logit"],
+      "properties": {
+        "token": { "type": "integer", "description": "Token ID." },
+        "logit": { "type": "number", "description": "Logit value (f64)." }
+      }
+    },
+    "ExpertStreamingStats": {
+      "type": "object",
+      "description": "Ported from Swift ExpertStreamingStats (Sources/MLXFastCore/ExpertStreamingStats.swift). All fields required; the dense RAM-resident runtime reports the zero struct.",
+      "additionalProperties": false,
+      "required": [
+        "expert_cache_hits",
+        "expert_cache_misses",
+        "expert_cache_evictions",
+        "expert_bytes_read",
+        "expert_read_seconds",
+        "expert_peak_cached_tensors"
+      ],
+      "properties": {
+        "expert_cache_hits": { "type": "integer", "minimum": 0 },
+        "expert_cache_misses": { "type": "integer", "minimum": 0 },
+        "expert_cache_evictions": { "type": "integer", "minimum": 0 },
+        "expert_bytes_read": { "type": "integer", "minimum": 0 },
+        "expert_read_seconds": { "type": "number" },
+        "expert_peak_cached_tensors": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

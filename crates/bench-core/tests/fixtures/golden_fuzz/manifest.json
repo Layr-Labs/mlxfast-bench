@@ -1,0 +1,1662 @@
+{
+  "corpus": "golden_fuzz",
+  "purpose": "M-4 structure-aware fuzz corpus for the golden loader accept/reject decision",
+  "seed": 20260817,
+  "required_model_type": "gemma4_text",
+  "steps": 64,
+  "prompt_tokens": 1024,
+  "vocab_size": 262144,
+  "count": 183,
+  "accept": 4,
+  "reject": 179,
+  "predicted_swift_divergences": 15,
+  "fixtures": [
+    {
+      "file": "valid.json",
+      "expected_rust": "ACCEPT",
+      "swift_diverges": false,
+      "sha256": "edd44040b7d85b02da7d3639e19fb4068fed803d4316fc40411d9249cbaef27b",
+      "bytes": 17474,
+      "mutation": "none",
+      "note": "canonical golden \u2014 accepted by both loaders"
+    },
+    {
+      "file": "valid_with_behavior.json",
+      "expected_rust": "ACCEPT",
+      "swift_diverges": false,
+      "sha256": "0cb79b078874acfdfaf883f8ca003bf256291199729bc9a38f673362c55b14d6",
+      "bytes": 17587,
+      "mutation": "add behavior gate",
+      "note": "canonical golden plus a well-formed behavior gate"
+    },
+    {
+      "file": "valid_cases_only.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "0d34aeaaed0e3e74d740ef6f42705b4c965917de09f303bc6fc15e6a3a18a528",
+      "bytes": 4331,
+      "mutation": "drop optional sections",
+      "note": "#77 FIXED: benchctl now requires the benchmark oracle by default \u2192 both loaders REJECT \u2192 divergence closed."
+    },
+    {
+      "file": "valid_anchor_optional_null.json",
+      "expected_rust": "ACCEPT",
+      "swift_diverges": false,
+      "sha256": "867ee55759ca7ad1303768c5e8091cc4cbb2270e23c62a7b7e1e39be7abf3c5a",
+      "bytes": 17514,
+      "mutation": "per-case optional = null",
+      "note": "anchor optional fields explicitly null -> decoded as absent by both loaders"
+    },
+    {
+      "file": "valid_extra_expected_tokens.json",
+      "expected_rust": "ACCEPT",
+      "swift_diverges": false,
+      "sha256": "f9f374a910687108f2dd810364e59aaa7a406fa60e7a4e73e08dee87ea3091c1",
+      "bytes": 17538,
+      "mutation": "expected_tokens length > steps",
+      "note": "expected_tokens longer than required steps is accepted (>= not ==)"
+    },
+    {
+      "file": "model_type_missing.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "4e02c8643642e0ec257c824e3ee12c14bf1f9964435c8ebd6022c89caed54d6a",
+      "bytes": 17484,
+      "mutation": "drop model_type",
+      "note": "model_type absent; benchmark loader requires model_type==gemma4_text"
+    },
+    {
+      "file": "model_type_wrong_00.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "dc89fe7cb3400665308e2aa256f2891147eb587a33b4a816e2cc6e2beb08b912",
+      "bytes": 17525,
+      "mutation": "model_type='qwen3_5_text'",
+      "note": "model_type != gemma4_text"
+    },
+    {
+      "file": "model_type_wrong_01.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "13c9961ea4542f056e9d9ecbadeabe1032c902dd22ad143bc5c4611cdac25c7e",
+      "bytes": 17502,
+      "mutation": "model_type='gemma4'",
+      "note": "model_type != gemma4_text"
+    },
+    {
+      "file": "model_type_wrong_02.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "4db2cb79e4ea7133be0830155f4a863fa87848e842cb68e85fde1f1e208f76fe",
+      "bytes": 17464,
+      "mutation": "model_type='gemma4.text'",
+      "note": "model_type != gemma4_text"
+    },
+    {
+      "file": "model_type_wrong_03.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "212e2c5f79eb21d6a3a5e8363dff6b3a10c7b427981038cc6d9db6b4d0a295dc",
+      "bytes": 17471,
+      "mutation": "model_type='llama'",
+      "note": "model_type != gemma4_text"
+    },
+    {
+      "file": "model_type_wrong_04.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "d7d449e92ec5d40afd1c5d2d936f74e17f59ce4c2bc783de2800698c799dc80a",
+      "bytes": 17491,
+      "mutation": "model_type='gemma'",
+      "note": "model_type != gemma4_text"
+    },
+    {
+      "file": "model_type_wrong_05.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "6083e5c620fd4fd7446b6907ee132587ea6087b7502a98d1bf36874f6d87f23d",
+      "bytes": 17518,
+      "mutation": "model_type='GEMMA4_TEXT'",
+      "note": "model_type != gemma4_text"
+    },
+    {
+      "file": "model_type_wrong_06.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "a53b474b40ba39538c004616ef3ddd685195806ff40909bbe06377a8693300c4",
+      "bytes": 17508,
+      "mutation": "model_type='gemma4_text_v2'",
+      "note": "model_type != gemma4_text"
+    },
+    {
+      "file": "model_type_wrong_07.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "829a1fbd97a3b620cf9b111db5fb4127b5ac9fd9be9f77313f8e49dafbbb60ac",
+      "bytes": 17472,
+      "mutation": "model_type='text'",
+      "note": "model_type != gemma4_text"
+    },
+    {
+      "file": "model_type_wrong_08.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "e6485400ee0712fb8497c312c2fdaafe001a58c7b956719dd61326eb345db8e1",
+      "bytes": 17522,
+      "mutation": "model_type='gemma_text'",
+      "note": "model_type != gemma4_text"
+    },
+    {
+      "file": "model_type_empty.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "e04d032f822ebe65bda4eb868560c9407ba9fa7bf6817cef561ec4ac9d2f79ba",
+      "bytes": 17435,
+      "mutation": "model_type=''",
+      "note": "empty model_type string"
+    },
+    {
+      "file": "model_type_leading_ws.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "4404c8692ad2937e5e63aa523bfa22923808f4af9372cebf345d883e3a8accec",
+      "bytes": 17479,
+      "mutation": "model_type=' gemma4_text'",
+      "note": "untrimmed model_type (leading whitespace)"
+    },
+    {
+      "file": "model_type_trailing_ws.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "9e78743b6bcac25ae778a47509e673ad608204df3f787bc0dc65b2621f789566",
+      "bytes": 17437,
+      "mutation": "model_type='gemma4_text '",
+      "note": "untrimmed model_type (trailing whitespace)"
+    },
+    {
+      "file": "model_type_null.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "5ffb409514c3ca5f8604af52b9d8f88225efc21088e4dfc302f884bac7dff254",
+      "bytes": 17488,
+      "mutation": "model_type=null",
+      "note": "explicit null model_type rejected by deny_explicit_null (Swift too)"
+    },
+    {
+      "file": "model_type_number.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "75fe142b4654ec7b2e4d2bd710fddd8cfdd97e3a1cd526ba1091dfb079de2f4a",
+      "bytes": 17468,
+      "mutation": "model_type=7",
+      "note": "model_type wrong type (number)"
+    },
+    {
+      "file": "model_type_bool.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "7557b8f1d2245ca38e05b04aa7150bdafdd7e5d835901f9bd4d5e12eb72c235f",
+      "bytes": 17468,
+      "mutation": "model_type=true",
+      "note": "model_type wrong type (bool)"
+    },
+    {
+      "file": "model_type_array.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "3e6ffa8530a2b7e2c761efcae5ddfaea552ac2fd52fc9424b1644cb75fead286",
+      "bytes": 17502,
+      "mutation": "model_type=[...]",
+      "note": "model_type wrong type (array)"
+    },
+    {
+      "file": "model_type_object.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "663610cbf8b74f117bcfb6a2ae051f0fc89d7a48c0ea37ba38f9355c42575c91",
+      "bytes": 17522,
+      "mutation": "model_type={...}",
+      "note": "model_type wrong type (object)"
+    },
+    {
+      "file": "version_wrong_00.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "6c96cc620041b018df8ba9cee7a741156ad4d3877299dc20000b26b338bd5321",
+      "bytes": 17506,
+      "mutation": "version=0",
+      "note": "version must be exactly 1"
+    },
+    {
+      "file": "version_wrong_01.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "1ea7df2ed94ffaa34596f3eb7d99a350397a35ef25fce834ba427807408144ab",
+      "bytes": 17477,
+      "mutation": "version=2",
+      "note": "version must be exactly 1"
+    },
+    {
+      "file": "version_wrong_02.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "53195e1284bad66d0fd51ea0c61f567d85b306b7261665ceee227c2dce86022f",
+      "bytes": 17486,
+      "mutation": "version=-1",
+      "note": "version must be exactly 1"
+    },
+    {
+      "file": "version_wrong_03.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "3e40fa92cf4a197c0f36cb6475cde227b2ef60559d9140d6cea56dd220b4d632",
+      "bytes": 17465,
+      "mutation": "version=100",
+      "note": "version must be exactly 1"
+    },
+    {
+      "file": "version_wrong_04.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "67106273494fb1d80ca0c83acddb32d7d355dcbfdfa4827695847d36037601c3",
+      "bytes": 17479,
+      "mutation": "version=3",
+      "note": "version must be exactly 1"
+    },
+    {
+      "file": "version_missing.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "6f123d71ae0b429a6bf7ffa815daec0d758357bea0963ebd541643ae84eec594",
+      "bytes": 17470,
+      "mutation": "drop version",
+      "note": "version must be present and 1"
+    },
+    {
+      "file": "version_string.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "1f4cd94a5551c489965b84b87b825b35aef4b7548e0d8601a9802c2210ef78a6",
+      "bytes": 17456,
+      "mutation": "version='1'",
+      "note": "version wrong type (string)"
+    },
+    {
+      "file": "version_float.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "3c1cd0152f9e14c4a927df0b65bd24be2aeb3849bbba4112aa2f285fc5b77e4e",
+      "bytes": 17541,
+      "mutation": "version=1.5",
+      "note": "version wrong type (non-integer float)"
+    },
+    {
+      "file": "version_bool.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "9af45b1adb6dbbb85f263f2ce6b928ee169e983e7ced4024bcea3be381404c50",
+      "bytes": 17492,
+      "mutation": "version=true",
+      "note": "version wrong type (bool)"
+    },
+    {
+      "file": "version_null.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "7524902da9beed527b32206ebab205e5a63989d19b6e6d2edde6aa1759c55ce3",
+      "bytes": 17506,
+      "mutation": "version=null",
+      "note": "version null (optional field, but must equal 1)"
+    },
+    {
+      "file": "version_array.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "f409323a9ee60dd751b570b1ceff1b1a1025cb3417b099b94360c24f9d05efa4",
+      "bytes": 17527,
+      "mutation": "version=[1]",
+      "note": "version wrong type (array)"
+    },
+    {
+      "file": "unknown_top_key_00.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "822095bfe5c2f880423f88b7f29aff4c1f016a03bc746069181787b3b384e72c",
+      "bytes": 17498,
+      "mutation": "add top-level key 'bogus'",
+      "note": "unknown top-level key; Swift key-set-validates the top level -> shared REJECT"
+    },
+    {
+      "file": "unknown_top_key_01.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "36d0a330bc61f796d49bf98665f5e2bd6780c7e03362e4ba862159dbefe05f56",
+      "bytes": 17495,
+      "mutation": "add top-level key 'model_provenance'",
+      "note": "unknown top-level key (model_provenance: unknown INNER key model_id); Swift key-set-validates both levels -> shared REJECT"
+    },
+    {
+      "file": "unknown_top_key_02.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "6b7b074cc159a88a28861bbb4d79c7d637cd6d287d63769fa2be2a30fffb7a21",
+      "bytes": 17512,
+      "mutation": "add top-level key 'extra'",
+      "note": "unknown top-level key; Swift key-set-validates the top level -> shared REJECT"
+    },
+    {
+      "file": "unknown_top_key_03.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "7677c168985f6ad5df2d905df811b2d3bf319862cf9a43bf4949654a5509d97e",
+      "bytes": 17501,
+      "mutation": "add top-level key 'notes'",
+      "note": "unknown top-level key; Swift key-set-validates the top level -> shared REJECT"
+    },
+    {
+      "file": "unknown_top_key_04.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "38d7cf7222185cfa2c483e4acb12b55c52ac8435032f45f668e26af8f5d92bd0",
+      "bytes": 17497,
+      "mutation": "add top-level key 'signature'",
+      "note": "unknown top-level key; Swift key-set-validates the top level -> shared REJECT"
+    },
+    {
+      "file": "unknown_top_key_05.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "c8bce56424b904c67e746789fa84d6b748e5dbb320dafcc8a07443f59ccb782b",
+      "bytes": 17491,
+      "mutation": "add top-level key '_meta'",
+      "note": "unknown top-level key; Swift key-set-validates the top level -> shared REJECT"
+    },
+    {
+      "file": "cases_missing.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "8b61bb4c68ee4b2d06bbbf5d78ffc6d3206c1fafc74f634f0620ac24c3959e5d",
+      "bytes": 13186,
+      "mutation": "drop cases",
+      "note": "cases is required"
+    },
+    {
+      "file": "cases_null.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "aba5925b9e358bc0639b80821e1f04107c4f127b2a991099a66b964c3ff49712",
+      "bytes": 13209,
+      "mutation": "cases=null",
+      "note": "cases explicitly null (required Vec)"
+    },
+    {
+      "file": "cases_empty.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "9017fb189157fd137bc4d6f937af76895ececa0be53885098e54c801958ed908",
+      "bytes": 13193,
+      "mutation": "cases=[]",
+      "note": "cases must be non-empty"
+    },
+    {
+      "file": "cases_object.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "27213a1876d38fbc22c04f7cdbb2d252a378be1f7fe1749212ab1629be9fa444",
+      "bytes": 17503,
+      "mutation": "cases={...}",
+      "note": "cases wrong type (object not array)"
+    },
+    {
+      "file": "cases_number.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "63b4d78735179d2bdc40ed320da22db9061bde532eb9b6219b93ae6edbfc8063",
+      "bytes": 13189,
+      "mutation": "cases=3",
+      "note": "cases wrong type (number)"
+    },
+    {
+      "file": "cases_string.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "03a943cd46f23dd629008d592fe5897e4b280b4cc709f3eb4ed4d007dd72b7ba",
+      "bytes": 13183,
+      "mutation": "cases='c1'",
+      "note": "cases wrong type (string)"
+    },
+    {
+      "file": "case_missing_name.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "ce248b84c88ccd9e792ea9b08ccf85caf84b655d58a48de6f42c5b544a1cdacb",
+      "bytes": 17480,
+      "mutation": "drop case.name",
+      "note": "base case missing required name"
+    },
+    {
+      "file": "case_missing_prompt.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "9a7181244b287f7b964d879e956c6ba66c600ce9d6604d763b393bd362ea540f",
+      "bytes": 13513,
+      "mutation": "drop case.prompt_tokens",
+      "note": "base case missing required prompt_tokens"
+    },
+    {
+      "file": "case_missing_expected.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "b4323787065d393d404ed7b733fb7536c72e72546242f8e5f92c69ec83516357",
+      "bytes": 17209,
+      "mutation": "drop case.expected_tokens",
+      "note": "base case missing required expected_tokens"
+    },
+    {
+      "file": "case_name_empty.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "49ed3e67c7b15e945c456e5745d398851fbee9fc810a93558703704ebdbe3132",
+      "bytes": 17487,
+      "mutation": "case.name=''",
+      "note": "base case name empty"
+    },
+    {
+      "file": "case_name_leading_ws.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "98d3b68c84a80817ea5b23922ecece8fbda94403ee62e0c649e856d82d7805c4",
+      "bytes": 17497,
+      "mutation": "case.name=' c1'",
+      "note": "base case name has leading whitespace"
+    },
+    {
+      "file": "case_name_trailing_ws.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "1171de47669d3127056c874af635371057b0f38f8ebf8116d832ba4661008cb8",
+      "bytes": 17480,
+      "mutation": "case.name='c1 '",
+      "note": "base case name has trailing whitespace"
+    },
+    {
+      "file": "case_name_control.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "420cd2d4483d6a2a5d4106ef8fd77946ab7d17655b2e2c00cc98d7948d976d5d",
+      "bytes": 17498,
+      "mutation": "case.name='c\\t1'",
+      "note": "base case name contains a control character"
+    },
+    {
+      "file": "case_name_number.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "aef1a9b914e50a24c4cafb288278559f393e8dc800c34bb815a85b32063ad540",
+      "bytes": 17484,
+      "mutation": "case.name=5",
+      "note": "base case name wrong type (number)"
+    },
+    {
+      "file": "case_name_null.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "241e29b2f326293259c30ca54c1c69ccb1ed23eead86a61d6e788a95c1c2a9f3",
+      "bytes": 17465,
+      "mutation": "case.name=null",
+      "note": "base case name null (required String)"
+    },
+    {
+      "file": "case_prompt_count_00.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "a3fc1d2aa64bcd7347e0db623593cab2cf02de85e0c74bf96cd80beb1a20ae6b",
+      "bytes": 17502,
+      "mutation": "prompt_tokens len=1023",
+      "note": "prompt_tokens must be exactly 1024"
+    },
+    {
+      "file": "case_prompt_count_01.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "baa82da868c55563484d8cba7252e992645e07c38a1be18323e27a1de0c76e73",
+      "bytes": 17446,
+      "mutation": "prompt_tokens len=1025",
+      "note": "prompt_tokens must be exactly 1024"
+    },
+    {
+      "file": "case_prompt_count_02.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "237a6a279ff0f1ce63830cf1028e2b40ee64081cdce20a55ef982e68bf431cfe",
+      "bytes": 13491,
+      "mutation": "prompt_tokens len=0",
+      "note": "prompt_tokens must be exactly 1024"
+    },
+    {
+      "file": "case_prompt_count_03.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "dba159c472c7214a392274bc7bc8bab9cbccfa5d62d2e41a620e071f6b5afdab",
+      "bytes": 14516,
+      "mutation": "prompt_tokens len=256",
+      "note": "prompt_tokens must be exactly 1024"
+    },
+    {
+      "file": "case_prompt_count_04.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "5be54989265047d04bf45dcbe263af37bc259a349640d2e8d873d3f9f078c852",
+      "bytes": 15490,
+      "mutation": "prompt_tokens len=512",
+      "note": "prompt_tokens must be exactly 1024"
+    },
+    {
+      "file": "case_expected_count_00.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "ae26b435194a8ff80482cdec8c000cd8296f97742f43849607a7b9fe748162cd",
+      "bytes": 17456,
+      "mutation": "expected_tokens len=63",
+      "note": "expected_tokens must be at least 64"
+    },
+    {
+      "file": "case_expected_count_01.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "7845b12f615502ffbe77fe53c6099de1b57b1659391a41fe6444d934d34e1c32",
+      "bytes": 17240,
+      "mutation": "expected_tokens len=0",
+      "note": "expected_tokens must be at least 64"
+    },
+    {
+      "file": "case_expected_count_02.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "1092ab30a25f41f6cb2de298dc9587f28e2aac6d6276d15c187f275749ed7536",
+      "bytes": 17253,
+      "mutation": "expected_tokens len=1",
+      "note": "expected_tokens must be at least 64"
+    },
+    {
+      "file": "case_expected_count_03.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "3f66299a56f5f266d8397b5a44f07b8311dbfb90a62ffb29dc7e5a20948b5891",
+      "bytes": 17349,
+      "mutation": "expected_tokens len=32",
+      "note": "expected_tokens must be at least 64"
+    },
+    {
+      "file": "case_token_oob_00.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "495d21c125e0995304b24d35e4d396c407651eb7c26015b6a70d67aa594eaca3",
+      "bytes": 17498,
+      "mutation": "prompt_tokens has -1",
+      "note": "out-of-range token -1 in prompt_tokens (valid range 0..262144)"
+    },
+    {
+      "file": "case_token_oob_01.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "68d8dfe30e77db5105a81ea42e95eac2a36be9267a620f3513e060098968b9c5",
+      "bytes": 17494,
+      "mutation": "prompt_tokens has 262144",
+      "note": "out-of-range token 262144 in prompt_tokens (valid range 0..262144)"
+    },
+    {
+      "file": "case_token_oob_02.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "32d70873c75cbc7fe1d06fa686bcd057dcc704e384f42a38efc0f2d5f45d6132",
+      "bytes": 17472,
+      "mutation": "prompt_tokens has 262145",
+      "note": "out-of-range token 262145 in prompt_tokens (valid range 0..262144)"
+    },
+    {
+      "file": "case_token_oob_03.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "22a66012f1947db2a6e86a730f1ccea43093b868c57e9cd0a44f4c0e761a672f",
+      "bytes": 17492,
+      "mutation": "prompt_tokens has 1099511627776",
+      "note": "out-of-range token 1099511627776 in prompt_tokens (valid range 0..262144)"
+    },
+    {
+      "file": "case_token_oob_04.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "1d719400161431be3ce81565892af2dcb25df854f8e47e8a3f16d59260f9aa2c",
+      "bytes": 17465,
+      "mutation": "expected_tokens has -1",
+      "note": "out-of-range token -1 in expected_tokens (valid range 0..262144)"
+    },
+    {
+      "file": "case_token_oob_05.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "5f6f4723ba71d757c6c134fa78a21d3548db061531440bc8fcd8db8a71846cd3",
+      "bytes": 17488,
+      "mutation": "expected_tokens has 262144",
+      "note": "out-of-range token 262144 in expected_tokens (valid range 0..262144)"
+    },
+    {
+      "file": "case_token_oob_06.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "12c395b841fb91561e5389ede8f82a6a6c48e0d1cc27752ec8cce6c053e8a857",
+      "bytes": 17529,
+      "mutation": "expected_tokens has -1099511627776",
+      "note": "out-of-range token -1099511627776 in expected_tokens (valid range 0..262144)"
+    },
+    {
+      "file": "case_prompt_string_elem.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "aa9438b942cd7ce537cba665b9a199173ecdfd27062f7ba16e69986914d0e90b",
+      "bytes": 17618,
+      "mutation": "prompt_tokens elem=string",
+      "note": "prompt_tokens element wrong type (string)"
+    },
+    {
+      "file": "case_prompt_float_elem.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "a7f39a11a2bc71467749deb745be2f45738dd7e9084477b186d7090a6290a94a",
+      "bytes": 17596,
+      "mutation": "prompt_tokens elem=float",
+      "note": "prompt_tokens element wrong type (non-integer float)"
+    },
+    {
+      "file": "case_prompt_null_elem.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "06654fb46be8e77af10eb7bf72789c003d29798fccbfa4284f529b52261c32ae",
+      "bytes": 18652,
+      "mutation": "prompt_tokens elem=null",
+      "note": "prompt_tokens element null"
+    },
+    {
+      "file": "case_prompt_not_array.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "b68f3726a46f4ad22c17cfdc156beb8bfc88cd6de398bfbe03495de97cbcddf6",
+      "bytes": 13490,
+      "mutation": "prompt_tokens=5",
+      "note": "prompt_tokens wrong type (number not array)"
+    },
+    {
+      "file": "case_expected_nested_array.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "f0deec8e588186503539cf1625f5e1506b27f61deb829e6144212da4c3a17817",
+      "bytes": 17480,
+      "mutation": "expected_tokens elem=array",
+      "note": "expected_tokens element wrong type (nested array)"
+    },
+    {
+      "file": "case_not_object.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "dc22894fc5f215ac3d52ab498d547a7123a1a2a09c4a5dc7eeee692329998b43",
+      "bytes": 13196,
+      "mutation": "cases[0]=array",
+      "note": "base case is not an object"
+    },
+    {
+      "file": "case_duplicate_name.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "51db7ec47488df5f43b44b1c9e20f6e73a0400896ac4a0aa03102129e23dad4c",
+      "bytes": 21818,
+      "mutation": "two cases named 'c1'",
+      "note": "duplicate base case name"
+    },
+    {
+      "file": "case_unknown_key_00.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": true,
+      "sha256": "f6d1201a8b67f44eca7e953213b2185bd170e27b1a850e63af995372f94be1ce",
+      "bytes": 17499,
+      "mutation": "base case unknown key 'acepted_tokens'",
+      "note": "unknown per-case key: Rust deny_unknown_fields REJECTS; Swift JSONDecoder DROPS -> ACCEPT (INTENTIONAL divergence, Rust stricter, anti-cheat)"
+    },
+    {
+      "file": "case_unknown_key_01.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": true,
+      "sha256": "77f10f552d7751b4447b5a1f127aa3a7c2cb4bda3389dca718be699483e7f10e",
+      "bytes": 17488,
+      "mutation": "base case unknown key 'prompt_token'",
+      "note": "unknown per-case key: Rust deny_unknown_fields REJECTS; Swift JSONDecoder DROPS -> ACCEPT (INTENTIONAL divergence, Rust stricter, anti-cheat)"
+    },
+    {
+      "file": "case_unknown_key_02.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": true,
+      "sha256": "0653b70014cd9dceb2164d2776d6dd5272be360333466eaeb5df9979eb43bf52",
+      "bytes": 17485,
+      "mutation": "base case unknown key 'expected_token'",
+      "note": "unknown per-case key: Rust deny_unknown_fields REJECTS; Swift JSONDecoder DROPS -> ACCEPT (INTENTIONAL divergence, Rust stricter, anti-cheat)"
+    },
+    {
+      "file": "case_unknown_key_03.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": true,
+      "sha256": "d8ec45386301dc0ac2ae9fe228585e2a774f75499bff76c42651c8c8c9c113bf",
+      "bytes": 17488,
+      "mutation": "base case unknown key 'weight'",
+      "note": "unknown per-case key: Rust deny_unknown_fields REJECTS; Swift JSONDecoder DROPS -> ACCEPT (INTENTIONAL divergence, Rust stricter, anti-cheat)"
+    },
+    {
+      "file": "case_unknown_key_04.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": true,
+      "sha256": "e4fd19c513ac46a7b1f395b659300a81e96c3ea4cdc7ed844ef1d7072806a9b5",
+      "bytes": 17518,
+      "mutation": "base case unknown key 'id'",
+      "note": "unknown per-case key: Rust deny_unknown_fields REJECTS; Swift JSONDecoder DROPS -> ACCEPT (INTENTIONAL divergence, Rust stricter, anti-cheat)"
+    },
+    {
+      "file": "gates_null.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "d7360a7945c34541550235bb736b7ca39bc568766269610440c6f97f509877f7",
+      "bytes": 13082,
+      "mutation": "correctness_gates=null",
+      "note": "gates explicitly null (deny_explicit_null; Swift rejects too)"
+    },
+    {
+      "file": "gates_empty_object.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "135a9e853f26f25a5fd3992f94c265e2edb2b86aab6ea6a42ef6be4c65c8179b",
+      "bytes": 13110,
+      "mutation": "correctness_gates={}",
+      "note": "gates object must declare at least one section"
+    },
+    {
+      "file": "gates_number.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "9feaa457ab829ed32cfa861932f56a18eaba224bf55d71c1bc09ab5491186813",
+      "bytes": 13056,
+      "mutation": "correctness_gates=3",
+      "note": "gates wrong type (number)"
+    },
+    {
+      "file": "gates_array.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "0242eb24e42952bf0ff0450d1f6b11361622145b890cbe7e05fc293a8ee9653f",
+      "bytes": 13097,
+      "mutation": "correctness_gates=[]",
+      "note": "gates wrong type (array)"
+    },
+    {
+      "file": "gates_anchors_empty.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "a6080bb02b0e5965c5a57bc9f0954151da5435c75389f8de4cc2edff6cba0609",
+      "bytes": 17151,
+      "mutation": "anchors=[]",
+      "note": "declared anchors section must be non-empty"
+    },
+    {
+      "file": "gates_free_run_empty.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "3c06fb844512272a42701f7fe43a8ef3e345fddf51b45ec4af3ea27070ce4f9a",
+      "bytes": 13476,
+      "mutation": "free_run=[]",
+      "note": "declared free_run section must be non-empty"
+    },
+    {
+      "file": "gates_anchors_null.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "8480dbbd8dfa303bbf96a14e58942e90ec4e71b2c90167e53ae486ef6978f7db",
+      "bytes": 17175,
+      "mutation": "anchors=null",
+      "note": "anchors explicitly null (deny_explicit_null; Swift rejects too)"
+    },
+    {
+      "file": "gates_free_run_null.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "c317afda67f8c9aec65ba21a7f368fa52de99b631a2f16cfdd3af9d2b744ddf6",
+      "bytes": 13438,
+      "mutation": "free_run=null",
+      "note": "free_run explicitly null (deny_explicit_null; Swift rejects too)"
+    },
+    {
+      "file": "gates_anchors_object.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "a7ed17615ebc6574e801115bc4eeb91c119dbe45aabb55c7e4894471671b68fd",
+      "bytes": 17310,
+      "mutation": "anchors={...}",
+      "note": "anchors wrong type (object not array)"
+    },
+    {
+      "file": "gates_unknown_section_00.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "35c837ef14ad19b3dc579d2fe7a599e80c0c414aa8da27ae10566ed34fa48aa5",
+      "bytes": 17521,
+      "mutation": "gates unknown section 'anchorz'",
+      "note": "unknown gates-section key: Rust deny_unknown_fields REJECTS; Swift Codable may DROP (inner object) -> box-confirmed MATCH (Swift also REJECTS this inner-object unknown key)"
+    },
+    {
+      "file": "gates_unknown_section_01.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "a8e164ac04307346c763e394e674355ebfeed0fb6050c69182d9f4e9b8525bec",
+      "bytes": 17502,
+      "mutation": "gates unknown section 'free_runs'",
+      "note": "unknown gates-section key: Rust deny_unknown_fields REJECTS; Swift Codable may DROP (inner object) -> box-confirmed MATCH (Swift also REJECTS this inner-object unknown key)"
+    },
+    {
+      "file": "gates_unknown_section_02.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "3e8b591db77fc87d80a77d6af60a93f9a4b770dc5c5045d222cb24a879101e78",
+      "bytes": 17483,
+      "mutation": "gates unknown section 'behaviors'",
+      "note": "unknown gates-section key: Rust deny_unknown_fields REJECTS; Swift Codable may DROP (inner object) -> box-confirmed MATCH (Swift also REJECTS this inner-object unknown key)"
+    },
+    {
+      "file": "anchor_missing_name.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "532104158ab8648c9265a987dce7149a4da23ca8bcbad376d1507f1bd33423a9",
+      "bytes": 17473,
+      "mutation": "drop anchor.name",
+      "note": "anchor missing required name"
+    },
+    {
+      "file": "anchor_missing_context.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "6fca6a43cd745937dcd217501760baf8a84bf2faa8f2142642ab8880d37a4826",
+      "bytes": 17475,
+      "mutation": "drop anchor.context_tokens",
+      "note": "anchor missing required context_tokens"
+    },
+    {
+      "file": "anchor_missing_expected.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "d459bbede61b62e68f6f9aa14aafc54d80849e9d94c6b9d1833493e615f70cdf",
+      "bytes": 17490,
+      "mutation": "drop anchor.expected_token",
+      "note": "anchor missing required expected_token"
+    },
+    {
+      "file": "anchor_context_empty.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "6969049f987048c06aef48fd8cff0d0ed6902b9f3aba18dbd35f790e88da7e2f",
+      "bytes": 17447,
+      "mutation": "anchor.context_tokens=[]",
+      "note": "anchor context_tokens must be non-empty"
+    },
+    {
+      "file": "anchor_context_too_long.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "87030461dc248eef0514a823614fcb9c9a61e628c17d879a056d2976cb90d5cb",
+      "bytes": 21466,
+      "mutation": "anchor.context_tokens len=1025",
+      "note": "anchor context_tokens exceeds max 1024"
+    },
+    {
+      "file": "anchor_expected_oob.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "eda57fb1382def335b843bc6ab4a426094c429fb2265a9a8f4f25ce50dd7a76f",
+      "bytes": 17449,
+      "mutation": "anchor.expected_token=VOCAB",
+      "note": "anchor expected_token out of vocab range"
+    },
+    {
+      "file": "anchor_expected_negative.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "ae0d51c7344ae400985059430b33c00de9d68e14254a9ae8ddb7232411e46566",
+      "bytes": 17484,
+      "mutation": "anchor.expected_token=-5",
+      "note": "anchor expected_token negative"
+    },
+    {
+      "file": "anchor_accepted_empty.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "9a1c523875736719f0150e3dd366da74604f8f717722333e1d75f92dad8cc05c",
+      "bytes": 17478,
+      "mutation": "anchor.accepted_tokens=[]",
+      "note": "anchor accepted_tokens must be non-empty when present"
+    },
+    {
+      "file": "anchor_accepted_oob.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "50e834582381fe907e30c896a1d9ae565040755fc679e44d47630b308611bd2d",
+      "bytes": 17553,
+      "mutation": "anchor.accepted_tokens=[HUGE]",
+      "note": "anchor accepted_tokens out of vocab range"
+    },
+    {
+      "file": "anchor_rank_bad_00.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "0dfd0fdfe74c11686dc2c25161655ecb494d658cc85658adcb4eb52ba5a2e2b9",
+      "bytes": 17468,
+      "mutation": "anchor.max_expected_rank=0",
+      "note": "max_expected_rank must be in 1..8"
+    },
+    {
+      "file": "anchor_rank_bad_01.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "df8686d5c8693a83c942b6252cc75cc802a1f4f724a10f46e6494afc25ba2c3b",
+      "bytes": 17474,
+      "mutation": "anchor.max_expected_rank=9",
+      "note": "max_expected_rank must be in 1..8"
+    },
+    {
+      "file": "anchor_rank_bad_02.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "4af174b7a99d458e5384888d7c7ef51c6ba51d17b3bafaf72c4c2b535c88478f",
+      "bytes": 17455,
+      "mutation": "anchor.max_expected_rank=999",
+      "note": "max_expected_rank must be in 1..8"
+    },
+    {
+      "file": "anchor_rank_negative.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "811bd65885d881fb6ee8c3d60ec61db906c9a0306174d70e361f12d06e05064e",
+      "bytes": 17448,
+      "mutation": "anchor.max_expected_rank=-1",
+      "note": "max_expected_rank negative (usize) -> decode reject"
+    },
+    {
+      "file": "anchor_delta_negative.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "084dec3080f5362f33d0a8fe23116c50bd8c22165dfb688fc8ee1d16f7928005",
+      "bytes": 17471,
+      "mutation": "anchor.max_top_logit_delta=-0.5",
+      "note": "max_top_logit_delta must be non-negative"
+    },
+    {
+      "file": "anchor_delta_without_rank.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "da304172c42918fc907379800c8511c0bb85b2d60a4554fca42041bea1a1724e",
+      "bytes": 17493,
+      "mutation": "delta without rank",
+      "note": "max_top_logit_delta requires max_expected_rank"
+    },
+    {
+      "file": "anchor_context_string_elem.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "2952632ecf047235de6de4f50ad4b1e69c31013e54192e3651f19efc2b40a8f4",
+      "bytes": 17465,
+      "mutation": "anchor.context_tokens elem=string",
+      "note": "anchor context_tokens element wrong type"
+    },
+    {
+      "file": "anchor_expected_string.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "3ef8afc45af8426e6f5eca20b62cab24fe28330ac739af9af2f439cc864ea1a1",
+      "bytes": 17486,
+      "mutation": "anchor.expected_token='9'",
+      "note": "anchor expected_token wrong type (string)"
+    },
+    {
+      "file": "anchor_not_object.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "139110f420484246826079fa53b022966bb00f03812daff6909dc06ff60315a8",
+      "bytes": 17373,
+      "mutation": "anchors[0]=5",
+      "note": "anchor case is not an object"
+    },
+    {
+      "file": "anchor_unknown_key_00.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": true,
+      "sha256": "c85fc59a3d53ca6abb68805500c3d49b84b5802ecaffcb5ce522a4e9d1bc8382",
+      "bytes": 17496,
+      "mutation": "anchor unknown key 'accepted_tokenss'",
+      "note": "unknown anchor key: Rust REJECTS; Swift Codable DROPS -> ACCEPT (divergence)"
+    },
+    {
+      "file": "anchor_unknown_key_01.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": true,
+      "sha256": "4b072e5de68ae69d35a40c37fa45391a16318fad445289f1fcaaafd199cfe38e",
+      "bytes": 17480,
+      "mutation": "anchor unknown key 'max_expected_ranke'",
+      "note": "unknown anchor key: Rust REJECTS; Swift Codable DROPS -> ACCEPT (divergence)"
+    },
+    {
+      "file": "anchor_unknown_key_02.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": true,
+      "sha256": "83021e2dd1ecba2a16a3018cb6782a66173ddfe5b53f74b2e1ee885f2c68eaca",
+      "bytes": 17506,
+      "mutation": "anchor unknown key 'contextt_tokens'",
+      "note": "unknown anchor key: Rust REJECTS; Swift Codable DROPS -> ACCEPT (divergence)"
+    },
+    {
+      "file": "anchor_unknown_key_03.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": true,
+      "sha256": "2d05bff7e590983e132b3c6f6ffae7373fcc0f95def26d3958488ef1722a26a8",
+      "bytes": 17506,
+      "mutation": "anchor unknown key 'note'",
+      "note": "unknown anchor key: Rust REJECTS; Swift Codable DROPS -> ACCEPT (divergence)"
+    },
+    {
+      "file": "free_run_missing_name.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "b31c6a870030495a7f3eb8833bb85b847b1de49656f7324f0b7f6c73d7f8c17d",
+      "bytes": 17447,
+      "mutation": "drop free_run.name",
+      "note": "free_run missing required name"
+    },
+    {
+      "file": "free_run_missing_prompt.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "9595b8334f448e869b23039ee9ca90bf7936dbb176138b6665917ea215d5c2f0",
+      "bytes": 13509,
+      "mutation": "drop free_run.prompt_tokens",
+      "note": "free_run missing required prompt_tokens"
+    },
+    {
+      "file": "free_run_missing_expected.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "edee0b03921d013131546e049751ad89772700defeefc38eaf3d38482c2508d6",
+      "bytes": 17466,
+      "mutation": "drop free_run.expected_tokens",
+      "note": "free_run missing required expected_tokens"
+    },
+    {
+      "file": "free_run_prompt_count_00.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "8d8dface53b9cf7a49bc76938951029d98316679efa935c2966b7546997642d5",
+      "bytes": 17496,
+      "mutation": "free_run prompt_tokens len=1023",
+      "note": "free_run prompt_tokens must be exactly 1024"
+    },
+    {
+      "file": "free_run_prompt_count_01.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "b0e97b82d70399285dfd62c4ee2d887fe84c607536263b5a34eb5462f422b903",
+      "bytes": 17509,
+      "mutation": "free_run prompt_tokens len=1025",
+      "note": "free_run prompt_tokens must be exactly 1024"
+    },
+    {
+      "file": "free_run_prompt_count_02.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "0b92fe8fc7ffd318c15ed892a39964ee955025a34de696e08ad273f6d424f8b7",
+      "bytes": 13505,
+      "mutation": "free_run prompt_tokens len=0",
+      "note": "free_run prompt_tokens must be exactly 1024"
+    },
+    {
+      "file": "free_run_expected_empty.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "ade56450aa3ca2ca844f218ce1beae8ca5609004df7a4f34b4e3fedc83693272",
+      "bytes": 17486,
+      "mutation": "free_run.expected_tokens=[]",
+      "note": "free_run expected_tokens must be non-empty"
+    },
+    {
+      "file": "free_run_expected_too_long.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "29527aff0c0f6a37d1857a6ec40909cea1dd68b6bbf7ab8cd0fc04d5fb8ec3a4",
+      "bytes": 18467,
+      "mutation": "free_run expected_tokens len=257",
+      "note": "free_run expected_tokens exceeds max 256"
+    },
+    {
+      "file": "free_run_expected_oob.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "fe794091335e85430d9216f94937eb05b575577b65931b8e383da862a0ce644a",
+      "bytes": 17486,
+      "mutation": "free_run expected_tokens has VOCAB",
+      "note": "free_run expected_tokens out of range"
+    },
+    {
+      "file": "free_run_prefix_bad_00.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "404c12a0b2555195be4d0723bc58fba00dbc324f0a22cc726244397ce34df046",
+      "bytes": 17519,
+      "mutation": "free_run.exact_prefix_tokens=0",
+      "note": "exact_prefix_tokens must be in 1..len(expected)"
+    },
+    {
+      "file": "free_run_prefix_bad_01.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "3bc645eea3b3d09ce2b56ebc7c151ee5e0e8add8804b1c3df9c89ad3901e98cb",
+      "bytes": 17521,
+      "mutation": "free_run.exact_prefix_tokens=999",
+      "note": "exact_prefix_tokens must be in 1..len(expected)"
+    },
+    {
+      "file": "free_run_prefix_negative.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "c03bf3e98b1d2d688be2e72ec148aaf22dab06f690dfdf6c8eead16aa8f6cd7d",
+      "bytes": 17533,
+      "mutation": "free_run.exact_prefix_tokens=-1",
+      "note": "exact_prefix_tokens negative (usize) -> decode reject"
+    },
+    {
+      "file": "free_run_unknown_key_00.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": true,
+      "sha256": "5a16cdc5f038e249e691aea378177b2a53f7a4e0c36ecfd70856541cb18c2d2a",
+      "bytes": 17548,
+      "mutation": "free_run unknown key 'exact_prefix_tokenss'",
+      "note": "unknown free_run key: Rust REJECTS; Swift Codable DROPS -> ACCEPT (divergence)"
+    },
+    {
+      "file": "free_run_unknown_key_01.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": true,
+      "sha256": "d44c53ca9f4d60dd2ea9db07ea1620aa91568723262112ab889f4c65dabda7f2",
+      "bytes": 17460,
+      "mutation": "free_run unknown key 'prompt_token'",
+      "note": "unknown free_run key: Rust REJECTS; Swift Codable DROPS -> ACCEPT (divergence)"
+    },
+    {
+      "file": "free_run_unknown_key_02.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": true,
+      "sha256": "1f076ccb532613a20d752ba6fb57abc17211b95443531c12239bfde8af56df46",
+      "bytes": 17469,
+      "mutation": "free_run unknown key 'extra'",
+      "note": "unknown free_run key: Rust REJECTS; Swift Codable DROPS -> ACCEPT (divergence)"
+    },
+    {
+      "file": "behavior_missing_name.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "0945088b860fef6f0c1f60ca00d9e7356b91981fba028c52ababeea0d6e6a2d9",
+      "bytes": 17607,
+      "mutation": "drop behavior.name",
+      "note": "behavior missing required name"
+    },
+    {
+      "file": "behavior_missing_prompt.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "3e670801a05a4b5f92f723368576e3c83a728fcacf019c05d8f163df77a393b7",
+      "bytes": 17573,
+      "mutation": "drop behavior.prompt_tokens",
+      "note": "behavior missing required prompt_tokens"
+    },
+    {
+      "file": "behavior_missing_sequences.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "5b29123abf1cd40af0554368aee338aa58d2174d0bf38a91a698c06fc2353256",
+      "bytes": 17532,
+      "mutation": "drop behavior.accepted_token_sequences",
+      "note": "behavior missing required accepted_token_sequences"
+    },
+    {
+      "file": "behavior_missing_max_new.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "2981ea9464ff904615512b14952310ea1a8d5292e0321d52cc45222bc8ce0f80",
+      "bytes": 17605,
+      "mutation": "drop behavior.max_new_tokens",
+      "note": "behavior missing required max_new_tokens"
+    },
+    {
+      "file": "behavior_prompt_empty.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "446f712e7c4bb9b9f6dedc982e8322517f234faf2c021a3efc7d4edbac73d408",
+      "bytes": 17614,
+      "mutation": "behavior.prompt_tokens=[]",
+      "note": "behavior prompt_tokens must be non-empty"
+    },
+    {
+      "file": "behavior_prompt_too_long.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "70aa9b3a7fa2e774ffcc208b28bd9380fcbb56ad8ab39ec6b528ee10a06e5ec6",
+      "bytes": 25528,
+      "mutation": "behavior.prompt_tokens len=2049",
+      "note": "behavior prompt_tokens exceeds max 2048"
+    },
+    {
+      "file": "behavior_max_new_bad_00.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "8bf2b479faac9f9c26ed4beb0347f2936b32ddb4c284af26d25d25c7a7e1794a",
+      "bytes": 17623,
+      "mutation": "behavior.max_new_tokens=0",
+      "note": "max_new_tokens must be in 1..64"
+    },
+    {
+      "file": "behavior_max_new_bad_01.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "0ff1ec43b6caf9e9f9f0d6c2fdab2255baea23abdeb6ff2d785dd59932ce8a00",
+      "bytes": 17582,
+      "mutation": "behavior.max_new_tokens=65",
+      "note": "max_new_tokens must be in 1..64"
+    },
+    {
+      "file": "behavior_sequences_empty.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "8d7934c9dc39cee86a0037d77dc0bc4398241a01cafa09861199bcf62801b553",
+      "bytes": 17599,
+      "mutation": "behavior.accepted_token_sequences=[]",
+      "note": "accepted_token_sequences must be non-empty"
+    },
+    {
+      "file": "behavior_sequence_elem_empty.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "a06362ca4484da2d7d3320032ff7d65555d5081ba3f56327f69962aeaae692c2",
+      "bytes": 17625,
+      "mutation": "behavior sequence=[]",
+      "note": "an accepted_token_sequence entry must be non-empty"
+    },
+    {
+      "file": "behavior_sequence_too_long.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "3d155e26feece8bbc83dfbc83c80c48d5587c86d724b30e3b1050560e28bced6",
+      "bytes": 17703,
+      "mutation": "behavior sequence len>max_new_tokens",
+      "note": "accepted_token_sequence longer than max_new_tokens"
+    },
+    {
+      "file": "behavior_sequence_oob.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "0316f3e9ccbb5f964b232514b308cfe4e3761c491e6c4af92cd5ab354af49508",
+      "bytes": 17610,
+      "mutation": "behavior sequence has VOCAB",
+      "note": "accepted_token_sequence token out of range"
+    },
+    {
+      "file": "behavior_prompt_oob.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "c5c88d37a9c2a91166d10a14677ef18099caee7f0e038ca8602407cc79928810",
+      "bytes": 17603,
+      "mutation": "behavior.prompt_tokens has -1",
+      "note": "behavior prompt_tokens out of range"
+    },
+    {
+      "file": "behavior_unknown_key_00.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": true,
+      "sha256": "23ccdabc11033ca79c1c9d8b33b08c190c775294c13286d2df906281356d4cc4",
+      "bytes": 17668,
+      "mutation": "behavior unknown key 'semantic_prompts'",
+      "note": "unknown behavior key: Rust REJECTS; Swift Codable DROPS -> ACCEPT (divergence)"
+    },
+    {
+      "file": "behavior_unknown_key_01.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": true,
+      "sha256": "a71e06da4b651004240d72058088f276b9c75296214a1c95f4324a3a2ef73a76",
+      "bytes": 17646,
+      "mutation": "behavior unknown key 'max_new_token'",
+      "note": "unknown behavior key: Rust REJECTS; Swift Codable DROPS -> ACCEPT (divergence)"
+    },
+    {
+      "file": "behavior_unknown_key_02.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": true,
+      "sha256": "8a578e89052556ce0c3d3437225077b68ef8ebf6c8164fcdffec20dc2e9fdeaa",
+      "bytes": 17640,
+      "mutation": "behavior unknown key 'extra'",
+      "note": "unknown behavior key: Rust REJECTS; Swift Codable DROPS -> ACCEPT (divergence)"
+    },
+    {
+      "file": "benchmark_null.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "814143f1fc5f24faeb8bbc56e8a69cef25296d7bc744145b986b6b32a64764bb",
+      "bytes": 8774,
+      "mutation": "benchmark=null",
+      "note": "benchmark explicitly null (deny_explicit_null; Swift rejects too)"
+    },
+    {
+      "file": "benchmark_number.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "ebf238a7adba5cf0cdc8690e90aa025114ee9b557ed3ee3f97b6ae396721fb46",
+      "bytes": 8791,
+      "mutation": "benchmark=3",
+      "note": "benchmark wrong type (number)"
+    },
+    {
+      "file": "benchmark_missing_prefill.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "c6e541fe94160c4601eb16443b37671dc2d017de202b5e01b378770aa721130c",
+      "bytes": 13455,
+      "mutation": "drop benchmark.prefill_prompt_tokens",
+      "note": "benchmark missing required prefill_prompt_tokens"
+    },
+    {
+      "file": "benchmark_missing_decode_seed.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "927187997cceeb586f8d24446ce128220c91952cf9e557dc34af46ba7ca9f2b5",
+      "bytes": 13448,
+      "mutation": "drop benchmark.decode_seed_tokens",
+      "note": "benchmark missing required decode_seed_tokens"
+    },
+    {
+      "file": "benchmark_missing_expected_prefill.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "418b1808d528541e85491693708630a8d7bc091312bf34ede1c62352dac9c571",
+      "bytes": 17490,
+      "mutation": "drop benchmark.expected_prefill_token",
+      "note": "benchmark missing expected_prefill_token"
+    },
+    {
+      "file": "benchmark_prefill_count_00.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "a27f64e14e323d91671eec5c3f375a5a668ef00a14c267c9eff23036d4ef4ba2",
+      "bytes": 17473,
+      "mutation": "benchmark prefill_prompt_tokens len=1023",
+      "note": "prefill_prompt_tokens must be exactly 1024"
+    },
+    {
+      "file": "benchmark_prefill_count_01.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "060b95ed908363fdcfe0ad75e45c82971430f43635618a30cd5df0397f642905",
+      "bytes": 17507,
+      "mutation": "benchmark prefill_prompt_tokens len=1025",
+      "note": "prefill_prompt_tokens must be exactly 1024"
+    },
+    {
+      "file": "benchmark_prefill_count_02.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "d18dafdfac75bf6250eaddc930e3607639624eb818d54f67a47adfd0b2a31b60",
+      "bytes": 13497,
+      "mutation": "benchmark prefill_prompt_tokens len=0",
+      "note": "prefill_prompt_tokens must be exactly 1024"
+    },
+    {
+      "file": "benchmark_decode_seed_count_00.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "4e6bceb33f9e5c5dd25956f0d72610d7753d0a185208237aa622a0e6e9b2db95",
+      "bytes": 17463,
+      "mutation": "benchmark decode_seed_tokens len=1023",
+      "note": "decode_seed_tokens must be exactly 1024"
+    },
+    {
+      "file": "benchmark_decode_seed_count_01.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "eda075aba6637872fd46aedb3b075cc7964a31077f91d4529cf8fa64d828b323",
+      "bytes": 13483,
+      "mutation": "benchmark decode_seed_tokens len=0",
+      "note": "decode_seed_tokens must be exactly 1024"
+    },
+    {
+      "file": "benchmark_decode_steps_short.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "d9e9c322ddbb638484264f2ef6c0c6923c27d5185ea5c51b5a5356e61de4a42b",
+      "bytes": 17496,
+      "mutation": "expected_decode_tokens len=127",
+      "note": "expected_decode_tokens must be at least 128"
+    },
+    {
+      "file": "benchmark_prefill_oob.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "6eb1f56ba35863bf29a6f74f1dc81fc7226a12195e21cc583de09105e27ad55a",
+      "bytes": 17510,
+      "mutation": "benchmark.expected_prefill_token=VOCAB",
+      "note": "expected_prefill_token out of range"
+    },
+    {
+      "file": "benchmark_decode_token_oob.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "f01a4bc7def293f4da585770a0537d28db3cff20ce00187667c45a563dd79965",
+      "bytes": 17490,
+      "mutation": "benchmark.expected_decode_tokens[0]=-1",
+      "note": "expected_decode_tokens out of range"
+    },
+    {
+      "file": "benchmark_half_baseline_prefill.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "9a7f406559a63efef9d0e32f599a36062b1d46271686d5982e83578b05a41664",
+      "bytes": 17433,
+      "mutation": "drop baseline_decode_seconds_per_token",
+      "note": "only one of the paired baselines present"
+    },
+    {
+      "file": "benchmark_half_baseline_decode.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "25c8743c6f8c9cfaa76ef28fd1227f76abfac34afab70f261ba25c287603d357",
+      "bytes": 17369,
+      "mutation": "drop baseline_prefill_seconds_per_token",
+      "note": "only one of the paired baselines present"
+    },
+    {
+      "file": "benchmark_baseline_bad_00.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "b0811397f05d8fce766e8f910dc010d19dc9b134428dd874fad18fb81188105d",
+      "bytes": 17470,
+      "mutation": "baseline_prefill=0",
+      "note": "baseline must be finite and positive"
+    },
+    {
+      "file": "benchmark_baseline_bad_01.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "ce16367ec4ec6c202f5e26614755efac6eb1f1ef53b73636a0c8999509982a68",
+      "bytes": 17460,
+      "mutation": "baseline_prefill=-1",
+      "note": "baseline must be finite and positive"
+    },
+    {
+      "file": "benchmark_baseline_bad_02.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "233e9087213951134bb8ad3bc4fea322693b2ccb94c16b17f6e016494a8691ad",
+      "bytes": 17499,
+      "mutation": "baseline_prefill=string",
+      "note": "baseline must be finite and positive"
+    },
+    {
+      "file": "benchmark_prefill_string_elem.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "75942fe180db5253f5ce3ca032a3928d0bb6ecad292d4b7ab8b5870776be7220",
+      "bytes": 17623,
+      "mutation": "benchmark prefill_prompt_tokens elem=string",
+      "note": "benchmark token element wrong type"
+    },
+    {
+      "file": "benchmark_unknown_key_00.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "efd933569a4c896d6771cbdb5edf2f8a0dd4adf7dc97e0caf58bb9de4d6411f7",
+      "bytes": 17488,
+      "mutation": "benchmark unknown key 'baseline_prefil_typo'",
+      "note": "unknown benchmark key: Rust deny_unknown_fields REJECTS; Swift Codable may DROP (inner object) -> box-confirmed MATCH (Swift also REJECTS this inner-object unknown key)"
+    },
+    {
+      "file": "benchmark_unknown_key_01.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "f6a8dd252815ed2295be524b0bd0a76913312c39e2b38ba6f76aa3a96a25edc8",
+      "bytes": 17508,
+      "mutation": "benchmark unknown key 'extra_baseline'",
+      "note": "unknown benchmark key: Rust deny_unknown_fields REJECTS; Swift Codable may DROP (inner object) -> box-confirmed MATCH (Swift also REJECTS this inner-object unknown key)"
+    },
+    {
+      "file": "benchmark_unknown_key_02.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "a3b59804ed365fd1d6126a199a8d4721ee0bd805f714550deb9861c37fbb0d92",
+      "bytes": 17522,
+      "mutation": "benchmark unknown key 'note'",
+      "note": "unknown benchmark key: Rust deny_unknown_fields REJECTS; Swift Codable may DROP (inner object) -> box-confirmed MATCH (Swift also REJECTS this inner-object unknown key)"
+    },
+    {
+      "file": "layered_dup_base_anchor.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "fcd102c05be3d067b3de827125a30c6f7965c08de7f832a8cb99f19bf587620c",
+      "bytes": 17671,
+      "mutation": "anchor name == base case name",
+      "note": "duplicate layered case name (base vs anchor)"
+    },
+    {
+      "file": "layered_dup_base_free_run.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "073a28bf6c2605efb7ec99917810defa1508bb7195173a2cc6dd27fab23d2172",
+      "bytes": 21527,
+      "mutation": "free_run name == base case name",
+      "note": "duplicate layered case name (base vs free_run)"
+    },
+    {
+      "file": "layered_dup_anchors.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "5e92cc158e008d0105782612779ffe0c791f3fcd52ab521cd823cb990fce235b",
+      "bytes": 17668,
+      "mutation": "two anchors named 'a1'",
+      "note": "duplicate anchor case name"
+    },
+    {
+      "file": "layered_dup_free_run.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "c2bc85c334cb618cfa58e82acfed398c8638cdf0288204149eabbf967418f5ce",
+      "bytes": 21541,
+      "mutation": "two free_run named 'fr1'",
+      "note": "duplicate free_run case name"
+    },
+    {
+      "file": "json_truncated.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "4d391b450aed6d75dd161911d3e0c0783e67c0c481046cd8704e4db853bf1377",
+      "bytes": 10931,
+      "mutation": "truncate JSON at 50%",
+      "note": "truncated JSON payload; decode error"
+    },
+    {
+      "file": "json_trailing_garbage.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "c877924be48d5ba5d63a03db9c69eee72a0590e3359eb7b1ef1967d2bd5f8566",
+      "bytes": 21874,
+      "mutation": "append trailing garbage",
+      "note": "trailing non-JSON bytes; decode error"
+    },
+    {
+      "file": "json_empty.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "mutation": "empty file",
+      "note": "empty payload; decode error"
+    },
+    {
+      "file": "json_whitespace_only.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "c1513de64a0bf55f96956b49223a1ff8a76432446bdf7ae261a6e193318f9fed",
+      "bytes": 6,
+      "mutation": "whitespace only",
+      "note": "no JSON value"
+    },
+    {
+      "file": "json_top_level_array.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "a615eeaee21de5179de080de8c3052c8da901138406ba71c38c032845f7d54f4",
+      "bytes": 7,
+      "mutation": "top-level array",
+      "note": "root is an array, not an object"
+    },
+    {
+      "file": "json_top_level_number.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "73475cb40a568e8da8a045ced110137e159f890ac4da883b6b17dc651b3a8049",
+      "bytes": 2,
+      "mutation": "top-level number",
+      "note": "root is a number, not an object"
+    },
+    {
+      "file": "json_top_level_string.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "75da4cda480106f266c85755cf69dc41ed4dd9f80119b770cf5f9fde3aba4909",
+      "bytes": 8,
+      "mutation": "top-level string",
+      "note": "root is a string"
+    },
+    {
+      "file": "json_not_json.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "5d2f9a2d1fed2742c527f2ebe668b6c98ab1fba3caf8d4148f81716493b1e72d",
+      "bytes": 16,
+      "mutation": "non-JSON text",
+      "note": "not JSON at all"
+    },
+    {
+      "file": "json_duplicate_model_type.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "sha256": "32ee88f095e657a7384c59fde39c1dfd1932c7f6925a2a542e40fef92a42bd26",
+      "bytes": 5457,
+      "mutation": "duplicate model_type key (last=qwen3_5_text)",
+      "note": "duplicate JSON key; both loaders take the last value -> wrong model_type -> REJECT"
+    }
+  ]
+}

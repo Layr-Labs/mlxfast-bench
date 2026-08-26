@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bench-protocol",
+    "crates/bench-core",
+    "crates/bench-runner",
+    "crates/bench-transform",
+    "crates/bench-telemetry",
+    "crates/bench-agent",
+    "crates/benchctl",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+bench-protocol = { path = "crates/bench-protocol" }
+bench-core = { path = "crates/bench-core" }
+bench-runner = { path = "crates/bench-runner" }
+bench-transform = { path = "crates/bench-transform" }
+bench-telemetry = { path = "crates/bench-telemetry" }

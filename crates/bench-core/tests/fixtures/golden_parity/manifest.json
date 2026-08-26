@@ -1,0 +1,100 @@
+{
+  "required_model_type": "gemma4_text",
+  "steps": 64,
+  "prompt_tokens": 1024,
+  "reference_model_contract": "reference_model_contract.json",
+  "fixtures": [
+    {
+      "file": "valid.json",
+      "expected_rust": "ACCEPT",
+      "swift_diverges": false,
+      "note": "canonical golden"
+    },
+    {
+      "file": "model_provenance.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "note": "model_provenance carrying an unknown inner key (model_id): the reference allows exactly repository+revision -> shared REJECT"
+    },
+    {
+      "file": "model_provenance_valid.json",
+      "expected_rust": "ACCEPT",
+      "swift_diverges": false,
+      "note": "well-formed model_provenance NAMING the contract's declared reference model (repository + 40-hex revision): an OPTIONAL key on the corrected reference schema, and the positive control for the #114 value pin -- it must stay ACCEPT with the contract supplied, or the pin is rejecting everything"
+    },
+    {
+      "file": "model_provenance_not_pinned.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "note": "well-formed model_provenance whose VALUES name a DIFFERENT model (valid shape: non-empty repository + 40-hex lowercase revision, but neither is the contract's declared reference model): REJECTED against the track contract's target pin, matching Swift's constant-driven pin -> SHARED REJECT (#114). WITHOUT a contract the same bytes ACCEPT (shape-only): see expected_rust_unpinned",
+      "expected_rust_unpinned": "ACCEPT"
+    },
+    {
+      "file": "wrong_model_type_and_provenance.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "note": "wrong model_type AND a provenance naming a different model: BOTH loaders REJECT, and both must report the MODEL_TYPE defect -- the reference checks requiredModelType BEFORE the provenance identity, so a loader that reported the provenance mismatch here would be decision-identical but diagnostic-divergent (#114 F1)",
+      "expected_rust_message_contains": "correctness golden file model_type="
+    },
+    {
+      "file": "missing_model_type.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "note": "model_type absent; the benchmark loader requires model_type==gemma4_text"
+    },
+    {
+      "file": "wrong_model_type.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "note": "model_type != gemma4_text (the retired qwen-era identity must reject on the gemma track)"
+    },
+    {
+      "file": "unknown_top_key.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "note": "unknown top-level key"
+    },
+    {
+      "file": "bad_version.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "note": "version must be 1"
+    },
+    {
+      "file": "empty_cases.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "note": "cases must be non-empty"
+    },
+    {
+      "file": "short_expected_tokens.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "note": "primary case expected_tokens < 64"
+    },
+    {
+      "file": "wrong_prompt_tokens.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "note": "primary case prompt_tokens != 1024"
+    },
+    {
+      "file": "null_benchmark.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "note": "benchmark explicitly null"
+    },
+    {
+      "file": "half_baseline.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": false,
+      "note": "only one of the paired baselines present"
+    },
+    {
+      "file": "per_case_unknown_key.json",
+      "expected_rust": "REJECT",
+      "swift_diverges": true,
+      "note": "per-case unknown key: Rust deny_unknown_fields rejects it; Swift JSONDecoder silently DROPS it and ACCEPTS -> INTENTIONAL divergence (Rust stricter, anti-cheat)"
+    }
+  ]
+}

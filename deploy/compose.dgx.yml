@@ -1,0 +1,2 @@
+# Sketch — see docs/dgx-spark-implementation-plan.md §6.
+# engine (cudafast-engine) + benchd on an internal:true network; engine --network none.

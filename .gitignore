@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+.DS_Store
+/weights
+/goldens
+*.score.json
+
+# Python bytecode
+__pycache__/
+*.pyc
+.claude/worktrees/
+
+# Local parity/manual-test evidence — lives in the dirs, never the repo
+.parity/

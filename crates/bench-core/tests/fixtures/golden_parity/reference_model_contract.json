@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "track_id": "loader-parity-corpus-v1",
+  "target": {
+    "upstream_model_id": "mlx-community/gemma-4-26B-A4B-it-qat-4bit",
+    "upstream_revision": "0e3cbab38ce568cf6e23543010d08d03b731910c"
+  }
+}

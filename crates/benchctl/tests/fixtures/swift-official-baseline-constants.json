@@ -1,0 +1,29 @@
+{
+  "_comment": [
+    "#127 (RULED David 2026-08-20, 'MIRROR REFERENCE') — the LOCAL-ITERATE scoring denominator,",
+    "captured from the reference source rather than restated in a Rust literal.",
+    "",
+    "The ruling makes the local legs score against these values, so a stale copy in bench-core is a",
+    "live scoring defect. The reference is now the gemma4 engine: the 2026-08-25 box-3 (ranked box)",
+    "calibration re-pin. `retired_fork` keeps the RETIRED mlxfast-challenge-dev fork's pair — the",
+    "exact wrong answer #127 was about (28.9x / 9.64x off the qwen-era reference, and what the",
+    "window-4 golden declared, splitting ~12x on score off a ~5% timing split — see",
+    "docs/iterate-128-window-reverify.md) — as assert_ne targets.",
+    "",
+    "Re-capture with:",
+    "  git -C <reference> show e1fddf39:Sources/MLXFastCore/Constants.swift | sed -n '359,360p'"
+  ],
+  "source_file": "Sources/MLXFastCore/Constants.swift",
+  "source_lines": "359-360",
+  "source_commit": "e1fddf39996e601d5c13e49c3388b095cf426f94",
+  "captured": "2026-08-25",
+  "reference": {
+    "officialBaselinePrefillSecondsPerToken": 0.0003276219582519531,
+    "officialBaselineDecodeSecondsPerToken": 0.012374741210937498
+  },
+  "retired_fork": {
+    "_source": "mlxfast-challenge-dev/Sources/MLXFastCore/Constants.swift:124-125 @ 242b19d",
+    "officialBaselinePrefillSecondsPerToken": 0.010605031949609375,
+    "officialBaselineDecodeSecondsPerToken": 0.1336139485703125
+  }
+}

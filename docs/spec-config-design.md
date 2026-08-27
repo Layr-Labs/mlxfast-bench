@@ -41,9 +41,12 @@ Rules:
   defines its own if/when #26 rules it in.
 - **Module owns validation.** The engine-side module for each mode parses its own block:
   unknown fields → error (deny_unknown_fields, matching bench-protocol posture); missing
-  fields → the module's coded default (MTP: depth 2 per the Option A naive baseline;
+  fields → the module's coded default (MTP: the envelope's own resolution/clamp;
   DFlash: the module's block-size-derived default). The benchmarker never interprets
-  block contents — it forwards bytes.
+  block contents — it forwards bytes. Benchd itself supplies NO depth default (David
+  ruling 2026-08-27): an omitted `--mtp-depth` sends `{"mode":"mtp","mtp":{}}` and the
+  echo reports the module-resolved depth. (The pre-ruling text here said "MTP: depth 2
+  per the Option A naive baseline" — that was benchd's retired injected default.)
 - **Cross-module keys are rejected.** `{"mode":"mtp","dflash":{…}}` is an error, not
   ignored — fail-closed against config drift.
 - **Artifacts are pinned.** Any module block that names an external artifact (DFlash

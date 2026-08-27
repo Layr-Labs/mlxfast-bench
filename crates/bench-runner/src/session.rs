@@ -371,8 +371,12 @@ impl<T: LineTransport> Session<T> {
     }
 
     /// Spec-never-ignored enforcement (§6): when `requested` is `Some`, the engine's echoed
-    /// `effective_spec` must be present and EQUAL it. A missing or divergent echo discards the
-    /// session and raises [`RunnerError::SpecEchoDivergence`]. `None` requested ⇒ no check.
+    /// `effective_spec` must be present and HONOR it — every field the request specified must come
+    /// back identical, while fields the request left absent are the module's to fill and the echo
+    /// reports them ([`bench_protocol::spec_echo_honors_request`]; David ruling 2026-08-27 — an
+    /// engine-decides request like `{"mode":"mtp","mtp":{}}` accepts the module-resolved depth in
+    /// the echo). A missing echo, or one that CHANGES a requested value, discards the session and
+    /// raises [`RunnerError::SpecEchoDivergence`]. `None` requested ⇒ no check.
     fn require_spec_echo(
         &mut self,
         requested: Option<&bench_protocol::SpecConfig>,
@@ -381,7 +385,11 @@ impl<T: LineTransport> Session<T> {
         let Some(requested) = requested else {
             return Ok(());
         };
-        if resp.effective_spec.as_ref() == Some(requested) {
+        if resp
+            .effective_spec
+            .as_ref()
+            .is_some_and(|e| bench_protocol::spec_echo_honors_request(requested, e))
+        {
             return Ok(());
         }
         self.discarded = true;

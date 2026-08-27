@@ -146,21 +146,156 @@ impl SpecConfig {
     pub fn mtp(depth: u32) -> Self {
         Self {
             mode: SPEC_MODE_MTP.to_string(),
-            mtp: Some(MtpSpec { depth }),
+            mtp: Some(MtpSpec { depth: Some(depth) }),
             dflash: None,
             dspark: None,
         }
+    }
+
+    /// The engine-decides MTP spec (`{"mode":"mtp","mtp":{}}`) — David ruling 2026-08-27: depth is
+    /// the PARTICIPANT'S variable (their drafter code sets it), so when the operator names no depth
+    /// benchd must not inject its own default request. The mtp block stays present (mode↔block
+    /// coherence), the `depth` key is omitted, and the engine's envelope resolves/clamps its own
+    /// value and reports it in the `effective_spec` echo — which [`spec_echo_honors_request`] then
+    /// accepts as the module filling a field the request left to it.
+    pub fn mtp_engine_default() -> Self {
+        Self {
+            mode: SPEC_MODE_MTP.to_string(),
+            mtp: Some(MtpSpec { depth: None }),
+            dflash: None,
+            dspark: None,
+        }
+    }
+
+    /// The DFlash spec carrying the arm's draft-depth lever
+    /// (`{"mode":"dflash","dflash":{"depth":D}}`). The `dflash` block stays an OPAQUE module input
+    /// (benchd forwards it verbatim and the module owns its own validation); `depth` is the one
+    /// lever benchd later projects back out with [`SpecConfig::dflash_depth`] for the metrics seal.
+    pub fn dflash(depth: u32) -> Self {
+        Self {
+            mode: SPEC_MODE_DFLASH.to_string(),
+            mtp: None,
+            dflash: Some(serde_json::json!({ "depth": depth })),
+            dspark: None,
+        }
+    }
+
+    /// The DFlash arm's draft-depth lever (`dflash.depth`), STRUCTURALLY decoded out of the
+    /// otherwise-opaque `dflash` module block via serde. Returns `Some(depth)` EXACTLY when
+    /// `mode == "dflash"` AND the block carries a numeric `depth`; `None` otherwise (a non-dflash
+    /// spec, or a dflash block that omits `depth`). This is a READ-ONLY projection: the block stays
+    /// opaque module input, no other key is interpreted, and the MTP depth constant is NEVER reused
+    /// for the dflash arm.
+    pub fn dflash_depth(&self) -> Option<u32> {
+        if self.mode != SPEC_MODE_DFLASH {
+            return None;
+        }
+        /// The minimal projection benchd reads out of the opaque `dflash` block: just the `depth`
+        /// lever. No `deny_unknown_fields`, so extra module keys are ignored — the block is not
+        /// re-schema'd here, only its one benchd-visible lever is decoded.
+        #[derive(Deserialize)]
+        struct DflashDepthProjection {
+            depth: u32,
+        }
+        let block = self.dflash.as_ref()?;
+        serde_json::from_value::<DflashDepthProjection>(block.clone())
+            .ok()
+            .map(|p| p.depth)
     }
 }
 
 /// The `mtp` module config block. Depth is the MODULE's field (`docs/spec-config-design.md` §2):
 /// the engine module owns its clamp/default; benchd only carries it and bounds-checks it against
 /// the anti-DDoS cap before spawning.
+///
+/// `depth` is OPTIONAL on the wire (David ruling 2026-08-27): an absent depth means "the engine's
+/// drafter decides" — the module resolves its own default/clamp and reports the operating value in
+/// the `effective_spec` echo. The engine already parses it exactly this way
+/// (`RuntimeWorkerSpecConfig.swift`: `decodeIfPresent`, "the module parses its own block, fills its
+/// own defaults"). A PRESENT depth remains a hard request the echo must honor verbatim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MtpSpec {
-    /// The MTP draft depth the module runs.
-    pub depth: u32,
+    /// The MTP draft depth the module runs; `None` = the engine's drafter decides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<u32>,
+}
+
+/// Whether an engine's `effective_spec` ECHO honors the REQUEST — the spec-never-ignored rule with
+/// engine-decides semantics (David ruling 2026-08-27):
+///
+/// Every field the request SPECIFIED must appear in the echo with an identical value (a divergent
+/// value is still a discard — a requested depth 4 echoed as 3 rejects exactly as before). Fields
+/// the request left ABSENT INSIDE ITS MODULE BLOCK are the module's to fill, and the echo REPORTS
+/// them — a resolved `mtp.depth`, a dflash `draft` identity block. That tolerance is scoped to
+/// WITHIN the mode's own block:
+///
+/// - The MODE must be identical, and the TOP-LEVEL MODULE-KEY SETS must match exactly — an echo
+///   may not introduce a module block the request did not carry (a serial request echoed with a
+///   stray `mtp`/`dflash` block refuses, exactly as the pre-ruling byte-equality did) nor drop one
+///   the request carried.
+/// - Inside the mode's block, the request's keys must echo verbatim (recursively); echo-added keys
+///   are the module reporting.
+/// - The echo must REPORT a resolved depth: an engine-decides request whose echo also omits
+///   `mtp.depth` (or a dflash echo without a numeric `depth`) refuses — with the seal's `mtp_depth`
+///   now absent-by-design on engine-decides runs, the echo is the one place the operating depth is
+///   recorded, and a silent echo would leave the run with no depth on record at all.
+pub fn spec_echo_honors_request(requested: &SpecConfig, effective: &SpecConfig) -> bool {
+    if requested.mode != effective.mode {
+        return false;
+    }
+    // Top-level module-key sets match exactly (presence, per block).
+    if requested.mtp.is_some() != effective.mtp.is_some()
+        || requested.dflash.is_some() != effective.dflash.is_some()
+        || requested.dspark.is_some() != effective.dspark.is_some()
+    {
+        return false;
+    }
+    // mtp block: a requested depth echoes verbatim; an engine-decides request (depth absent)
+    // requires the echo to carry the module-RESOLVED depth.
+    if let (Some(req_mtp), Some(echo_mtp)) = (&requested.mtp, &effective.mtp) {
+        match req_mtp.depth {
+            Some(d) => {
+                if echo_mtp.depth != Some(d) {
+                    return false;
+                }
+            }
+            None => {
+                if echo_mtp.depth.is_none() {
+                    return false;
+                }
+            }
+        }
+    }
+    // dflash block (opaque): request keys must echo verbatim, echo may add module-filled keys
+    // (`draft` identity, a resolved `depth`) — and the echo must carry a numeric `depth`.
+    if let (Some(req_block), Some(echo_block)) = (&requested.dflash, &effective.dflash) {
+        if !json_subset(req_block, echo_block) {
+            return false;
+        }
+        if requested.mode == SPEC_MODE_DFLASH && effective.dflash_depth().is_none() {
+            return false;
+        }
+    }
+    // dspark block (opaque, reserved): request keys must echo verbatim.
+    if let (Some(req_block), Some(echo_block)) = (&requested.dspark, &effective.dspark) {
+        if !json_subset(req_block, echo_block) {
+            return false;
+        }
+    }
+    true
+}
+
+/// `a` ⊆ `b`, recursively: objects require every key of `a` present in `b` with a subset value;
+/// everything else requires equality. Arrays are compared by equality — no element-wise subset —
+/// because an order/length divergence in a requested array is a real divergence.
+fn json_subset(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    match (a, b) {
+        (serde_json::Value::Object(ao), serde_json::Value::Object(bo)) => ao
+            .iter()
+            .all(|(k, av)| bo.get(k).is_some_and(|bv| json_subset(av, bv))),
+        _ => a == b,
+    }
 }
 
 /// Request kind carried by [`WorkerRequest::kind`] — the benchmarker -> engine message
@@ -781,6 +916,187 @@ pub struct HeadProvenance {
 mod tests {
     use super::*;
 
+    /// David ruling 2026-08-27 — the engine-decides spec serializes with the mtp block present and
+    /// the depth key ABSENT (`{"mode":"mtp","mtp":{}}`), which is exactly the shape the engine's
+    /// module parser documents ("the mtp block has no depth key → the envelope resolves its own").
+    #[test]
+    fn engine_default_spec_serializes_without_a_depth_key() {
+        let spec = SpecConfig::mtp_engine_default();
+        assert_eq!(
+            serde_json::to_string(&spec).unwrap(),
+            r#"{"mode":"mtp","mtp":{}}"#
+        );
+        // ...and the explicit form is unchanged.
+        assert_eq!(
+            serde_json::to_string(&SpecConfig::mtp(2)).unwrap(),
+            r#"{"mode":"mtp","mtp":{"depth":2}}"#
+        );
+    }
+
+    /// The echo-honors-request rule: requested fields must come back identical; module-filled
+    /// fields the request omitted are reported, not divergence.
+    #[test]
+    fn spec_echo_honors_request_semantics() {
+        // Fully specified request: exact equality passes (the pre-ruling behavior, unchanged)...
+        assert!(spec_echo_honors_request(
+            &SpecConfig::mtp(2),
+            &SpecConfig::mtp(2)
+        ));
+        // ...and a CHANGED requested value still rejects — a requested 4 echoed as 3 is divergence.
+        assert!(!spec_echo_honors_request(
+            &SpecConfig::mtp(4),
+            &SpecConfig::mtp(3)
+        ));
+        // Engine-decides request: the module resolving a depth the request omitted is ACCEPTED.
+        assert!(spec_echo_honors_request(
+            &SpecConfig::mtp_engine_default(),
+            &SpecConfig::mtp(3)
+        ));
+        // The mode is always load-bearing: a serial request echoed as mtp rejects.
+        assert!(!spec_echo_honors_request(
+            &SpecConfig::serial(),
+            &SpecConfig::mtp(3)
+        ));
+        // A missing module block in the ECHO of an engine-decides request still rejects — the
+        // engine must report what it resolved, not stay silent (`{"mtp":{}}` ⊄ no block).
+        let mut bare = SpecConfig::mtp_engine_default();
+        bare.mtp = None;
+        assert!(!spec_echo_honors_request(
+            &SpecConfig::mtp_engine_default(),
+            &bare
+        ));
+        // DFlash: a requested depth honored while the engine adds its draft-identity block passes —
+        // the added block is the module reporting, not divergence.
+        let dflash_req = SpecConfig::dflash(1);
+        let mut dflash_echo = SpecConfig::dflash(1);
+        dflash_echo.dflash = Some(serde_json::json!({
+            "depth": 1,
+            "draft": { "artifact": "dflash-head", "sha256": "ab" }
+        }));
+        assert!(spec_echo_honors_request(&dflash_req, &dflash_echo));
+        // ...but a changed dflash depth rejects.
+        assert!(!spec_echo_honors_request(
+            &SpecConfig::dflash(2),
+            &dflash_echo
+        ));
+    }
+
+    /// Review gate (48/aa item 3) — the module-block tolerance is scoped WITHIN the mode's block:
+    /// an echo may not INTRODUCE a module block the request did not carry. Pre-ruling byte-equality
+    /// refused a serial echo with a stray speculative block; the subset rule must not readmit it.
+    #[test]
+    fn stray_module_blocks_in_the_echo_refuse() {
+        let mut serial_with_mtp = SpecConfig::serial();
+        serial_with_mtp.mtp = Some(MtpSpec { depth: Some(2) });
+        assert!(!spec_echo_honors_request(
+            &SpecConfig::serial(),
+            &serial_with_mtp
+        ));
+        let mut serial_with_dflash = SpecConfig::serial();
+        serial_with_dflash.dflash = Some(serde_json::json!({ "depth": 1 }));
+        assert!(!spec_echo_honors_request(
+            &SpecConfig::serial(),
+            &serial_with_dflash
+        ));
+        // An mtp echo sprouting a dflash block refuses the same way.
+        let mut mtp_with_dflash = SpecConfig::mtp(2);
+        mtp_with_dflash.dflash = Some(serde_json::json!({ "depth": 1 }));
+        assert!(!spec_echo_honors_request(
+            &SpecConfig::mtp(2),
+            &mtp_with_dflash
+        ));
+    }
+
+    /// Review gate (48/aa item 4) — the echo must REPORT a resolved depth. With the seal's
+    /// `mtp_depth` absent-by-design on engine-decides runs, the echo is the only place the
+    /// operating depth is recorded; an echo as silent as the request leaves the run with no depth
+    /// on record anywhere, and refuses.
+    #[test]
+    fn engine_decides_echo_must_carry_the_resolved_depth() {
+        assert!(!spec_echo_honors_request(
+            &SpecConfig::mtp_engine_default(),
+            &SpecConfig::mtp_engine_default()
+        ));
+        // A dflash echo without a numeric depth refuses for the same reason.
+        let req = SpecConfig {
+            mode: SPEC_MODE_DFLASH.to_string(),
+            mtp: None,
+            dflash: Some(serde_json::json!({})),
+            dspark: None,
+        };
+        let mut echo_no_depth = req.clone();
+        echo_no_depth.dflash = Some(serde_json::json!({
+            "draft": { "artifact": "dflash-head", "sha256": "cd" }
+        }));
+        assert!(!spec_echo_honors_request(&req, &echo_no_depth));
+    }
+
+    /// Review gate (48/aa item 2) — the VERBATIM PRODUCTION REQUEST for the DFlash arm
+    /// (`{"mode":"dflash","dflash":{}}`, the wrapper's engine-decides form) against an
+    /// engine-shaped echo: resolved depth plus the draft identity block with a real 64-hex digest.
+    /// This exact shape is what the byte-equality gate refused on every served dflash session; it
+    /// must be exercised by a committed test, not only by specified-field variants.
+    #[test]
+    fn production_engine_decides_dflash_request_accepts_the_engine_echo() {
+        let req: SpecConfig = serde_json::from_str(r#"{"mode":"dflash","dflash":{}}"#).unwrap();
+        let echo: SpecConfig = serde_json::from_str(&format!(
+            r#"{{"mode":"dflash","dflash":{{"depth":3,"draft":{{"artifact":"dflash-head","sha256":"{}"}}}}}}"#,
+            "ab".repeat(32)
+        ))
+        .unwrap();
+        assert!(spec_echo_honors_request(&req, &echo));
+        // And the same echo with the depth dropped refuses (the item-4 rule on the real shape).
+        let echo_no_depth: SpecConfig = serde_json::from_str(&format!(
+            r#"{{"mode":"dflash","dflash":{{"draft":{{"artifact":"dflash-head","sha256":"{}"}}}}}}"#,
+            "ab".repeat(32)
+        ))
+        .unwrap();
+        assert!(!spec_echo_honors_request(&req, &echo_no_depth));
+    }
+
+    /// Review contract (48): a REQUEST-SPECIFIED drafter identity is verbatim-match-or-refuse.
+    /// The module-filled tolerance covers only fields the request left ABSENT — a request that
+    /// declares `draft.sha256` has specified it, and an echo carrying any other digest is a
+    /// wrong-drafter divergence, discarded exactly like a changed depth. (The engine's own
+    /// declared-vs-recomputed identity refusal — `RuntimeWorkerSpecConfig.swift`, "refusing rather
+    /// than echoing a draft identity this run is not using" — sits in front of this and is
+    /// untouched by this change; this is benchd's independent half of the same guarantee.)
+    #[test]
+    fn request_specified_drafter_identity_is_verbatim_or_refused() {
+        let mut req = SpecConfig::dflash(1);
+        req.dflash = Some(serde_json::json!({
+            "depth": 1,
+            "draft": { "sha256": "aa" }
+        }));
+        // Echo honors the declared digest (and fills artifact, a field the request omitted): OK.
+        let mut echo_honored = SpecConfig::dflash(1);
+        echo_honored.dflash = Some(serde_json::json!({
+            "depth": 1,
+            "draft": { "artifact": "dflash-head", "sha256": "aa" }
+        }));
+        assert!(spec_echo_honors_request(&req, &echo_honored));
+        // A DIFFERENT digest in the echo is a wrong drafter: refused.
+        let mut echo_wrong = echo_honored.clone();
+        echo_wrong.dflash = Some(serde_json::json!({
+            "depth": 1,
+            "draft": { "artifact": "dflash-head", "sha256": "bb" }
+        }));
+        assert!(!spec_echo_honors_request(&req, &echo_wrong));
+        // An echo that DROPS the declared digest entirely is equally a refusal — silence about a
+        // specified field is not honoring it.
+        let mut echo_silent = echo_honored.clone();
+        echo_silent.dflash = Some(serde_json::json!({
+            "depth": 1,
+            "draft": { "artifact": "dflash-head" }
+        }));
+        assert!(!spec_echo_honors_request(&req, &echo_silent));
+        // Wrong MODE stays refused whatever the blocks say — for the engine-decides request too.
+        assert!(!spec_echo_honors_request(
+            &SpecConfig::mtp_engine_default(),
+            &SpecConfig::serial()
+        ));
+    }
+
     /// Parse a canonical NDJSON line, re-serialize, and assert byte-identical output.
     fn assert_request_roundtrip(canonical: &str) {
         let parsed: WorkerRequest = serde_json::from_str(canonical).unwrap();
@@ -938,6 +1254,29 @@ mod tests {
             serde_json::to_string(&SpecConfig::mtp(4)).unwrap(),
             r#"{"mode":"mtp","mtp":{"depth":4}}"#
         );
+        assert_eq!(
+            serde_json::to_string(&SpecConfig::dflash(5)).unwrap(),
+            r#"{"mode":"dflash","dflash":{"depth":5}}"#
+        );
+    }
+
+    #[test]
+    fn dflash_depth_projects_the_lever_out_of_the_opaque_block() {
+        // The `dflash` block stays opaque, but benchd structurally decodes the ONE lever it seals.
+        assert_eq!(SpecConfig::dflash(5).dflash_depth(), Some(5));
+        // Decoded off a wire echo carrying EXTRA module keys — the projection ignores them (the
+        // block is not re-schema'd), and still reads `depth`.
+        let echo: SpecConfig =
+            serde_json::from_str(r#"{"mode":"dflash","dflash":{"depth":7,"drafter":"z-lab"}}"#)
+                .unwrap();
+        assert_eq!(echo.dflash_depth(), Some(7));
+        // A non-dflash spec has no dflash lever — never the mtp depth standing in for it.
+        assert_eq!(SpecConfig::mtp(4).dflash_depth(), None);
+        assert_eq!(SpecConfig::serial().dflash_depth(), None);
+        // A dflash block without a numeric `depth` yields None (honest — never a fabricated depth).
+        let no_depth: SpecConfig =
+            serde_json::from_str(r#"{"mode":"dflash","dflash":{"drafter":"z-lab"}}"#).unwrap();
+        assert_eq!(no_depth.dflash_depth(), None);
     }
 
     #[test]

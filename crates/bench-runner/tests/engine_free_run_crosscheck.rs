@@ -304,7 +304,7 @@ fn engine_real_mtp_effective_spec_echo_parses_into_benchd() {
         .expect("the mtp line carries an effective_spec");
     assert_eq!(spec.mode, "mtp");
     assert_eq!(
-        spec.mtp.as_ref().map(|m| m.depth),
+        spec.mtp.as_ref().and_then(|m| m.depth),
         Some(3),
         "no depth was requested, so the echo carries the pinned ceiling"
     );

@@ -115,7 +115,7 @@ USAGE:
     benchctl measure-job --candidate <WS> --baseline <WS> --golden <PATH> [--golden <PATH> ...] \\
         --contract <PATH> --min-pairs <N> --target-pairs <N> --tag <S> --out <DIR> \\
         [--correctness-golden <PATH>] \\
-        [--tokens 512] [--mtp-depth 2] [--weights <DIR>] [--exactness-probe once] \\
+        [--tokens 512] [--mtp-depth <N>] [--weights <DIR>] [--exactness-probe once] \\
         [--prompt <PATH> --prompt-sha256 <HEX> --target-id <ID>] [--preflight-only] \\
         [--calibration-bootstrap] [--gates-producer <NAME>]
 
@@ -163,8 +163,10 @@ OPTIONAL (LANE 2a):
 
 OPTIONAL:
     --tokens <N>       Depth-0 decode window both legs time (default 512).
-    --mtp-depth <N>    Convenience for the candidate spec {\"mode\":\"mtp\",\"mtp\":{\"depth\":N}}
-                       (default 2). Depth is a MODULE field now. MUTUALLY EXCLUSIVE with
+    --mtp-depth <N>    Convenience for the candidate spec {\"mode\":\"mtp\",\"mtp\":{\"depth\":N}}.
+                       OMITTED = the engine's drafter decides ({\"mode\":\"mtp\",\"mtp\":{}} — no
+                       depth is requested or sealed; the echo reports the operating value).
+                       Depth is a MODULE field now. MUTUALLY EXCLUSIVE with
                        --candidate-spec (pass one). Bounds-checked against the readonly 32
                        draft-depth cap.
     --candidate-spec <JSON>  Explicit per-module speculative spec for the candidate leg (e.g.
@@ -484,9 +486,13 @@ struct MeasureJobArgs {
     /// `measure_job::candidate_regime_for_spec` (the single production rule). The serial control leg
     /// is always teacher-forced.
     candidate_regime: measure_job::LegRegime,
-    /// R13 — `--mtp-depth` (replaces `--depth`): candidate MTP depth, default 2. Derived from
-    /// `candidate_spec.mtp.depth`; sealed as the `mtp_depth` mirror (0 for a non-mtp candidate).
-    mtp_depth: usize,
+    /// R13 — `--mtp-depth` (replaces `--depth`): candidate MTP depth. Derived from
+    /// `candidate_spec.mtp.depth`; sealed as the `mtp_depth` mirror (`Some(0)` for a non-mtp
+    /// candidate, matching the serial-control vocabulary). `None` = the operator requested no
+    /// depth and the ENGINE'S DRAFTER DECIDES (David ruling 2026-08-27) — the seal then carries no
+    /// `mtp_depth` at all rather than presenting benchd's retired default as if it described the
+    /// run; the operating depth is what the engine's `effective_spec` echo reports.
+    mtp_depth: Option<usize>,
     /// spec (docs/spec-config-design.md) — the resolved candidate/baseline declared specs + sources.
     candidate_spec: bench_protocol::SpecConfig,
     baseline_spec: bench_protocol::SpecConfig,
@@ -876,10 +882,10 @@ fn parse_measure_job_args(args: &[String]) -> Result<Option<MeasureJobArgs>, Str
                 .to_string(),
         );
     }
-    // #105 cycle-5 finding 5 — remember whether the operator ACTUALLY passed `--mtp-depth`, so the
-    // sealed spec_source can distinguish a declared depth from benchd's built-in default.
-    let mtp_depth_flag_given = mtp_depth.is_some();
-    let mtp_depth = mtp_depth.unwrap_or(measure_job::DEFAULT_MTP_DEPTH);
+    // David ruling 2026-08-27 — NO built-in default depth. Depth is the participant's variable
+    // (their drafter code sets it); an omitted `--mtp-depth` therefore builds the engine-decides
+    // spec `{"mode":"mtp","mtp":{}}` rather than injecting benchd's retired DEFAULT_MTP_DEPTH as a
+    // request the engine is then forced to echo. The flag stays for explicit experiments.
     let min_pairs = min_pairs.ok_or("missing required --min-pairs")?;
     let target_pairs = target_pairs.ok_or("missing required --target-pairs")?;
     let tag = tag.ok_or("missing required --tag")?;
@@ -896,36 +902,33 @@ fn parse_measure_job_args(args: &[String]) -> Result<Option<MeasureJobArgs>, Str
     );
 
     // spec (docs/spec-config-design.md, steps 4/5) — resolve the per-leg declared specs.
-    // Candidate: a `--candidate-spec` JSON override (spec_source "cli-override"), else the default
-    // built from `--mtp-depth` (`{"mode":"mtp","mtp":{"depth":D}}`). #105 H-C — that default's honest
-    // source is the convenience flag ("mtp-depth-flag" when it was passed, "mtp-depth-default" when
-    // benchd's DEFAULT_MTP_DEPTH supplied it — cycle-5 finding 5), NOT the FALSE "contract-default"
-    // (no contract speculative-block parsing exists). Baseline: a `--baseline-spec` override, else
-    // `{"mode":"serial"}` (spec_source "serial-default").
-    let (candidate_spec, candidate_spec_source) = match &candidate_spec_json {
-        Some(json) => (
+    // Candidate: a `--candidate-spec` JSON override (spec_source "cli-override"), else `--mtp-depth D`
+    // builds `{"mode":"mtp","mtp":{"depth":D}}` (spec_source "mtp-depth-flag"), else the
+    // ENGINE-DECIDES default `{"mode":"mtp","mtp":{}}` (spec_source "mtp-engine-default") — David
+    // ruling 2026-08-27: depth is the participant's variable, so an omitted flag names NO depth and
+    // the engine's module resolves its own, reporting it in the effective_spec echo. Baseline: a
+    // `--baseline-spec` override, else `{"mode":"serial"}` (spec_source "serial-default").
+    let (candidate_spec, candidate_spec_source) = match (&candidate_spec_json, mtp_depth) {
+        (Some(json), _) => (
             measure_job::parse_spec_override(json)?,
             measure_job::SPEC_SOURCE_CLI_OVERRIDE.to_string(),
         ),
-        None => (
+        (None, Some(depth)) => (
             // Medium (#105) — u32 TRUNCATION GUARD: `mtp.depth` is a u32 module field, so a usize
             // `--mtp-depth` that does not fit u32 must ERROR, never wrap silently to a small value
             // that would sneak under the depth cap. (A cast `as u32` truncates; try_from does not.)
-            bench_protocol::SpecConfig::mtp(u32::try_from(mtp_depth).map_err(|_| {
+            bench_protocol::SpecConfig::mtp(u32::try_from(depth).map_err(|_| {
                 format!(
-                    "--mtp-depth {mtp_depth} does not fit a u32 (mtp.depth is a u32 module field); \
+                    "--mtp-depth {depth} does not fit a u32 (mtp.depth is a u32 module field); \
                      a plausible depth is a small integer bounded by the {} draft-depth cap",
                     measure_job::DEFAULT_MAX_DRAFT_DEPTH_CAP
                 )
             })?),
-            // #105 cycle-5 finding 5 — HONEST source: `--mtp-depth` given → the flag built it;
-            // omitted → benchd's DEFAULT_MTP_DEPTH built it. The old code sealed "mtp-depth-flag"
-            // on both, naming a flag the operator never passed on the default path.
-            if mtp_depth_flag_given {
-                measure_job::SPEC_SOURCE_MTP_DEPTH_FLAG.to_string()
-            } else {
-                measure_job::SPEC_SOURCE_MTP_DEPTH_DEFAULT.to_string()
-            },
+            measure_job::SPEC_SOURCE_MTP_DEPTH_FLAG.to_string(),
+        ),
+        (None, None) => (
+            bench_protocol::SpecConfig::mtp_engine_default(),
+            measure_job::SPEC_SOURCE_MTP_ENGINE_DEFAULT.to_string(),
         ),
     };
     let (baseline_spec, baseline_spec_source) = match &baseline_spec_json {
@@ -961,9 +964,16 @@ fn parse_measure_job_args(args: &[String]) -> Result<Option<MeasureJobArgs>, Str
     measure_job::validate_spec_module_coherent(&baseline_spec)?;
     measure_job::validate_spec_capped(&candidate_spec, max_draft_depth_cap)?;
     measure_job::validate_spec_capped(&baseline_spec, max_draft_depth_cap)?;
-    // Keep the sealed `mtp_depth` mirror consistent with the candidate spec's module depth (serial /
-    // non-mtp candidates seal depth 0, matching the serial-control constant vocabulary).
-    let mtp_depth = candidate_spec.mtp.map(|m| m.depth as usize).unwrap_or(0);
+    // Keep the sealed `mtp_depth` mirror consistent with the candidate spec's module depth: a
+    // requested depth seals verbatim; a non-mtp candidate seals `Some(0)` (the serial-control
+    // vocabulary); an engine-decides mtp candidate (depth left to the module) seals NOTHING —
+    // `None` — because a depth benchd never requested must not be presented as if it described the
+    // run (David ruling 2026-08-27). The operating value lives in the engine's echoed
+    // `effective_spec`, sealed per leg.
+    let mtp_depth = match &candidate_spec.mtp {
+        Some(m) => m.depth.map(|d| d as usize),
+        None => Some(0),
+    };
 
     // W3 — the CANDIDATE LEG'S TIMED REGIME, derived from the declared candidate spec by the single
     // production rule (`candidate_regime_for_spec`): a speculating candidate (mtp today, dflash when
@@ -1482,16 +1492,24 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
             .ok()
             .as_deref(),
     );
-    for (hd, labels) in [
-        (
+    // The DFlash pair is only VALIDATED for a `dflash` candidate, the same scope its own die-8
+    // requirement (`enforce_dflash_head_present`) and its spawn-flag emission
+    // (`paired_leg_spawn_args`) use. The env is resolved mode-independently above, so an operator
+    // shell still carrying a `QMTP_DFLASH_HEAD_DIR` export from an earlier dflash run — pointing at
+    // a workspace that has since been swept — would otherwise die-8 an unrelated mtp run for a
+    // drafter that run never loads. The MTP-family pair stays unscoped: it is the standing
+    // behaviour on every track and this lane does not widen or narrow it.
+    let validated_head_dirs = [
+        Some((
             head_dirs.as_ref(),
             ("QMTP_HEAD_DIR", "QMTP_CANDIDATE_HEAD_DIR"),
-        ),
-        (
+        )),
+        (args.candidate_spec.mode == bench_protocol::SPEC_MODE_DFLASH).then_some((
             dflash_head_dirs.as_ref(),
             ("QMTP_DFLASH_HEAD_DIR", "QMTP_CANDIDATE_DFLASH_HEAD_DIR"),
-        ),
-    ] {
+        )),
+    ];
+    for (hd, labels) in validated_head_dirs.into_iter().flatten() {
         let Some(hd) = hd else { continue };
         for (label, dir) in [(labels.0, &hd.head_dir), (labels.1, &hd.candidate_head_dir)] {
             if !Path::new(dir).is_dir() {
@@ -1798,8 +1816,17 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
     // `UNVERIFIED(measure-job)` and therefore covered by no test at all. A mutation that swapped
     // the candidate leg's drafter for the pinned one passed the whole suite; against
     // `paired_leg_spawn_args` it does not.
-    let (serial_base_args, candidate_base_args) =
-        measure_job::paired_leg_spawn_args(&head_dirs, dflash_head_dirs.as_ref(), candidate_regime);
+    //
+    // The candidate MODE is passed in because the DFlash channel is scoped to a `dflash` candidate:
+    // the env behind `dflash_head_dirs` is resolved mode-independently, so a stale
+    // `QMTP_DFLASH_HEAD_DIR` export would otherwise put `--dflash-head` on both legs of an mtp pair
+    // and kill it pre-hello against any engine build that predates the flag.
+    let (serial_base_args, candidate_base_args) = measure_job::paired_leg_spawn_args(
+        &head_dirs,
+        dflash_head_dirs.as_ref(),
+        candidate_regime,
+        &args.candidate_spec.mode,
+    );
     // #109 window-2 finding 3 — fence BOTH legs' argv against the verb's accepted option surface
     // before any worker is spawned, so a flag the engine would reject dies here, naming itself,
     // rather than as one opaque "engine closed the stream" infra reject per leg per pair.
@@ -5367,14 +5394,15 @@ mod tests {
         .collect();
         let ok = parse_measure_job_args(&full).unwrap().unwrap();
         assert_eq!(ok.tokens, 128);
-        assert_eq!(ok.mtp_depth, 2);
+        assert_eq!(ok.mtp_depth, Some(2));
         // #105 cycle-5 finding 5 — `--mtp-depth` WAS passed here, so the flag is the honest source.
         assert_eq!(
             ok.candidate_spec_source,
             measure_job::SPEC_SOURCE_MTP_DEPTH_FLAG
         );
-        // ...and with the flag OMITTED the spec comes from DEFAULT_MTP_DEPTH, which must NOT seal
-        // "mtp-depth-flag" (naming a flag the operator never passed).
+        // ...and with the flag OMITTED the candidate is the ENGINE-DECIDES spec (David ruling
+        // 2026-08-27): `{"mode":"mtp","mtp":{}}`, no depth requested, no `mtp_depth` sealed —
+        // benchd's retired DEFAULT_MTP_DEPTH must NOT be injected as a request.
         let no_flag: Vec<String> = full
             .iter()
             .enumerate()
@@ -5384,11 +5412,16 @@ mod tests {
             .map(|(_, s)| s.clone())
             .collect();
         let defaulted = parse_measure_job_args(&no_flag).unwrap().unwrap();
-        assert_eq!(defaulted.mtp_depth, measure_job::DEFAULT_MTP_DEPTH);
+        assert_eq!(defaulted.mtp_depth, None, "no depth requested, none sealed");
+        assert_eq!(
+            defaulted.candidate_spec,
+            bench_protocol::SpecConfig::mtp_engine_default(),
+            "the no-flag candidate names no depth: the engine's drafter decides"
+        );
         assert_eq!(
             defaulted.candidate_spec_source,
-            measure_job::SPEC_SOURCE_MTP_DEPTH_DEFAULT,
-            "the no-flag path seals the DEFAULT source, not the flag source"
+            measure_job::SPEC_SOURCE_MTP_ENGINE_DEFAULT,
+            "the no-flag path seals the ENGINE-DECIDES source, not the flag source"
         );
         assert_eq!(ok.goldens, vec![PathBuf::from("g")]);
         assert_eq!(ok.min_pairs, 3);
@@ -5774,16 +5807,15 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
 
-        // Defaults: --mtp-depth 2, once, no trio, both booleans off.
+        // Defaults: engine-decides depth (no request), once, no trio, both booleans off.
         let d = parse_measure_job_args(&base).unwrap().unwrap();
         assert_eq!(
-            d.mtp_depth,
-            measure_job::DEFAULT_MTP_DEPTH,
-            "default --mtp-depth is 2"
+            d.mtp_depth, None,
+            "no --mtp-depth means NO requested depth (David ruling 2026-08-27), not a default 2"
         );
-        // W3 — the DEFAULT `--mtp-depth 2` candidate spec is `mode=mtp`, which selects the v1.1
-        // FREE-RUN regime, whose window is the RULED N = 128. The 512 teacher-forced default now
-        // applies to a SERIAL candidate (the only shape that still runs teacher-forced).
+        // W3 — the DEFAULT candidate spec is still `mode=mtp` (engine-decides), which selects the
+        // v1.1 FREE-RUN regime, whose window is the RULED N = 128. The 512 teacher-forced default
+        // now applies to a SERIAL candidate (the only shape that still runs teacher-forced).
         assert_eq!(d.candidate_regime, measure_job::LegRegime::FreeRunV1_1);
         assert_eq!(
             d.tokens,
@@ -5824,13 +5856,15 @@ mod tests {
             "renamed-flag error names the new flag: {err}"
         );
 
-        // Default candidate spec is built from --mtp-depth (mode mtp), baseline defaults to serial.
-        assert_eq!(d.candidate_spec, bench_protocol::SpecConfig::mtp(2));
+        // Default candidate spec is the ENGINE-DECIDES mtp spec (David ruling 2026-08-27): `base`
+        // passes NO --mtp-depth, so benchd names no depth — `{"mode":"mtp","mtp":{}}` — and the
+        // honest source is "mtp-engine-default". Baseline defaults to serial.
+        assert_eq!(
+            d.candidate_spec,
+            bench_protocol::SpecConfig::mtp_engine_default()
+        );
         assert_eq!(d.baseline_spec, bench_protocol::SpecConfig::serial());
-        // #105 cycle-5 finding 5 — `base` passes NO --mtp-depth, so the spec came from
-        // DEFAULT_MTP_DEPTH: the honest source is "mtp-depth-default". Sealing "mtp-depth-flag"
-        // here (the old assertion) named a flag this invocation never carried.
-        assert_eq!(d.candidate_spec_source, "mtp-depth-default");
+        assert_eq!(d.candidate_spec_source, "mtp-engine-default");
         assert_eq!(d.baseline_spec_source, "serial-default");
 
         // Depth-0-via-serial-mode (docs/spec-config-design.md step 4): the ">= 2" floor is RETIRED.

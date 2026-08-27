@@ -387,11 +387,14 @@ pub fn run_timed_mode(candidate_regime: LegRegime) -> &'static str {
 /// ever lands, it gets its own source string — the decoration always names where the spec ACTUALLY
 /// came from.
 pub const SPEC_SOURCE_MTP_DEPTH_FLAG: &str = "mtp-depth-flag";
-/// #105 cycle-5 finding 5 — the honest source when NO `--mtp-depth` was given and the candidate
-/// spec was built from [`DEFAULT_MTP_DEPTH`]. Sealing `"mtp-depth-flag"` on that path named a flag
-/// the operator never passed; the two cases are materially different provenance (an operator's
-/// declared depth vs benchd's built-in default), so they get distinct decorations.
-pub const SPEC_SOURCE_MTP_DEPTH_DEFAULT: &str = "mtp-depth-default";
+/// David ruling 2026-08-27 — the honest source when NO `--mtp-depth` was given: the candidate spec
+/// is the ENGINE-DECIDES `{"mode":"mtp","mtp":{}}` ([`SpecConfig::mtp_engine_default`]). Depth is
+/// the participant's variable (their drafter code sets it), so benchd names no depth at all; the
+/// engine's module resolves its own and reports it in the `effective_spec` echo. This RETIRES the
+/// old `"mtp-depth-default"` provenance (benchd injecting `DEFAULT_MTP_DEPTH = 2` as a request the
+/// engine was then forced to echo — the 2026-08-27 depth experiment sealed that parroted 2 while an
+/// in-engine pin drafted at 1). Old artifacts still carry the retired string; nothing writes it.
+pub const SPEC_SOURCE_MTP_ENGINE_DEFAULT: &str = "mtp-engine-default";
 /// #105 H-C — the honest source for a `--candidate-spec`/`--baseline-spec` JSON override.
 pub const SPEC_SOURCE_CLI_OVERRIDE: &str = "cli-override";
 /// #105 H-C — the honest source for the baseline default `{"mode":"serial"}`.
@@ -401,9 +404,9 @@ pub const SPEC_SOURCE_SERIAL_DEFAULT: &str = "serial-default";
 /// decode window; there is NO separately-scored prefill phase, so the component is `"none"`.
 pub const PREFILL_COMPONENT_NONE: &str = "none";
 
-/// R13 — the default candidate `--mtp-depth` when the flag is omitted (live wrapper default 2,
-/// W:542). Depth 0 is the serial control; depth 1 is a diagnostic; a real candidate needs >= 2.
-pub const DEFAULT_MTP_DEPTH: usize = 2;
+// R13's `DEFAULT_MTP_DEPTH = 2` (the injected default when `--mtp-depth` was omitted) is RETIRED —
+// David ruling 2026-08-27: an omitted flag builds the engine-decides spec instead
+// ([`SPEC_SOURCE_MTP_ENGINE_DEFAULT`]); benchd injects no depth of its own.
 
 /// R13 — the default `--tokens` decode window (live wrapper default 512, W:539; was 128).
 pub const DEFAULT_TOKENS: usize = 512;
@@ -444,6 +447,32 @@ pub const MEDIAN_RULE_EVEN_N: &str = "even_n_mean_of_two_central_order_statistic
 /// R16 — `aggregate.mtp_max_draft_depth`: the sealed maximum MTP draft depth (8), verbatim the live
 /// wrapper's published constant (Y:2535 passes 8).
 pub const MTP_MAX_DRAFT_DEPTH: usize = 8;
+
+/// Seal the ARM-SPECIFIC draft-depth lever(s) for an aggregate, from the candidate leg's
+/// engine-ECHOED effective spec — the single decision that keeps `mtp_max_draft_depth` and
+/// `dflash_effective_depth` mutually exclusive so a run never carries the wrong arm's depth field.
+///
+/// * A DFlash run — candidate leg echoed `mode == "dflash"` — seals `dflash_effective_depth` from
+///   the echo's OWN `dflash.depth` ([`SpecConfig::dflash_depth`], structurally decoded out of the
+///   opaque module block) and carries NO `mtp_max_draft_depth`: the MTP cap does not govern that arm.
+/// * Every other run (the MTP arm and its serial control / teacher-forced runs, which echo `mtp` or
+///   `serial`, and the batched MTP cohort path) seals the fixed [`MTP_MAX_DRAFT_DEPTH`] cap and no
+///   dflash field — unchanged from before this seal existed.
+///
+/// Returns `(mtp_max_draft_depth, dflash_effective_depth)`. When no candidate echo is available (an
+/// empty / all-die-5 pool) it defaults to the historical MTP cap, so the seal shape for a run that
+/// measured nothing is unchanged. A dflash echo whose block omits a numeric `depth` yields
+/// `(None, None)` — honest, never a fabricated depth and never the MTP constant standing in.
+fn arm_draft_depth_seals(
+    candidate_effective_spec: Option<&SpecConfig>,
+) -> (Option<usize>, Option<usize>) {
+    match candidate_effective_spec {
+        Some(spec) if spec.mode == SPEC_MODE_DFLASH => {
+            (None, spec.dflash_depth().map(|d| d as usize))
+        }
+        _ => (Some(MTP_MAX_DRAFT_DEPTH), None),
+    }
+}
 
 /// R16 — the `teacher_forced_v1` `aggregate.decode_speedup_floor`: the LOOSE SANITY floor
 /// (`MIN_ACCEPTED_SPEEDUP` = 0.50). NAME-TRAP: this is NOT the ranked 0.90 performance floor (which
@@ -967,14 +996,15 @@ pub fn mode_is_cohort_capable(mode: &str) -> bool {
 /// (serial/dflash/dspark) has no `mtp.depth`, so the cap does not apply. On the official/scored path
 /// `cap` is the readonly constant 32 (env ignored, submission-proof); `--local-dev` may raise it.
 pub fn validate_spec_capped(spec: &SpecConfig, cap: usize) -> Result<(), String> {
-    if let Some(mtp) = &spec.mtp {
-        if mtp.depth as usize > cap {
+    // An engine-decides mtp block (`depth` absent — David ruling 2026-08-27) has no requested depth
+    // to bound; the engine's own envelope clamp governs, and the echo reports what it resolved.
+    if let Some(depth) = spec.mtp.as_ref().and_then(|m| m.depth) {
+        if depth as usize > cap {
             return Err(format!(
-                "spec mtp.depth {} exceeds the maximum draft depth cap {cap} (defensive bound \
+                "spec mtp.depth {depth} exceeds the maximum draft depth cap {cap} (defensive bound \
                  mirroring the engine's {MAX_DRAFT_DEPTH_ENV}); on the official/scored path the cap \
                  is the readonly constant {DEFAULT_MAX_DRAFT_DEPTH_CAP} and the env override is \
-                 ignored",
-                mtp.depth
+                 ignored"
             ));
         }
     }
@@ -1066,13 +1096,15 @@ pub fn validate_spec_module_coherent(spec: &SpecConfig) -> Result<(), String> {
                         .to_string(),
                 );
             }
-            Some(mtp) if mtp.depth == 0 => {
+            Some(mtp) if mtp.depth == Some(0) => {
                 return Err(
                     "spec mode \"mtp\" with mtp.depth 0 is not a candidate: depth 0 is the serial \
                      control ({\"mode\":\"serial\"}), so an mtp(0) candidate is rejected"
                         .to_string(),
                 );
             }
+            // A present block with an ABSENT depth is the engine-decides form (David ruling
+            // 2026-08-27): the module resolves its own depth and the echo reports it.
             Some(_) => {}
         }
     }
@@ -1233,11 +1265,30 @@ pub fn leg_spawn_args(
 /// The serial control's REGIME is derived here too ([`serial_control_regime_for`], the Fable
 /// same-series rule), so the one function that decides which head each leg gets also decides which
 /// series each leg runs — the two facts that must agree between the legs, decided together.
+///
+/// CROSS-MODE SCOPING — the DFlash argv channel belongs to a `dflash` CANDIDATE and to nothing
+/// else. `dflash_heads` is resolved from the environment (`QMTP_DFLASH_HEAD_DIR` /
+/// `QMTP_CANDIDATE_DFLASH_HEAD_DIR`) MODE-INDEPENDENTLY, so a box that still has the export in its
+/// shell from an earlier dflash run would otherwise hand `--dflash-head` to BOTH legs of an `mtp`
+/// (or `serial`) pair. On any engine build that predates the flag, the `runtime-worker` verb exits
+/// 1 on the first unknown option BEFORE the hello, which reaches benchd as the opaque *"engine
+/// closed the stream before returning a response"* — one indistinguishable infra reject per leg
+/// per pair, on a run that has nothing to do with dflash. `RUNTIME_WORKER_ACCEPTED_FLAGS` cannot
+/// catch that: it mirrors the flag surface of the engine benchd was BUILT against, not the one on
+/// the box. Scoping the emission to the declared candidate mode is what keeps a stale export
+/// inert, and it is the same scope the env's own die-8 requirement uses
+/// ([`enforce_dflash_head_present`]) — one mode fence, applied to both halves of the channel.
+///
+/// A `dflash` candidate is UNCHANGED: both legs still receive their own per-leg dir (the serial
+/// control the PINNED drafter, the candidate its BYO one), because the control leg loads the
+/// drafter too and its residency charges the denominator.
 pub fn paired_leg_spawn_args(
     heads: &HeadDirs,
     dflash_heads: Option<&HeadDirs>,
     candidate_regime: LegRegime,
+    candidate_mode: &str,
 ) -> (Vec<String>, Vec<String>) {
+    let dflash_heads = dflash_heads.filter(|_| candidate_mode == SPEC_MODE_DFLASH);
     let serial = leg_spawn_args(
         &heads.head_dir,
         dflash_heads.map(|d| d.head_dir.as_str()),
@@ -2675,11 +2726,13 @@ pub struct MeasureJobConfig {
     pub run_timestamp: String,
     /// `--tokens` → the depth-0 decode window both legs time.
     pub tokens: usize,
-    /// R13 — `--mtp-depth` → the candidate MTP depth (>= 2; serial control is the depth-0 constant).
+    /// R13 — `--mtp-depth` → the candidate MTP depth (serial control is the depth-0 constant).
     /// Recorded, not scored. Since the spec re-home (`docs/spec-config-design.md`), depth is a MODULE
     /// field on [`candidate_spec`](Self::candidate_spec); this mirror stays for the sealed
-    /// `mtp_depth`/provenance and is derived from the candidate spec's `mtp.depth`.
-    pub mtp_depth: usize,
+    /// `mtp_depth`/provenance and is derived from the candidate spec's `mtp.depth`. `None` = the
+    /// engine-decides spec (David ruling 2026-08-27): no depth was requested, none is sealed — the
+    /// operating value is the engine's echoed `effective_spec`, per leg.
+    pub mtp_depth: Option<usize>,
     /// The candidate leg's declared per-module speculative spec (`docs/spec-config-design.md`): from
     /// the submission/contract, or a `--candidate-spec` override. Plumbed onto the timed decode
     /// window (the runner enforces the never-ignored echo) and sealed as the declared spec.
@@ -3301,7 +3354,8 @@ pub struct BootstrapAuthorInput<'a> {
     pub pooled_serial_mean: f64,
     /// The run's decode window; recorded as the entry's `decode_tokens` (no inherit).
     pub tokens: usize,
-    pub mtp_depth: usize,
+    /// The run's declared MTP depth knob; `None` (engine-decides) authors NO `mtp_depth` key.
+    pub mtp_depth: Option<usize>,
     pub serial_control_depth: usize,
     pub pairs_total: usize,
 }
@@ -3402,19 +3456,21 @@ pub fn build_bootstrap_calibration(
     let targets = targets
         .as_object_mut()
         .ok_or_else(|| "existing `targets` is not a JSON object".to_string())?;
-    targets.insert(
-        target_id.to_string(),
-        json!({
-            "serial_decode_seconds_per_token_mean": pooled_serial_mean,
-            "serial_band_low": default_band_low(),
-            "serial_band_high": default_band_high(),
-            "decode_tokens": tokens,
-            "mtp_depth": mtp_depth,
-            "serial_control_depth": serial_control_depth,
-            "provisional": true,
-            "pairs_total": pairs_total,
-        }),
-    );
+    let mut entry = json!({
+        "serial_decode_seconds_per_token_mean": pooled_serial_mean,
+        "serial_band_low": default_band_low(),
+        "serial_band_high": default_band_high(),
+        "decode_tokens": tokens,
+        "serial_control_depth": serial_control_depth,
+        "provisional": true,
+        "pairs_total": pairs_total,
+    });
+    // Absent-not-null: an engine-decides run (David ruling 2026-08-27) declared no depth knob, so
+    // the calibration entry carries no `mtp_depth` key rather than a null or an invented value.
+    if let Some(depth) = mtp_depth {
+        entry["mtp_depth"] = json!(depth);
+    }
+    targets.insert(target_id.to_string(), entry);
 
     serde_json::to_string_pretty(&Value::Object(root))
         .map_err(|e| format!("calibration serialization failed: {e}"))
@@ -5730,10 +5786,16 @@ pub struct Results {
     /// R15 — the serial control's depth (0); the serial leg runs the same `mtp-timed` verb at
     /// `--mtp-depth 0`.
     pub serial_control_depth: usize,
-    /// R15 — the candidate leg's `--mtp-depth D`.
-    pub mtp_depth: usize,
+    /// R15 — the candidate leg's REQUESTED `--mtp-depth D`, sealed only when one was actually
+    /// requested. ABSENT (David ruling 2026-08-27) on an engine-decides run: this field is the
+    /// REQUEST, never the operating depth — `require_spec_echo` forces the engine to echo the
+    /// request verbatim, so it structurally cannot show an in-engine value (the 2026-08-27 depth
+    /// experiment sealed a parroted 2 while the pin drafted at 1). Consumers judge depth by the
+    /// echoed `effective_spec` and the realized `effective_mean_draft_len`, never this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtp_depth: Option<usize>,
     /// The candidate leg's DECLARED per-module speculative spec (`docs/spec-config-design.md`) and
-    /// its honest source (`mtp-depth-flag` / `mtp-depth-default` / `cli-override`). The
+    /// its honest source (`mtp-depth-flag` / `mtp-engine-default` / `cli-override`). The
     /// engine-echoed effective spec each
     /// leg actually ran is sealed per pair as `pairs[].serial_effective_spec` /
     /// `pairs[].candidate_effective_spec` (cycle-5 finding 6 — the old text named
@@ -5847,12 +5909,28 @@ pub struct Aggregate {
     /// R16 — RETIRED diagnostic (informational): the per-prompt normalized ratios (raw / no-op ref),
     /// for prompts that carry a no-op reference. NOT scored.
     pub normalized_ratios_informational: Vec<f64>,
-    /// R16 — the per-prompt engine-echoed effective mean draft length, in pool order.
+    /// R16 — the per-prompt effective mean draft length benchd COMPUTES from the per-round
+    /// `acceptance_lengths` it collected (`free_run::effective_mean_draft_len`, the trusted-measured
+    /// realized value) — NOT an engine echo. In pool order.
     pub effective_mean_draft_len_by_prompt: Vec<f64>,
-    /// R16 — the total engine-echoed non-drafting round count summed across prompts.
+    /// R16 — the total non-drafting round count benchd COMPUTES from the per-round
+    /// `acceptance_lengths` (`free_run::non_drafting_round_count`, trusted-measured — NOT an engine
+    /// echo), summed across prompts.
     pub non_drafting_round_count_total: usize,
-    /// R16 — the sealed maximum MTP draft depth ([`MTP_MAX_DRAFT_DEPTH`] = 8).
-    pub mtp_max_draft_depth: usize,
+    /// R16 — the sealed maximum MTP draft depth ([`MTP_MAX_DRAFT_DEPTH`] = 8). Sealed on the MTP
+    /// arm and its serial control / teacher-forced runs (the arms whose candidate leg echoes `mtp`
+    /// or `serial`) — the runs this cap governs. OMITTED on a DFlash run: the MTP cap is meaningless
+    /// there, and stamping it would misdescribe the run; a dflash run carries `dflash_effective_depth`
+    /// instead. Sealed by [`arm_draft_depth_seals`], which gates exactly one of the two depth fields on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtp_max_draft_depth: Option<usize>,
+    /// The DFlash arm's engine-ECHOED effective draft depth, structurally decoded out of the
+    /// candidate leg's `effective_spec.dflash.depth` ([`SpecConfig::dflash_depth`]) — the dflash
+    /// counterpart of `mtp_max_draft_depth`, NEVER a reuse of the MTP constant. Sealed EXACTLY on a
+    /// DFlash run (candidate leg echoed `mode == "dflash"`); OMITTED on the MTP/serial arms, whose
+    /// depth cap is `mtp_max_draft_depth`. Sealed by [`arm_draft_depth_seals`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dflash_effective_depth: Option<usize>,
     /// R16 — the per-prompt candidate head provenance sha256, in pool order.
     pub head_provenance_sha256_by_prompt: Vec<String>,
     /// R16 — the prefill component ([`PREFILL_COMPONENT_NONE`] = "none"; seed prefill inside decode).
@@ -6575,6 +6653,13 @@ fn build_results(
         .filter_map(|p| p.head_provenance_sha256.clone())
         .collect();
 
+    // Gate the ARM-SPECIFIC depth field on from the candidate leg's engine-ECHOED effective spec
+    // (the first prompt that accepted a pair — the echo is one arm across the run). A dflash run
+    // seals `dflash_effective_depth` and drops the MTP cap; every other run keeps the MTP cap.
+    let candidate_effective_spec = per_prompt.iter().find_map(|p| p.effective_spec.clone());
+    let (mtp_max_draft_depth, dflash_effective_depth) =
+        arm_draft_depth_seals(candidate_effective_spec.as_ref());
+
     let aggregate = Aggregate {
         baseline_serial_seconds_per_token_mean: pooled_serial_mean,
         candidate_mtp_seconds_per_token_mean: pooled_mtp_mean,
@@ -6592,7 +6677,8 @@ fn build_results(
         normalized_ratios_informational,
         effective_mean_draft_len_by_prompt,
         non_drafting_round_count_total,
-        mtp_max_draft_depth: MTP_MAX_DRAFT_DEPTH,
+        mtp_max_draft_depth,
+        dflash_effective_depth,
         head_provenance_sha256_by_prompt,
         prefill_component: PREFILL_COMPONENT_NONE,
         decode_speedup_floor,
@@ -6952,6 +7038,13 @@ fn build_cohort_results(
     let effective_mean_draft_len = accepted.first().map(|p| p.effective_mean_draft_len);
     let non_drafting_round_count = accepted.first().map(|p| p.non_drafting_round_count);
 
+    // Same arm-specific depth gate as the single-stream path (computed before `effective_spec`
+    // moves into `per_cohort`). The batch cohort driver is MTP/serial-only — dflash is single-
+    // stream by mode (`mode_is_cohort_capable`) — so this keeps the MTP cap here; the shared helper
+    // still drives it so the two paths can never diverge on the rule.
+    let (mtp_max_draft_depth, dflash_effective_depth) =
+        arm_draft_depth_seals(effective_spec.as_ref());
+
     let per_cohort = PerCohort {
         cohort_index: 0,
         cohort_sha256: cohort_id,
@@ -7003,7 +7096,8 @@ fn build_cohort_results(
         normalized_ratios_informational: Vec::new(),
         effective_mean_draft_len_by_prompt: effective_mean_draft_len.into_iter().collect(),
         non_drafting_round_count_total: non_drafting_round_count.unwrap_or(0),
-        mtp_max_draft_depth: MTP_MAX_DRAFT_DEPTH,
+        mtp_max_draft_depth,
+        dflash_effective_depth,
         head_provenance_sha256_by_prompt: head_provenance_sha256.into_iter().collect(),
         prefill_component: PREFILL_COMPONENT_NONE,
         decode_speedup_floor,
@@ -7542,6 +7636,37 @@ mod tests {
         })
     }
 
+    /// The DFlash arm's draft-depth lever a test drives (an arbitrary non-default value distinct
+    /// from the MTP cap of 8, so a test that finds it in the seal can only have read the ECHO —
+    /// never a stray MTP constant).
+    const DFLASH_DEPTH: u32 = 5;
+
+    /// A v1.1 FREE-RUN candidate leg for the DFLASH arm — the exact shape of [`inv_free_run`] but
+    /// echoing a `dflash` effective_spec carrying `dflash.depth` (single-stream: dflash is
+    /// cohort-incapable by mode). Drives the dflash depth seal the same way the mtp free-run leg
+    /// drives the mtp path.
+    fn inv_free_run_dflash(
+        spt: f64,
+        depth: u32,
+        acceptance_lengths: Vec<u32>,
+        n: usize,
+    ) -> bench_runner::Result<LegInvocation> {
+        let audit = free_run_audit(&acceptance_lengths, n);
+        Ok(LegInvocation {
+            benchd_seconds_per_token: spt,
+            wire_head_provenance: head_prov(CANDIDATE_HEAD_SHA),
+            gate_state: GateState::Fired,
+            telemetry: candidate_telemetry(),
+            wire_effective_spec: Some(SpecConfig::dflash(depth)),
+            regime: LegRegime::FreeRunV1_1,
+            free_run_audit: Some(audit),
+            cohort_audit: None,
+            cohort_phase_windows: None,
+            per_stream_timing: None,
+            cohort_committed_tokens_by_stream: None,
+        })
+    }
+
     /// Fable ruling — the closure-seam fake for the SAME-SERIES SERIAL CONTROL leg: the free-run
     /// regime, the depth-0 SERIAL wire echo, and the `[1]*N` histogram a non-speculating free-run
     /// window commits. The engine-driven counterpart is `free_run_serial_leg`; this one is for the
@@ -7629,7 +7754,7 @@ mod tests {
             tag: "qwen-mtp-mjob-test".to_string(),
             run_timestamp: "2026-08-19T00:00:00Z".to_string(),
             tokens: BENCHMARK_DECODE_STEPS,
-            mtp_depth: 2,
+            mtp_depth: Some(2),
             candidate_spec: SpecConfig::mtp(2),
             baseline_spec: SpecConfig::serial(),
             candidate_spec_source: SPEC_SOURCE_MTP_DEPTH_FLAG.to_string(),
@@ -7678,7 +7803,7 @@ mod tests {
     fn free_run_cfg(min_pairs: usize, target_pairs: usize) -> MeasureJobConfig {
         MeasureJobConfig {
             tokens: FREE_RUN_DECODE_TOKENS,
-            mtp_depth: FREE_RUN_DEPTH as usize,
+            mtp_depth: Some(FREE_RUN_DEPTH as usize),
             candidate_spec: SpecConfig::mtp(FREE_RUN_DEPTH),
             candidate_regime: LegRegime::FreeRunV1_1,
             ..test_cfg(min_pairs, target_pairs)
@@ -8506,7 +8631,7 @@ mod tests {
         let serial_calls = Cell::new(0usize);
         let candidate_calls = Cell::new(0usize);
         let mut cfg = test_cfg(1, 1);
-        cfg.mtp_depth = 8; // DECLARED D (candidate_spec provenance)
+        cfg.mtp_depth = Some(8); // DECLARED D (candidate_spec provenance)
         let out = run_measure_job(
             &[measure_golden()],
             &DirDigest::empty(),
@@ -8554,7 +8679,8 @@ mod tests {
         assert_eq!(out.results.timed_regime, Some("tf-serial-timed"));
         assert_eq!(out.results.serial_control_depth, 0);
         assert_eq!(
-            out.results.mtp_depth, 8,
+            out.results.mtp_depth,
+            Some(8),
             "declared depth D sealed as provenance"
         );
     }
@@ -8803,6 +8929,73 @@ mod tests {
             Some(CANDIDATE_HEAD_SHA),
             "head_provenance_sha256 sealed per prompt from the candidate leg's hello"
         );
+        // The MTP arm's depth cap is sealed; the dflash-specific field is OMITTED (mirror of the
+        // dflash direction in `dflash_run_seals_dflash_depth_and_drops_the_mtp_field`).
+        assert_eq!(
+            out.results.aggregate.mtp_max_draft_depth,
+            Some(MTP_MAX_DRAFT_DEPTH)
+        );
+        assert_eq!(out.results.aggregate.dflash_effective_depth, None);
+    }
+
+    #[test]
+    fn dflash_run_seals_dflash_depth_and_drops_the_mtp_field() {
+        // The dflash counterpart of `r15_per_side_heads_seal_candidate_head_provenance`: a
+        // single-stream free-run whose candidate leg echoes a DFLASH effective_spec carrying
+        // `dflash.depth`. The aggregate must (a) seal `dflash_effective_depth` = that ECHOED depth,
+        // structurally decoded out of the opaque `dflash` block (never the MTP constant), and
+        // (b) OMIT `mtp_max_draft_depth` entirely — that MTP-specific cap is meaningless on this arm.
+        let cfg = MeasureJobConfig {
+            candidate_spec: SpecConfig::dflash(DFLASH_DEPTH),
+            ..free_run_cfg(1, 1)
+        };
+        let n = BENCHMARK_DECODE_STEPS;
+        let out = run_measure_job(
+            &[measure_golden()],
+            &DirDigest::empty(),
+            "deadbeef",
+            &cfg,
+            |_p| ok_free_run_serial(),
+            move |_p: &TimingParams| {
+                inv_free_run_dflash(CANDIDATE_SPT, DFLASH_DEPTH, vec![4; n / 4], n)
+            },
+        )
+        .unwrap();
+        assert!(out.candidate_accepted, "the dflash candidate clears die-5");
+
+        // The candidate leg's echoed effective spec is the dflash spec carrying the depth lever.
+        assert_eq!(
+            out.results.pairs[0].candidate_effective_spec,
+            SpecConfig::dflash(DFLASH_DEPTH),
+            "candidate leg echoed the dflash effective_spec"
+        );
+
+        // Typed seal: dflash depth sealed from the ECHO, the MTP cap absent.
+        let agg = &out.results.aggregate;
+        assert_eq!(
+            agg.dflash_effective_depth,
+            Some(DFLASH_DEPTH as usize),
+            "dflash_effective_depth = the engine-echoed dflash.depth"
+        );
+        assert_eq!(
+            agg.mtp_max_draft_depth, None,
+            "the MTP-specific cap is NOT stamped on a dflash run"
+        );
+        assert_ne!(
+            agg.dflash_effective_depth,
+            Some(MTP_MAX_DRAFT_DEPTH),
+            "NAME-TRAP: the dflash depth is the ECHO (5), never the MTP constant (8)"
+        );
+
+        // Serialized shape the website reads: the dflash field present, the mtp field OMITTED (not
+        // a fabricated null), the two arms' depth fields mutually exclusive.
+        let v = serde_json::to_value(&out.results).unwrap();
+        let agg_json = &v["aggregate"];
+        assert_eq!(agg_json["dflash_effective_depth"], json!(DFLASH_DEPTH));
+        assert!(
+            agg_json.get("mtp_max_draft_depth").is_none(),
+            "mtp_max_draft_depth is OMITTED from a dflash run's serialized aggregate"
+        );
     }
 
     #[test]
@@ -8909,7 +9102,8 @@ mod tests {
         assert!(out.candidate_accepted);
         // The declared depth is still sealed as the top-level knob (what we asked for / provenance)...
         assert_eq!(
-            out.results.mtp_depth, 2,
+            out.results.mtp_depth,
+            Some(2),
             "top-level mtp_depth is the declared knob"
         );
         // ...but the effective_spec echo (what the engine ACTUALLY ran) is SERIAL, sealed as fact.
@@ -9450,7 +9644,7 @@ mod tests {
         );
         let mtp_wire = bench_protocol::SpecConfig::mtp(4);
         assert_eq!(
-            mtp_wire.mtp.as_ref().map(|m| m.depth),
+            mtp_wire.mtp.as_ref().and_then(|m| m.depth),
             Some(4),
             "free-run depth rides the spec"
         );
@@ -9628,7 +9822,7 @@ mod tests {
             track_id: "qwen3.8-27b-mtp-v1",
             pooled_serial_mean: 0.038,
             tokens: 512,
-            mtp_depth: 2,
+            mtp_depth: Some(2),
             serial_control_depth: 0,
             pairs_total: 6,
         };
@@ -9900,7 +10094,7 @@ mod tests {
 
             pooled_serial_mean: 0.038,
             tokens: 512,
-            mtp_depth: 2,
+            mtp_depth: Some(2),
             serial_control_depth: 0,
             pairs_total: 6,
         };
@@ -10028,7 +10222,7 @@ mod tests {
 
                 pooled_serial_mean: 0.037,
                 tokens: 512,
-                mtp_depth: 2,
+                mtp_depth: Some(2),
                 serial_control_depth: 0,
                 pairs_total: 3,
             },
@@ -10805,7 +10999,7 @@ mod tests {
         assert!(validate_spec_mode_allowed(
             &SpecConfig {
                 mode: "serial".to_string(),
-                mtp: Some(bench_protocol::MtpSpec { depth: 2 }),
+                mtp: Some(bench_protocol::MtpSpec { depth: Some(2) }),
                 dflash: None,
                 dspark: None,
             },
@@ -10823,7 +11017,7 @@ mod tests {
         // mtp mode carrying a stray dflash block (cross-module) → reject.
         let cross = SpecConfig {
             mode: "mtp".to_string(),
-            mtp: Some(bench_protocol::MtpSpec { depth: 2 }),
+            mtp: Some(bench_protocol::MtpSpec { depth: Some(2) }),
             dflash: Some(serde_json::json!({})),
             dspark: None,
         };
@@ -11108,6 +11302,13 @@ mod tests {
             agg["mtp_max_draft_depth"],
             json!(8),
             "sealed max draft depth 8"
+        );
+        // This is an MTP-arm run (serial teacher-forced echo), so the DFlash-specific depth field is
+        // OMITTED entirely — it belongs only to a dflash run
+        // (`dflash_run_seals_dflash_depth_and_drops_the_mtp_field`).
+        assert!(
+            agg.get("dflash_effective_depth").is_none(),
+            "no dflash depth field on an MTP-arm run"
         );
         assert_eq!(agg["published_speedup_ceiling"].as_f64().unwrap(), 5.0);
         // per-prompt-sourced vectors (pool order, length pool_size).
@@ -12444,7 +12645,7 @@ mod tests {
     fn cohort_cfg(min_pairs: usize, target_pairs: usize) -> MeasureJobConfig {
         MeasureJobConfig {
             tokens: FREE_RUN_DECODE_TOKENS,
-            mtp_depth: FREE_RUN_DEPTH as usize,
+            mtp_depth: Some(FREE_RUN_DEPTH as usize),
             candidate_spec: SpecConfig::mtp(FREE_RUN_DEPTH),
             candidate_regime: b8_regime(),
             // The CERTIFIED ruled pair — a cohort config carries it exactly as the real caller
@@ -15139,8 +15340,12 @@ mod tests {
         // head families at once. A swap of any one of the four is a silent wrong measurement — the
         // candidate's drafter resident on the DENOMINATOR leg — and each swap fails here.
         let mtp_heads = resolve_head_dirs(Some("/pinned/mtp"), Some("/byo/mtp")).unwrap();
-        let (serial_wired, candidate_wired) =
-            paired_leg_spawn_args(&mtp_heads, Some(&heads), LegRegime::FreeRunV1_1);
+        let (serial_wired, candidate_wired) = paired_leg_spawn_args(
+            &mtp_heads,
+            Some(&heads),
+            LegRegime::FreeRunV1_1,
+            SPEC_MODE_DFLASH,
+        );
         let value_after = |args: &[String], flag: &str| -> String {
             let at = args.iter().position(|a| a == flag).expect("flag present");
             args[at + 1].clone()
@@ -15170,7 +15375,8 @@ mod tests {
         );
         // No drafter staged ⇒ neither leg carries the flag (the MTP-only no-perturbation control,
         // through the production selection this time).
-        let (s_none, c_none) = paired_leg_spawn_args(&mtp_heads, None, LegRegime::FreeRunV1_1);
+        let (s_none, c_none) =
+            paired_leg_spawn_args(&mtp_heads, None, LegRegime::FreeRunV1_1, SPEC_MODE_DFLASH);
         for args in [&s_none, &c_none] {
             assert!(!args.iter().any(|a| a == DFLASH_HEAD_FLAG), "{args:?}");
         }
@@ -15231,5 +15437,83 @@ mod tests {
             );
             assert!(enforce_dflash_head_present(mode, staged.as_ref()).is_ok());
         }
+    }
+
+    /// The `--dflash-head` EMISSION is scoped to a `dflash` candidate, not to whether the env
+    /// happens to be exported.
+    ///
+    /// The env behind `dflash_head_dirs` is resolved MODE-INDEPENDENTLY in `execute_measure_job`,
+    /// so before this scoping an operator shell still carrying `QMTP_DFLASH_HEAD_DIR` from an
+    /// earlier dflash run put `--dflash-head` on BOTH legs of every subsequent pair — including an
+    /// `mtp` pair. Against any engine build that predates the flag, the `runtime-worker` verb exits
+    /// 1 on the first unknown option BEFORE the hello, so each leg of each pair died as the opaque
+    /// "engine closed the stream before returning a response". `validate_spawn_argv` cannot catch
+    /// it: it mirrors the flag surface benchd was BUILT against, not the engine on the box.
+    ///
+    /// REVERT-PROOF: drop the `candidate_mode` filter from `paired_leg_spawn_args` (emit whenever
+    /// the dirs are `Some`) and the mtp/serial assertions below go red; scope it the wrong way
+    /// (emit only for non-dflash) and the dflash assertions go red.
+    #[test]
+    fn dflash_spawn_flag_is_scoped_to_a_dflash_candidate() {
+        let mtp_heads = resolve_head_dirs(Some("/pinned/mtp"), Some("/byo/mtp")).unwrap();
+        let dflash_heads = resolve_head_dirs(Some("/pinned/dflash"), Some("/byo/dflash")).unwrap();
+
+        // THE FINDING — env staged (dirs are `Some`), candidate mode is NOT dflash ⇒ NEITHER leg
+        // carries the flag, and the argv is byte-for-byte the argv the same run spawned before the
+        // DFlash channel existed.
+        for mode in [SPEC_MODE_MTP, SPEC_MODE_SERIAL] {
+            let (serial, candidate) = paired_leg_spawn_args(
+                &mtp_heads,
+                Some(&dflash_heads),
+                LegRegime::FreeRunV1_1,
+                mode,
+            );
+            for (leg, args) in [("serial", &serial), ("candidate", &candidate)] {
+                assert!(
+                    !args.iter().any(|a| a == DFLASH_HEAD_FLAG),
+                    "{mode} candidate: {leg} leg carries {DFLASH_HEAD_FLAG} — a stale \
+                     QMTP_DFLASH_HEAD_DIR export would kill this pair pre-hello on a pre-flag \
+                     engine: {args:?}"
+                );
+                assert!(
+                    !args.iter().any(|a| a.contains("dflash")),
+                    "{mode} candidate: {leg} leg argv mentions a drafter it never loads: {args:?}"
+                );
+            }
+            // NO PERTURBATION: exactly the pre-lane argv for both legs.
+            assert_eq!(
+                serial,
+                leg_spawn_args(
+                    "/pinned/mtp",
+                    None,
+                    serial_control_regime_for(LegRegime::FreeRunV1_1)
+                ),
+                "{mode} candidate: serial leg argv perturbed"
+            );
+            assert_eq!(
+                candidate,
+                leg_spawn_args("/byo/mtp", None, LegRegime::FreeRunV1_1),
+                "{mode} candidate: candidate leg argv perturbed"
+            );
+        }
+
+        // POSITIVE CONTROL — the same staged env on a `dflash` candidate still gives BOTH legs
+        // their OWN per-leg drafter dir (the control leg loads it too; its residency charges the
+        // denominator). Scoping the emission must not have defanged the channel it scopes.
+        let (serial, candidate) = paired_leg_spawn_args(
+            &mtp_heads,
+            Some(&dflash_heads),
+            LegRegime::FreeRunV1_1,
+            SPEC_MODE_DFLASH,
+        );
+        let value_after = |args: &[String], flag: &str| -> String {
+            let at = args
+                .iter()
+                .position(|a| a == flag)
+                .unwrap_or_else(|| panic!("{flag} absent: {args:?}"));
+            args[at + 1].clone()
+        };
+        assert_eq!(value_after(&serial, DFLASH_HEAD_FLAG), "/pinned/dflash");
+        assert_eq!(value_after(&candidate, DFLASH_HEAD_FLAG), "/byo/dflash");
     }
 }

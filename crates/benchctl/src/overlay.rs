@@ -105,15 +105,38 @@ pub enum ResultsShape {
 ///
 /// Safe to read either leg: [`validate_series`] requires the two legs to be identical (homogeneous)
 /// before any caller reaches a shape decision, so they cannot disagree here.
-pub fn results_shape(results: &ResultsView) -> ResultsShape {
-    if results.timed_series.candidate_leg_timed_mode.trim()
-        == bench_core::free_run::TIMED_MODE_BATCHED_FREE_RUN_V1_2_B8
-    {
-        ResultsShape::Cohort {
-            batch_size: crate::measure_job::SCORED_BATCH_SIZE_B8,
+///
+/// EXHAUSTIVE, not defaulted. This used to classify anything that was not the b8 tag as
+/// [`ResultsShape::SingleStream`] through an `else` fallback, which made an UNKNOWN series tag
+/// silently score as a single-stream run: `per_prompt` populated is all the single-stream arm of
+/// [`validate_results`] demands, and a future regime whose tag nobody taught this function would
+/// have been aggregated by the wrong rule rather than refused. That was safe only by CALL ORDERING
+/// — every production caller happens to run [`validate_series`]'s known-tag refusal first — and the
+/// function is `pub`, so the ordering is a convention, not a guarantee. It now matches the known
+/// tags explicitly and REFUSES anything else, which makes the fail-closed property local to the
+/// function instead of a property of where it is called from.
+pub fn results_shape(results: &ResultsView) -> Result<ResultsShape, String> {
+    let tag = results.timed_series.candidate_leg_timed_mode.trim();
+    match tag {
+        t if t == bench_core::free_run::TIMED_MODE_BATCHED_FREE_RUN_V1_2_B8 => {
+            Ok(ResultsShape::Cohort {
+                batch_size: crate::measure_job::SCORED_BATCH_SIZE_B8,
+            })
         }
-    } else {
-        ResultsShape::SingleStream
+        t if t == bench_core::free_run::TIMED_MODE_TEACHER_FORCED_V1
+            || t == bench_core::free_run::TIMED_MODE_FREE_RUN_V1_1 =>
+        {
+            Ok(ResultsShape::SingleStream)
+        }
+        unknown => Err(format!(
+            "results.json timed_series.candidate_leg_timed_mode ({unknown:?}) is not a known timed \
+             series ({:?} | {:?} | {:?}): the overlay cannot tell which measurement SHAPE the file \
+             carries, so it refuses to pick one — a defaulted shape would aggregate an unknown \
+             regime by the single-stream rule",
+            bench_core::free_run::TIMED_MODE_TEACHER_FORCED_V1,
+            bench_core::free_run::TIMED_MODE_FREE_RUN_V1_1,
+            bench_core::free_run::TIMED_MODE_BATCHED_FREE_RUN_V1_2_B8,
+        )),
     }
 }
 
@@ -621,9 +644,11 @@ pub fn validate_series(results: &ResultsView, expected_series: Option<&str>) -> 
         if !known(tag) {
             return Err(format!(
                 "results.json timed_series.{leg}_leg_timed_mode ({tag:?}) is not a known timed \
-                 series ({:?} | {:?}): refusing to score a regime the overlay cannot reason about",
+                 series ({:?} | {:?} | {:?}): refusing to score a regime the overlay cannot reason \
+                 about",
                 bench_core::free_run::TIMED_MODE_TEACHER_FORCED_V1,
                 bench_core::free_run::TIMED_MODE_FREE_RUN_V1_1,
+                bench_core::free_run::TIMED_MODE_BATCHED_FREE_RUN_V1_2_B8,
             ));
         }
     }
@@ -774,7 +799,7 @@ pub fn validate_results(
     // shape) and must NOT carry cohort records; a cohort file needs `per_cohort` and must NOT carry
     // per-prompt records. Neither shape may claim to be both, and neither may be empty of the
     // records its own regime is defined by.
-    let shape = results_shape(results);
+    let shape = results_shape(results)?;
     match shape {
         ResultsShape::SingleStream => {
             if results.per_prompt.is_empty() {
@@ -1395,7 +1420,7 @@ fn merge_overlay_against_harness(
     // sample sets. Neither shape loses it: on both, the overlay recomputes the sealed
     // `aggregate.raw_decode_speedup_median` from the artifact's own per-unit numbers and refuses a
     // file whose parts and published aggregate were authored inconsistently.
-    let shape = results_shape(results);
+    let shape = results_shape(results)?;
     let recomputed_median = match shape {
         // SINGLE-STREAM: the median over per_prompt of `serial / mtp`, from the per-prompt MEANS.
         ResultsShape::SingleStream => {
@@ -3056,6 +3081,82 @@ mod tests {
         r.timed_series.serial_leg_timed_mode = "batched_free_run_v1_2_b1".to_string();
         let err = merge_matched(&passing_gates(), &r, None, None, &pooln(8)).unwrap_err();
         assert!(err.contains("is not a known timed series"), "{err}");
+    }
+
+    /// `results_shape` is EXHAUSTIVE over the known series tags and REFUSES anything else.
+    ///
+    /// It used to classify every non-b8 tag as `SingleStream` through an `else` fallback, which was
+    /// fail-closed only by CALL ORDERING: production reaches it after `validate_series` has already
+    /// refused unknown tags. The function is `pub`, so that ordering was a convention. An unknown
+    /// tag reaching it directly would have been scored by the single-stream aggregation rule —
+    /// silently, because a populated `per_prompt` is all the single-stream arm then asks for.
+    ///
+    /// REVERT-PROOF: restore the `else` fallback and the unknown-tag assertion below goes red; drop
+    /// either known arm and its `Ok` assertion goes red.
+    #[test]
+    fn results_shape_refuses_a_tag_it_does_not_know() {
+        // The three KNOWN tags each classify, and to the right shape.
+        for (tag, expected) in [
+            (
+                bench_core::free_run::TIMED_MODE_TEACHER_FORCED_V1,
+                ResultsShape::SingleStream,
+            ),
+            (
+                bench_core::free_run::TIMED_MODE_FREE_RUN_V1_1,
+                ResultsShape::SingleStream,
+            ),
+            (
+                bench_core::free_run::TIMED_MODE_BATCHED_FREE_RUN_V1_2_B8,
+                ResultsShape::Cohort {
+                    batch_size: crate::measure_job::SCORED_BATCH_SIZE_B8,
+                },
+            ),
+        ] {
+            let mut r = results_with(1.0, vec![1.0]);
+            r.timed_series.candidate_leg_timed_mode = tag.to_string();
+            assert_eq!(results_shape(&r).unwrap(), expected, "tag {tag}");
+        }
+
+        // THE FINDING — an unknown tag is a REFUSAL, not a defaulted single-stream classification.
+        // `batched_free_run_v1_2_b16` is the load-bearing case: a batched regime that the b8-only
+        // certification can never have produced would have been handed to the per-prompt median.
+        for tag in [
+            "batched_free_run_v1_2_b16",
+            "free_run_v2",
+            "",
+            "teacher_forced_v1_x",
+        ] {
+            let mut r = results_with(1.0, vec![1.0]);
+            r.timed_series.candidate_leg_timed_mode = tag.to_string();
+            let err = results_shape(&r).unwrap_err();
+            assert!(
+                err.contains("is not a known timed series"),
+                "tag {tag:?} must be refused by name: {err}"
+            );
+        }
+    }
+
+    /// The unknown-series REFUSAL MESSAGE must name every tag the known-set actually accepts.
+    ///
+    /// The message listed only the two single-stream tags while the accepting closure took three,
+    /// so an operator debugging a b8-adjacent typo was told the batched regime was not a known
+    /// series at all. REVERT-PROOF: drop the b8 tag from either the message or the known-set and
+    /// this goes red.
+    #[test]
+    fn the_unknown_series_refusal_names_every_accepted_tag() {
+        let mut r = results_with(1.0, vec![1.0]);
+        r.timed_series.candidate_leg_timed_mode = "free_run_v2".to_string();
+        let err = validate_series(&r, None).unwrap_err();
+        for tag in [
+            bench_core::free_run::TIMED_MODE_TEACHER_FORCED_V1,
+            bench_core::free_run::TIMED_MODE_FREE_RUN_V1_1,
+            bench_core::free_run::TIMED_MODE_BATCHED_FREE_RUN_V1_2_B8,
+        ] {
+            assert!(
+                err.contains(tag),
+                "the refusal must name the accepted tag {tag}: {err}"
+            );
+        }
     }
 
     /// REFUSAL TWIN of the cohort acceptance — an EMPTY `per_cohort` on a cohort series has nothing

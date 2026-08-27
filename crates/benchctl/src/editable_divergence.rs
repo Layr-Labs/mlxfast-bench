@@ -32,6 +32,12 @@
 //! The forbidden-surface arm of the shell (`benchd`, `.gitmodules`) is NOT re-homed here: that is
 //! the trusted-scope roster's job (#147 / the roster follow-up), enforced against the manifest's
 //! DECLARATION. This gate enforces the realized DIFF against that same declared surface.
+//!
+//! TWO REFERENCE MODES (David ruling 2026-08-27). The tree-diff above is the ORIGINAL mode and stays
+//! the default; [`verify_no_write_outside_editable_from_git`] is the ruled mode, selected by
+//! `measure-job --write-gate-base <SHA>`, which judges the SUBMISSION'S OWN COMMITTED DIFF
+//! (`<SHA>..HEAD`, its fork point from harness main) and never looks at the staged workspace at all.
+//! See that function for why the tree-diff mode coupled submission validity to box-staging freshness.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -187,6 +193,37 @@ fn hash_tree(root: &Path) -> Result<BTreeMap<String, [u8; 32]>, String> {
     Ok(out)
 }
 
+/// The declared modifiable surface, read from the TRUSTED manifest bytes (never the candidate's
+/// own), fail-closed. Shared by BOTH reference modes so they can never disagree about what the
+/// allowlist is: the tree-diff mode ([`verify_no_write_outside_editable`]) and the ruled fork-point
+/// mode ([`verify_no_write_outside_editable_from_git`]) enforce the SAME declaration and differ only
+/// in how the diff is obtained.
+fn parse_usable_editable_paths(manifest_bytes: &[u8]) -> Result<Vec<String>, String> {
+    let surface = trusted_scope::EditableSurface::parse(manifest_bytes)?;
+    let editable = surface.editable_paths;
+    if editable.iter().all(|e| normalize(e).is_empty()) {
+        // Empty (or root-only) editablePaths gives this gate no allowlist — fail loud, as the shell
+        // reference does, rather than reject every divergent file while naming no surface.
+        return Err(
+            "write-divergence: benchmark.json lists no usable editablePaths — the modifiable \
+             surface is undefined"
+                .to_string(),
+        );
+    }
+    Ok(editable)
+}
+
+/// True when `sha` is a FULL 40-character ASCII-hex object name. The `--write-gate-base` value is
+/// operator/CI-supplied and is handed to `git` as an argument, so it is validated to this shape
+/// BEFORE it ever reaches a `Command` — a short sha, a ref name, a `--flag` spelling or a pathspec
+/// is refused rather than resolved, which keeps the base UNAMBIGUOUS (no rev-parse guessing) and
+/// keeps argument-injection off the table. Shared by the growth bound in
+/// [`crate::byte_budget::verify_growth_over_from_git`] so both halves of the gate accept exactly the
+/// same base spellings.
+pub(crate) fn is_full_commit_sha(sha: &str) -> bool {
+    sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// AUTHORITATIVE write-outside-editablePaths refusal. Reads `editablePaths` from the trusted
 /// `--baseline` manifest bytes (never the candidate's own), computes the candidate-vs-baseline file
 /// divergence, and returns `Err` (a die-class refusal) naming the FIRST path that changed, was added
@@ -197,17 +234,7 @@ pub fn verify_no_write_outside_editable(
     baseline_root: &Path,
     candidate_root: &Path,
 ) -> Result<(), String> {
-    let surface = trusted_scope::EditableSurface::parse(manifest_bytes)?;
-    let editable = &surface.editable_paths;
-    if editable.iter().all(|e| normalize(e).is_empty()) {
-        // Empty (or root-only) editablePaths gives this gate no allowlist — fail loud, as the shell
-        // reference does, rather than reject every divergent file while naming no surface.
-        return Err(
-            "write-divergence: benchmark.json lists no usable editablePaths — the modifiable \
-             surface is undefined"
-                .to_string(),
-        );
-    }
+    let editable = parse_usable_editable_paths(manifest_bytes)?;
 
     let base = hash_tree(baseline_root)?;
     let cand = hash_tree(candidate_root)?;
@@ -226,9 +253,132 @@ pub fn verify_no_write_outside_editable(
             (Some(_), None) => ("deleted", baseline_root),
             _ => continue, // identical content, or absent from both — no divergence.
         };
-        if !path_within_editable(resolve_root, rel, editable) {
+        if !path_within_editable(resolve_root, rel, &editable) {
             return Err(format!(
                 "write-divergence: {rel:?} was {kind} outside the modifiable surface \
+                 (editablePaths) — a submission may only change files it declared editable"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The RULED reference mode (David, 2026-08-27): judge the SUBMISSION'S OWN COMMITTED DIFF —
+/// `<base_sha>..HEAD` in the candidate workspace, where `base_sha` is the submission's FORK POINT
+/// from harness main — instead of tree-diffing the box-staged `--baseline` workspace. The staged
+/// workspace keeps exactly one job under this mode: it is the PAIRED TIMING baseline, and it has no
+/// say in whether a submission is well-formed.
+///
+/// WHY (the failure class this kills). The tree-diff mode compares the candidate against whatever
+/// snapshot happens to be staged on the box, so submission validity moved whenever the ORGANIZER
+/// moved harness main. On 2026-08-27 an organizer commit to the gemma engine repo's main deleted
+/// `Tests/MLXFastTests/Gemma4SubmissionDraftDepthTests.swift`; every submission cut afterwards then
+/// tree-diverged from the stale staged snapshot at a path no participant had touched, and benchd
+/// refused all of them pre-GPU ("... was deleted outside the modifiable surface"). A fork-point diff
+/// cannot express that failure: organizer commits sit BELOW the fork point, so they are common
+/// history and simply do not appear in `<base_sha>..HEAD`. What DOES appear is exactly the
+/// participant's own work — submission branches are built from `editablePaths`-only archives, so
+/// participant content can only arrive as commits on top of the fork point.
+///
+/// FAIL-CLOSED, always. A base that is not a full 40-hex object name, a `git` that cannot be spawned
+/// (git absent), a `git diff` that exits non-zero (base unknown to this repo, `candidate_root` not a
+/// work tree), or a `-z` stream that does not parse are each an `Err` — never a silent pass. Nothing
+/// here falls open on an unreadable history.
+pub fn verify_no_write_outside_editable_from_git(
+    manifest_bytes: &[u8],
+    candidate_root: &Path,
+    base_sha: &str,
+) -> Result<(), String> {
+    let editable = parse_usable_editable_paths(manifest_bytes)?;
+    if !is_full_commit_sha(base_sha) {
+        return Err(format!(
+            "write-divergence: --write-gate-base {base_sha:?} is not a 40-character hex commit sha \
+             — the fork point must be named exactly, never resolved from a ref or a short sha"
+        ));
+    }
+
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(candidate_root)
+        .args(["diff", "--name-status", "--no-renames", "-z"])
+        .arg(base_sha)
+        .arg("HEAD")
+        .output()
+        .map_err(|e| {
+            format!(
+                "write-divergence: cannot run git in {}: {e} — --write-gate-base needs a git work \
+                 tree and a git executable",
+                candidate_root.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "write-divergence: git diff {base_sha}..HEAD failed in {}: {}",
+            candidate_root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stream = String::from_utf8(output.stdout).map_err(|e| {
+        format!("write-divergence: git diff --name-status -z emitted non-UTF-8 output: {e}")
+    })?;
+
+    // `--name-status -z` emits STATUS NUL PATH NUL, repeating, with no trailing record. `-z` also
+    // means paths are RAW (never C-quoted), which is why this mode can compare them byte-for-byte
+    // against the declared surface. `--no-renames` keeps the record shape at one path per status:
+    // a rename is reported as its delete + its add, so no `R`/`C` record with a second path (and
+    // therefore no third field) can appear.
+    let mut fields = stream.split('\0');
+    while let Some(status) = fields.next() {
+        if status.is_empty() {
+            // The stream is NUL-TERMINATED, so the final split always yields one empty tail field
+            // (and an EMPTY diff yields only that). Anything non-empty after it is not a shape this
+            // parser understands, so refuse instead of guessing where the record boundary went.
+            if fields.any(|rest| !rest.is_empty()) {
+                return Err(format!(
+                    "write-divergence: git diff --name-status -z stream is malformed (trailing \
+                     data after the final record) for {base_sha}..HEAD"
+                ));
+            }
+            break;
+        }
+        let path = match fields.next() {
+            Some(path) if !path.is_empty() => path,
+            _ => {
+                return Err(format!(
+                    "write-divergence: git diff --name-status -z stream is malformed (status \
+                     {status:?} with no following path) for {base_sha}..HEAD"
+                ))
+            }
+        };
+        // T = the type changed (regular file ↔ symlink ↔ gitlink). That is a CONTENT change to the
+        // reviewable surface exactly as a byte edit is — the tree-diff mode's type-tagged digest
+        // calls the same swap "changed" — so the two modes report it identically.
+        let kind = match status {
+            "A" => "added",
+            "M" | "T" => "changed",
+            "D" => "deleted",
+            other => {
+                return Err(format!(
+                    "write-divergence: git diff --name-status reported the unhandled status \
+                     {other:?} for {path:?} — refusing rather than guessing what it changed"
+                ))
+            }
+        };
+        // The SAME membership relation as the tree-diff mode, deliberately reused rather than
+        // re-derived: it carries the #147 casefold (the ranked box is APFS, case-INSENSITIVE) plus
+        // the device:inode arms. For a DELETED path the leaf is absent from the work tree, so the
+        // inode arms simply find nothing and the lexical arms decide — which is the correct answer,
+        // because a deletion is judged by WHERE THE FILE WAS.
+        //
+        // NOTE the deliberate divergence: the `.git`/`.build` EXCLUDED_TOP_SEGMENTS hold-out is NOT
+        // applied in this mode. Those exclusions exist because the tree-diff mode compares WORK
+        // TREES, where VCS metadata and gitignored SwiftPM output necessarily differ; a COMMITTED
+        // path under `.git`/`.build` cannot arise legitimately, so it must refuse here. Untracked
+        // box-staged assets never appear in a committed diff at all, which is the whole point of
+        // this mode.
+        if !path_within_editable(candidate_root, path, &editable) {
+            return Err(format!(
+                "write-divergence: {path:?} was {kind} outside the modifiable surface \
                  (editablePaths) — a submission may only change files it declared editable"
             ));
         }
@@ -622,6 +772,217 @@ mod tests {
         assert!(e.contains("added") && e.contains("inject"), "{e}");
         std::fs::remove_dir_all(&base).unwrap();
         std::fs::remove_dir_all(&cand).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // The RULED fork-point mode (`--write-gate-base`, David 2026-08-27).
+    // -----------------------------------------------------------------------
+
+    /// Run one git command in `repo` and return its trimmed stdout, asserting success. Every
+    /// invocation pins its own identity and turns SIGNING OFF (`commit.gpgsign=false`): the fixtures
+    /// must build identically on a laptop whose global config signs every commit and on a runner
+    /// with no key at all. `core.excludesFile=/dev/null` keeps a developer's global ignore file from
+    /// silently dropping a fixture file out of the commit the assertion depends on.
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=benchd test",
+                "-c",
+                "user.email=benchd@example.invalid",
+                "-c",
+                "init.defaultBranch=main",
+                "-c",
+                "core.excludesFile=/dev/null",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed in {}: {}",
+            repo.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// Commit everything currently in the work tree and return the new commit's full sha.
+    fn commit_all(repo: &Path, message: &str) -> String {
+        git(repo, &["add", "-A", "."]);
+        git(repo, &["commit", "-q", "-m", message]);
+        git(repo, &["rev-parse", "HEAD"])
+    }
+
+    /// A fresh git repo under a temp dir.
+    fn git_repo(tag: &str) -> std::path::PathBuf {
+        let repo = tmp(tag);
+        git(&repo, &["init", "-q"]);
+        repo
+    }
+
+    /// The manifest every fork-point fixture below declares.
+    const GIT_MANIFEST: &[u8] = br#"{"editablePaths":["Sources/MLXFastModel"]}"#;
+
+    /// INCIDENT REGRESSION (2026-08-27) — the organizer moved harness main by DELETING a file no
+    /// participant ever touched (`Tests/pin.swift`, standing in for the real
+    /// `Tests/MLXFastTests/Gemma4SubmissionDraftDepthTests.swift` @ a9bd041). Under the tree-diff
+    /// mode that deletion made every fresh submission diverge from the stale staged snapshot and
+    /// benchd refused them all pre-GPU. Judged against the submission's OWN fork point the deletion
+    /// is common history, so it cannot be attributed to the submission: this must PASS.
+    ///
+    /// The second assertion is the mechanism check — pointed at the STALE base (c0, before the
+    /// organizer's deletion) the very same submission refuses, naming that same untouched file.
+    /// That is the failure class, reproduced, and it is exactly what the correct base makes
+    /// unreachable.
+    #[test]
+    fn organizer_deletion_below_the_fork_point_does_not_refuse_the_submission() {
+        let repo = git_repo("git-incident");
+        write(&repo, "Tests/pin.swift", b"organizer test\n");
+        write(&repo, "Sources/MLXFastModel/Head.swift", b"stock head\n");
+        let c0 = commit_all(&repo, "c0: harness main");
+
+        // The organizer's commit on harness main: the test file is deleted upstream.
+        git(&repo, &["rm", "-q", "Tests/pin.swift"]);
+        let c1 = commit_all(&repo, "c1: organizer deletes the draft-depth test");
+
+        // The submission forks c1 and only ever touches its declared editable surface.
+        git(&repo, &["checkout", "-q", "-b", "submission"]);
+        write(
+            &repo,
+            "Sources/MLXFastModel/Head.swift",
+            b"my candidate head\n",
+        );
+        commit_all(&repo, "submission: tune the head");
+
+        assert_eq!(
+            verify_no_write_outside_editable_from_git(GIT_MANIFEST, &repo, &c1),
+            Ok(()),
+            "an organizer commit BELOW the fork point must never be charged to the submission"
+        );
+        let stale =
+            verify_no_write_outside_editable_from_git(GIT_MANIFEST, &repo, &c0).unwrap_err();
+        assert!(
+            stale.contains("deleted") && stale.contains("Tests/pin.swift"),
+            "the stale base must reproduce the incident refusal: {stale}"
+        );
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    /// NEGATIVE CONTROL — the gate still refuses real writes outside the surface when they are the
+    /// SUBMISSION'S OWN commits, in all three directions. Without this the fork-point mode could be
+    /// silently defanged and the incident regression above would still pass.
+    #[test]
+    fn submission_commits_outside_the_surface_are_still_refused() {
+        // changed
+        let repo = git_repo("git-neg-changed");
+        write(&repo, "tools/x.sh", b"#!/bin/sh\ntrue\n");
+        write(&repo, "Sources/MLXFastModel/Head.swift", b"stock head\n");
+        let base = commit_all(&repo, "base");
+        write(&repo, "tools/x.sh", b"#!/bin/sh\nTAMPERED\n");
+        commit_all(&repo, "submission: edit a trusted tool");
+        let e = verify_no_write_outside_editable_from_git(GIT_MANIFEST, &repo, &base).unwrap_err();
+        assert!(e.contains("tools/x.sh") && e.contains("changed"), "{e}");
+        std::fs::remove_dir_all(&repo).unwrap();
+
+        // added
+        let repo = git_repo("git-neg-added");
+        write(&repo, "Sources/MLXFastModel/Head.swift", b"stock head\n");
+        let base = commit_all(&repo, "base");
+        write(&repo, "tools/evil.sh", b"#!/bin/sh\n");
+        commit_all(&repo, "submission: add a tool");
+        let e = verify_no_write_outside_editable_from_git(GIT_MANIFEST, &repo, &base).unwrap_err();
+        assert!(e.contains("tools/evil.sh") && e.contains("added"), "{e}");
+        std::fs::remove_dir_all(&repo).unwrap();
+
+        // deleted — the deletion is IN the submission's own commit, so it IS the submission's.
+        let repo = git_repo("git-neg-deleted");
+        write(&repo, "Package.resolved", b"pins\n");
+        write(&repo, "Sources/MLXFastModel/Head.swift", b"stock head\n");
+        let base = commit_all(&repo, "base");
+        git(&repo, &["rm", "-q", "Package.resolved"]);
+        commit_all(&repo, "submission: drop the pins");
+        let e = verify_no_write_outside_editable_from_git(GIT_MANIFEST, &repo, &base).unwrap_err();
+        assert!(
+            e.contains("Package.resolved") && e.contains("deleted"),
+            "{e}"
+        );
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    /// No over-rejection: inside `editablePaths` a submission is free — add, modify and delete, over
+    /// several commits — and the accumulated fork-point diff still passes.
+    #[test]
+    fn the_editable_surface_stays_fully_writable_across_commits() {
+        let repo = git_repo("git-editable-free");
+        write(&repo, "Package.swift", b"// pinned\n");
+        write(&repo, "Sources/MLXFastModel/Head.swift", b"stock head\n");
+        write(&repo, "Sources/MLXFastModel/Old.swift", b"to be removed\n");
+        let base = commit_all(&repo, "base");
+
+        write(&repo, "Sources/MLXFastModel/Head.swift", b"tuned head\n");
+        commit_all(&repo, "submission 1: modify");
+        write(&repo, "Sources/MLXFastModel/New.swift", b"new module\n");
+        commit_all(&repo, "submission 2: add");
+        git(&repo, &["rm", "-q", "Sources/MLXFastModel/Old.swift"]);
+        commit_all(&repo, "submission 3: delete");
+
+        assert_eq!(
+            verify_no_write_outside_editable_from_git(GIT_MANIFEST, &repo, &base),
+            Ok(())
+        );
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    /// FAIL-CLOSED — a base this gate cannot pin down is a refusal, never a pass. Short sha (the
+    /// spelling git would happily resolve, and the one an injection would hide behind), a
+    /// well-formed 40-hex object this repo has never seen, and a candidate root that is not a work
+    /// tree at all.
+    #[test]
+    fn an_unusable_write_gate_base_fails_closed() {
+        let repo = git_repo("git-failclosed");
+        write(&repo, "Sources/MLXFastModel/Head.swift", b"stock head\n");
+        let base = commit_all(&repo, "base");
+
+        let short = verify_no_write_outside_editable_from_git(GIT_MANIFEST, &repo, &base[..12])
+            .unwrap_err();
+        assert!(short.contains("--write-gate-base"), "{short}");
+        assert!(verify_no_write_outside_editable_from_git(GIT_MANIFEST, &repo, "not-hex").is_err());
+
+        let unknown = "0123456789abcdef0123456789abcdef01234567";
+        assert!(verify_no_write_outside_editable_from_git(GIT_MANIFEST, &repo, unknown).is_err());
+        std::fs::remove_dir_all(&repo).unwrap();
+
+        // A directory with no .git: `git diff` exits non-zero and the gate refuses.
+        let bare = tmp("git-notarepo");
+        assert!(verify_no_write_outside_editable_from_git(GIT_MANIFEST, &bare, unknown).is_err());
+        std::fs::remove_dir_all(&bare).unwrap();
+    }
+
+    /// A COMMITTED path under `.git`/`.build` is NOT held out in this mode (unlike the tree-diff
+    /// mode, whose hold-out exists only because it compares work trees). Such a path cannot arise
+    /// from a legitimate submission, so it must refuse.
+    #[test]
+    fn a_committed_build_output_is_not_excused_in_git_mode() {
+        let repo = git_repo("git-build-committed");
+        write(&repo, "Sources/MLXFastModel/Head.swift", b"stock head\n");
+        let base = commit_all(&repo, "base");
+        write(
+            &repo,
+            ".build/release/worker",
+            b"a binary a submission must not commit",
+        );
+        commit_all(&repo, "submission: commit a build output");
+        let e = verify_no_write_outside_editable_from_git(GIT_MANIFEST, &repo, &base).unwrap_err();
+        assert!(
+            e.contains(".build/release/worker") && e.contains("added"),
+            "{e}"
+        );
+        std::fs::remove_dir_all(&repo).unwrap();
     }
 
     /// LOW (#151 ledger) — `editablePaths` is read by TWO parsers over the SAME trusted bytes:

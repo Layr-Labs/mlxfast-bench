@@ -1,8 +1,8 @@
 {
   "version": "0.0.0",
-  "branch": "gemma4-26b-a4b-mlx-v1",
-  "source_commit": "dca27e6c250e650e873054e424c8c069f94dc3ec",
+  "branch": "lane/gemma4-pairs4",
+  "source_commit": "f625921dafbcc7feceefee281aaf995fefb5d315",
   "target_triple": "aarch64-apple-darwin",
-  "sha256": "5b1410fd3b55ee97ecae9622e02f938ef9ef44ff8c18309224fbd453b240c9cc",
-  "bytes": 2551664
+  "sha256": "f07bebe517b02bebb5fce755d85557442394a85704c4233d55c02b3ecdf0279c",
+  "bytes": 2528464
 }

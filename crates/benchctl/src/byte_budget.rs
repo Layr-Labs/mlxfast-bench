@@ -34,6 +34,8 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use crate::trusted_scope;
+
 /// R1.1 — the pinned default total editable-surface cap (bytes). `EditableSurfaceByteBudget.swift`
 /// `defaultMaxTotalBytes` (spec R1.1).
 pub const DEFAULT_MAX_TOTAL_BYTES: u64 = 4_404_587;
@@ -569,15 +571,9 @@ fn walk_budget(contract: &Contract, limits: &Limits, surface_root: &Path) -> Bud
 /// against the editable surface materialized under `surface_root` (the `--candidate` workspace). No
 /// file read here — the bytes are already in hand — so this never returns `Skipped`.
 pub fn verify_byte_budget_over(manifest_bytes: &[u8], surface_root: &Path) -> BudgetVerification {
-    let contract = match load_contract(manifest_bytes) {
-        Ok(c) => c,
-        Err(reason) => return BudgetVerification::Exceeded(reason),
-    };
-    let limits = match resolve_limits_from_contract(&contract) {
-        LimitsResolution::Resolved(l) => l,
-        LimitsResolution::Invalid(reason) => return BudgetVerification::Exceeded(reason),
-        #[cfg(test)]
-        LimitsResolution::MissingContract(reason) => return BudgetVerification::Skipped(reason),
+    let (contract, limits) = match contract_and_limits(manifest_bytes) {
+        Ok(pair) => pair,
+        Err(verification) => return verification,
     };
     walk_budget(&contract, &limits, surface_root)
 }
@@ -659,27 +655,154 @@ fn sum_regular_files(path: &Path, total: &mut u64) {
     }
 }
 
-/// benchd-native GROWTH bound: refuse a candidate whose editable code surface grew by more than
-/// `maxGrowthBytes` over the trusted baseline. `growth = candidate_code_bytes −
-/// baseline_code_bytes` (saturating at 0 — a shrink is never a growth violation). The caps + paths
-/// are read from the trusted `--baseline` manifest bytes; a malformed manifest fails closed.
-pub fn verify_growth_over(
-    manifest_bytes: &[u8],
-    baseline_root: &Path,
-    candidate_root: &Path,
-) -> BudgetVerification {
+/// The NON-exempt code bytes of the editable surface AS OF one commit, read out of git's object
+/// store rather than off disk. This is the baseline half of the RULED fork-point mode (David
+/// 2026-08-27): the growth bound must measure the submission against ITS OWN fork point, not against
+/// whatever snapshot happens to be staged on the box.
+///
+/// The accounting deliberately mirrors [`code_bytes`]/[`sum_regular_files`] entry for entry so the
+/// two sides of the subtraction are commensurable: exempt `editablePaths` entries are skipped
+/// (they are not CODE), symlinks are skipped (git spells one as mode `120000`, which is what
+/// `sum_regular_files` skips on disk), and gitlinks/submodules are skipped (type `commit`, whose
+/// `ls-tree -l` size field is a literal `-`, and which `sum_regular_files` never descends into).
+///
+/// Membership is the CASEFOLDED lexical prefix relation — equal, or under `entry/` — after the same
+/// `normalize` treatment the divergence gate uses. The casefold mirrors the ranked box's APFS
+/// behavior: on a case-insensitive volume the disk-side walk of `Sources/MLXFastModel` also picks up
+/// a tree spelled `sources/mlxfastmodel`, so the git side must agree or the subtraction is between
+/// two different surfaces. The device:inode arms of the divergence gate have no counterpart here —
+/// a commit's tree has no inodes — and they are not needed: this is a SUM, not an authorization.
+///
+/// Every failure is an `Err`: the caller turns it into a fail-closed refusal.
+fn code_bytes_at_commit(
+    contract: &Contract,
+    repo_root: &Path,
+    base_sha: &str,
+) -> Result<u64, String> {
+    if !crate::editable_divergence::is_full_commit_sha(base_sha) {
+        return Err(format!(
+            "--write-gate-base {base_sha:?} is not a 40-character hex commit sha, so git cannot be \
+             asked for the fork point's editable surface"
+        ));
+    }
+    let editable_paths = match &contract.editable_paths {
+        Some(paths) => paths,
+        None => return Ok(0),
+    };
+    let exempt: BTreeSet<&str> = contract
+        .budget
+        .exempt_paths
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(String::as_str)
+        .collect();
+    // The non-exempt surface, pre-normalized + lowercased once so the per-blob test is a plain
+    // comparison. An entry that normalizes away (`""`, `"/"`, `"."`) grants nothing, exactly as it
+    // grants nothing in the divergence gate.
+    let surfaces: Vec<String> = editable_paths
+        .iter()
+        .filter(|entry| !exempt.contains(entry.as_str()))
+        .map(|entry| trusted_scope::normalize(entry).to_lowercase())
+        .filter(|entry| !entry.is_empty())
+        .collect();
+
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["ls-tree", "-r", "-l", "-z"])
+        .arg(base_sha)
+        .output()
+        .map_err(|e| {
+            format!(
+                "--write-gate-base: cannot run git in {}: {e}",
+                repo_root.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "--write-gate-base: git ls-tree {base_sha} failed in {}: {}",
+            repo_root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stream = String::from_utf8(output.stdout)
+        .map_err(|e| format!("--write-gate-base: git ls-tree -z emitted non-UTF-8 output: {e}"))?;
+
+    // `ls-tree -r -l -z` emits one NUL-terminated record per entry:
+    //   <mode> SP <type> SP <oid> SP<pad> <size> TAB <path>
+    // The size field is right-aligned with blank padding, so the metadata half is split on
+    // whitespace. `-z` means the path is RAW (never C-quoted), so it compares directly.
+    let mut total = 0u64;
+    for record in stream.split('\0') {
+        if record.is_empty() {
+            continue; // the NUL-terminated tail (and an empty tree yields only that).
+        }
+        let (meta, path) = record.split_once('\t').ok_or_else(|| {
+            format!("--write-gate-base: git ls-tree record has no path separator: {record:?}")
+        })?;
+        let mut parts = meta.split_whitespace();
+        let (Some(mode), Some(kind), Some(_oid), Some(size)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(format!(
+                "--write-gate-base: git ls-tree record is malformed: {record:?}"
+            ));
+        };
+        if kind != "blob" || mode == SYMLINK_MODE {
+            continue;
+        }
+        let size: u64 = size.parse().map_err(|e| {
+            format!("--write-gate-base: git ls-tree reported a non-numeric size {size:?}: {e}")
+        })?;
+        if path_within_surfaces(path, &surfaces) {
+            total += size;
+        }
+    }
+    Ok(total)
+}
+
+/// git's mode for a SYMLINK blob (its content is the link target). Skipped by the commit-side
+/// summation because [`sum_regular_files`] skips symlinks on disk (spec R1.7).
+const SYMLINK_MODE: &str = "120000";
+
+/// True when repo-relative `path` is within one of the already-normalized, already-lowercased
+/// `surfaces` — equal to it, or under it (separator-anchored, so `Foo` never matches `FooBar`).
+fn path_within_surfaces(path: &str, surfaces: &[String]) -> bool {
+    let candidate = trusted_scope::normalize(path).to_lowercase();
+    if candidate.is_empty() {
+        return false;
+    }
+    surfaces
+        .iter()
+        .any(|entry| candidate == *entry || candidate.starts_with(&format!("{entry}/")))
+}
+
+/// The contract's caps, or the verification that replaces them. Shared by every entry point below so
+/// a malformed contract fails closed identically no matter which one the caller reached for.
+fn contract_and_limits(manifest_bytes: &[u8]) -> Result<(Contract, Limits), BudgetVerification> {
     let contract = match load_contract(manifest_bytes) {
         Ok(c) => c,
-        Err(reason) => return BudgetVerification::Exceeded(reason),
+        Err(reason) => return Err(BudgetVerification::Exceeded(reason)),
     };
     let limits = match resolve_limits_from_contract(&contract) {
         LimitsResolution::Resolved(l) => l,
-        LimitsResolution::Invalid(reason) => return BudgetVerification::Exceeded(reason),
+        LimitsResolution::Invalid(reason) => return Err(BudgetVerification::Exceeded(reason)),
         #[cfg(test)]
-        LimitsResolution::MissingContract(reason) => return BudgetVerification::Skipped(reason),
+        LimitsResolution::MissingContract(reason) => {
+            return Err(BudgetVerification::Skipped(reason))
+        }
     };
-    let baseline_bytes = code_bytes(&contract, baseline_root);
-    let candidate_bytes = code_bytes(&contract, candidate_root);
+    Ok((contract, limits))
+}
+
+/// The growth comparison itself, shared by both growth entry points so the two reference bases can
+/// never drift apart in what counts as an overshoot or in how the overshoot is worded.
+fn growth_verdict(
+    limits: &Limits,
+    baseline_bytes: u64,
+    candidate_bytes: u64,
+) -> BudgetVerification {
     let growth = candidate_bytes.saturating_sub(baseline_bytes);
     if growth > limits.max_growth_bytes {
         return BudgetVerification::Exceeded(format!(
@@ -692,6 +815,55 @@ pub fn verify_growth_over(
         total_bytes: candidate_bytes,
         file_count: 0,
     }
+}
+
+/// benchd-native GROWTH bound: refuse a candidate whose editable code surface grew by more than
+/// `maxGrowthBytes` over the trusted baseline. `growth = candidate_code_bytes −
+/// baseline_code_bytes` (saturating at 0 — a shrink is never a growth violation). The caps + paths
+/// are read from the trusted `--baseline` manifest bytes; a malformed manifest fails closed.
+pub fn verify_growth_over(
+    manifest_bytes: &[u8],
+    baseline_root: &Path,
+    candidate_root: &Path,
+) -> BudgetVerification {
+    let (contract, limits) = match contract_and_limits(manifest_bytes) {
+        Ok(pair) => pair,
+        Err(verification) => return verification,
+    };
+    let baseline_bytes = code_bytes(&contract, baseline_root);
+    let candidate_bytes = code_bytes(&contract, candidate_root);
+    growth_verdict(&limits, baseline_bytes, candidate_bytes)
+}
+
+/// The RULED fork-point form of the growth bound (David 2026-08-27), selected by
+/// `measure-job --write-gate-base <SHA>`. Identical to [`verify_growth_over`] except that the
+/// baseline half is the candidate repo's OWN state at `base_sha` — its fork point from harness main
+/// — instead of the box-staged workspace, which under this mode is the paired TIMING baseline only.
+///
+/// This removes the growth bound's dependence on box-staging freshness for the same reason the
+/// divergence gate's fork-point mode does (see
+/// [`crate::editable_divergence::verify_no_write_outside_editable_from_git`]): an organizer commit
+/// to harness main used to move the reference under every submission at once.
+///
+/// FAIL-CLOSED: any git failure — no git, no work tree, an unknown or badly-spelled base, an
+/// unparseable listing — returns `Exceeded`, which the caller turns into the same die-8 refusal an
+/// overshoot gets. The reason names both `write-gate-base` and `git` so an operator reading the
+/// refusal can tell a WIRING fault from a real oversized submission.
+pub fn verify_growth_over_from_git(
+    manifest_bytes: &[u8],
+    candidate_root: &Path,
+    base_sha: &str,
+) -> BudgetVerification {
+    let (contract, limits) = match contract_and_limits(manifest_bytes) {
+        Ok(pair) => pair,
+        Err(verification) => return verification,
+    };
+    let baseline_bytes = match code_bytes_at_commit(&contract, candidate_root, base_sha) {
+        Ok(bytes) => bytes,
+        Err(reason) => return BudgetVerification::Exceeded(reason),
+    };
+    let candidate_bytes = code_bytes(&contract, candidate_root);
+    growth_verdict(&limits, baseline_bytes, candidate_bytes)
 }
 
 #[cfg(test)]
@@ -1011,6 +1183,146 @@ mod tests {
         ));
         std::fs::remove_dir_all(&base).unwrap();
         std::fs::remove_dir_all(&cand).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // The RULED fork-point growth base (`--write-gate-base`, David 2026-08-27).
+    // -----------------------------------------------------------------------
+
+    /// Run one git command in `repo`, asserting success. Identity is pinned and SIGNING is off
+    /// (`commit.gpgsign=false`) so the fixtures build the same on a signing laptop and on a keyless
+    /// runner; `core.excludesFile=/dev/null` keeps a developer's global ignore file from dropping a
+    /// fixture file out of the commit the byte counts depend on.
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=benchd test",
+                "-c",
+                "user.email=benchd@example.invalid",
+                "-c",
+                "init.defaultBranch=main",
+                "-c",
+                "core.excludesFile=/dev/null",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed in {}: {}",
+            repo.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    fn git_repo(tag: &str) -> std::path::PathBuf {
+        let repo = tmp(tag);
+        git(&repo, &["init", "-q"]);
+        repo
+    }
+
+    fn commit_all(repo: &Path, message: &str) -> String {
+        git(repo, &["add", "-A", "."]);
+        git(repo, &["commit", "-q", "-m", message]);
+        git(repo, &["rev-parse", "HEAD"])
+    }
+
+    /// The fork-point growth base reads the BASE COMMIT'S blobs, not a staged workspace: the same
+    /// +300 growth is measured against the repo's own history, and the same cap decides it. The work
+    /// tree here is the CANDIDATE (the base commit's 100 bytes plus the 300 the submission added),
+    /// which is exactly the shape the ruled mode runs in — one workspace, two points in its history.
+    #[test]
+    fn growth_from_git_measures_the_base_commits_blobs() {
+        let repo = git_repo("growth-git");
+        write(&repo, "src/a.txt", &[b'x'; 100]);
+        let base = commit_all(&repo, "base");
+        write(&repo, "src/added.txt", &[b'y'; 300]); // +300 growth over the fork point
+        commit_all(&repo, "submission: grow the surface");
+
+        let m = br#"{"editablePaths":["src"],"editableSurfaceByteBudget":{"maxGrowthBytes":200}}"#;
+        assert!(
+            matches!(verify_growth_over_from_git(m, &repo, &base), BudgetVerification::Exceeded(r) if r.contains("grew by 300"))
+        );
+        let m_ok =
+            br#"{"editablePaths":["src"],"editableSurfaceByteBudget":{"maxGrowthBytes":400}}"#;
+        assert!(matches!(
+            verify_growth_over_from_git(m_ok, &repo, &base),
+            BudgetVerification::Verified {
+                total_bytes: 400,
+                ..
+            }
+        ));
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    /// The commit-side sum mirrors the disk-side one on the entries that are NOT plain files: an
+    /// exempt editable entry is not code, and a symlink is skipped on both sides (git spells it as
+    /// mode 120000, `sum_regular_files` lstats it). With both sides agreeing there is no growth.
+    #[test]
+    #[cfg(unix)]
+    fn growth_from_git_skips_symlinks_and_exempt_entries_like_the_disk_walk() {
+        let repo = git_repo("growth-git-skips");
+        write(&repo, "src/a.txt", &[b'x'; 100]);
+        std::os::unix::fs::symlink("a.txt", repo.join("src/link.txt")).unwrap();
+        write(&repo, "weights/blob.bin", &[b'w'; 5000]);
+        let base = commit_all(&repo, "base");
+
+        let m = br#"{"editablePaths":["src","weights"],
+                     "editableSurfaceByteBudget":{"exemptPaths":["weights"],"maxGrowthBytes":1}}"#;
+        assert!(matches!(
+            verify_growth_over_from_git(m, &repo, &base),
+            BudgetVerification::Verified {
+                total_bytes: 100,
+                ..
+            }
+        ));
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    /// FAIL-CLOSED — a git failure is `Exceeded`, and its reason names BOTH `write-gate-base` and
+    /// `git` so an operator can tell a wiring fault from a real oversized submission.
+    #[test]
+    fn a_git_failure_is_a_distinguishable_exceeded() {
+        let repo = git_repo("growth-git-failclosed");
+        write(&repo, "src/a.txt", &[b'x'; 100]);
+        let base = commit_all(&repo, "base");
+        let m = br#"{"editablePaths":["src"]}"#;
+
+        for bad_base in [
+            &base[..12],
+            "not-a-sha",
+            "0123456789abcdef0123456789abcdef01234567",
+        ] {
+            match verify_growth_over_from_git(m, &repo, bad_base) {
+                BudgetVerification::Exceeded(reason) => {
+                    assert!(
+                        reason.contains("write-gate-base") && reason.contains("git"),
+                        "the refusal must name the wiring, not read as an overshoot: {reason}"
+                    );
+                }
+                other => panic!("expected Exceeded for base {bad_base:?}, got {other:?}"),
+            }
+        }
+        std::fs::remove_dir_all(&repo).unwrap();
+
+        // A directory that is not a work tree at all.
+        let bare = tmp("growth-git-notarepo");
+        match verify_growth_over_from_git(m, &bare, "0123456789abcdef0123456789abcdef01234567") {
+            BudgetVerification::Exceeded(reason) => {
+                assert!(
+                    reason.contains("write-gate-base") && reason.contains("git"),
+                    "{reason}"
+                )
+            }
+            other => panic!("expected Exceeded, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&bare).unwrap();
     }
 
     #[test]

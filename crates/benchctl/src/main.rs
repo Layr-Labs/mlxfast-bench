@@ -197,6 +197,10 @@ OPTIONAL:
     --prompt-sha256 <HEX>      --target-id: the sha is 64 lowercase hex, the target-id matches
     --target-id <ID>           [A-Za-z0-9._-]+, and the prompt file's sha256 MUST equal
                                --prompt-sha256 (die 8 on mismatch).
+    --write-gate-base <SHA>    Judge the write-outside gate + growth budget against the candidate's
+                               own committed diff (<SHA>..HEAD, its fork point from harness main)
+                               instead of the staged --baseline tree. ABSENT = the legacy staged-
+                               --baseline tree-diff, unchanged.
     --preflight-only           Run the pre-GPU prereq/quiesce checks then exit 0 without measuring.
     --calibration-bootstrap    Skip the BASELINE_CALIBRATION serial-band check and mark for authoring.
     --local-dev                LOCAL-DEV mode: a failed pair retries up to a budget (target-pairs x4)
@@ -528,6 +532,13 @@ struct MeasureJobArgs {
     /// measure-job (no driver, no seam 1) genuinely has no producer, and #132/F3's lesson is that
     /// an empty string must never be ambiguous.
     gates_producer: String,
+    /// David ruling 2026-08-27 — `--write-gate-base <SHA>`: when present, the write-outside gate and
+    /// the growth budget judge the candidate's own committed diff/state at `<sha>..HEAD` instead of
+    /// tree-diffing the staged `--baseline`; the staged workspace remains the timing baseline only.
+    ///
+    /// ABSENT is the LEGACY behavior, byte-identical (the qwen38 track lane runs without the flag
+    /// and must not move): both gates keep tree-diffing the staged baseline workspace.
+    write_gate_base: Option<String>,
 }
 
 /// A-1: the Option-A MEASURE-JOB subcommand (seam 2). Parses the workspace CLI, runs the
@@ -664,6 +675,8 @@ fn parse_measure_job_args(args: &[String]) -> Result<Option<MeasureJobArgs>, Str
     let mut preflight_only = false;
     let mut calibration_bootstrap = false;
     let mut local_dev = false;
+    // David ruling 2026-08-27 — `--write-gate-base`: the submission's fork point from harness main.
+    let mut write_gate_base: Option<String> = None;
 
     fn value<'a>(args: &'a [String], i: usize, name: &str) -> Result<&'a str, String> {
         args.get(i + 1)
@@ -686,6 +699,15 @@ fn parse_measure_job_args(args: &[String]) -> Result<Option<MeasureJobArgs>, Str
             }
             "--baseline" => {
                 baseline = Some(PathBuf::from(value(args, i, "--baseline")?));
+                i += 2;
+            }
+            // David ruling 2026-08-27 — the SUBMISSION'S OWN fork point from harness main. When
+            // given, the write-outside gate and the growth budget judge `<SHA>..HEAD` inside the
+            // --candidate repo and stop consulting the staged --baseline tree (which stays the
+            // paired TIMING baseline). The sha shape is validated at the gates, which is where the
+            // fail-closed refusal belongs.
+            "--write-gate-base" => {
+                write_gate_base = Some(value(args, i, "--write-gate-base")?.to_string());
                 i += 2;
             }
             "--weights" => {
@@ -1067,6 +1089,7 @@ fn parse_measure_job_args(args: &[String]) -> Result<Option<MeasureJobArgs>, Str
         calibration_bootstrap,
         local_dev,
         gates_producer: gates_producer.unwrap_or_else(|| GATES_PRODUCER_UNDECLARED.to_string()),
+        write_gate_base,
     }))
 }
 
@@ -1429,7 +1452,20 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
         // WIRE-1 item 1a (growth) — the benchd-native maxGrowthBytes bound the launch-time Swift
         // enforcer resolves but can NOT consume (no review base at launch). benchd HAS the base:
         // growth = candidate − baseline editable code bytes. An overshoot is a die-8 refusal, pre-GPU.
-        match byte_budget::verify_growth_over(&manifest_bytes, &args.baseline, &args.candidate) {
+        //
+        // David ruling 2026-08-27 — WHICH base: with `--write-gate-base <SHA>` the base is the
+        // candidate repo's OWN state at its fork point from harness main, so the bound stops moving
+        // when the organizer moves main. Without the flag this is byte-identical legacy behavior
+        // (the staged --baseline workspace), which the qwen38 track lane depends on.
+        let growth = match &args.write_gate_base {
+            Some(base) => {
+                byte_budget::verify_growth_over_from_git(&manifest_bytes, &args.candidate, base)
+            }
+            None => {
+                byte_budget::verify_growth_over(&manifest_bytes, &args.baseline, &args.candidate)
+            }
+        };
+        match growth {
             byte_budget::BudgetVerification::Verified { .. } => {}
             #[cfg(test)]
             byte_budget::BudgetVerification::Skipped(_) => {}
@@ -1440,14 +1476,26 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
             }
         }
         // WIRE-1 item 1b — the AUTHORITATIVE write-outside-editablePaths gate. Any file changed,
-        // added or deleted between the trusted --baseline and the --candidate that is NOT under
-        // editablePaths is a die-8 refusal, pre-GPU (the same overlap discipline as #147's
-        // trusted-scope: casefold + device:inode, not substring).
-        editable_divergence::verify_no_write_outside_editable(
-            &manifest_bytes,
-            &args.baseline,
-            &args.candidate,
-        )
+        // added or deleted OUTSIDE editablePaths is a die-8 refusal, pre-GPU (the same overlap
+        // discipline as #147's trusted-scope: casefold + device:inode, not substring).
+        //
+        // David ruling 2026-08-27 — WHICH diff: with `--write-gate-base <SHA>` the gate judges the
+        // SUBMISSION'S OWN committed diff (<SHA>..HEAD in the --candidate repo), so an organizer
+        // commit to harness main — which sits BELOW the fork point — can no longer be charged to
+        // every submission at once (the 2026-08-27 stale-staging refusals). Without the flag this is
+        // byte-identical legacy behavior: the candidate tree versus the staged --baseline tree.
+        match &args.write_gate_base {
+            Some(base) => editable_divergence::verify_no_write_outside_editable_from_git(
+                &manifest_bytes,
+                &args.candidate,
+                base,
+            ),
+            None => editable_divergence::verify_no_write_outside_editable(
+                &manifest_bytes,
+                &args.baseline,
+                &args.candidate,
+            ),
+        }
         .map_err(MeasureJobFailure::die8)?;
     } else {
         // #150 — the absent-manifest SKIP is silent, so emit a one-line stderr NOTICE so an audit can

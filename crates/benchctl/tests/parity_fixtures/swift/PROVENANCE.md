@@ -6,7 +6,8 @@ checkout). They are the *reference* the native Rust port in `crates/benchctl/src
 pinned against per David's WIRE-1 ruling ("a PARITY TEST pinning the two implementations against
 SHARED FIXTURES").
 
-Origin (read-only), engine `Layr-Labs/mlxfast-gemma4-26b-a4b-engine-dev`:
+Origin (read-only), engine `Layr-Labs/mlxfast-gemma4-26b-a4b-engine` (the commit below is from its
+development history, so identity here is carried by the sha256 column, not by the repo name):
 
 | file | origin path | commit | sha256 (vendored == git object) |
 |---|---|---|---|
@@ -14,7 +15,7 @@ Origin (read-only), engine `Layr-Labs/mlxfast-gemma4-26b-a4b-engine-dev`:
 | `main.swift` | `tools/editable-surface-budget-cli/main.swift` | `feb2b092e76776acfe3ff27a3b649d96848fae2a` | `a24110fc55dd9fa7c373dea9765ec94f1cd14e1cb0a7c8372021cee8b1516009` |
 
 RE-PINNED 2026-08-26 (David BYO-512 ruling). The previous pin was
-`davidtai/mlxfast-qwen-38-27b-mtp-engine@736781ea`, a QWEN-ERA copy that had drifted from the live
+the qwen-era engine fork at `736781ea`, a QWEN-ERA copy that had drifted from the live
 enforcer: it predated the D8 absent-surface backstop (issue #20 Q3) and carried the older cap
 defaults. Because the Rust port's own constants had been matched to that stale copy, the parity test
 was green while benchd was in fact LOOSER than the engine on an all-absent editable surface — a

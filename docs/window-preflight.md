@@ -16,7 +16,7 @@ protocol version, the #123 roster superset — and never extended that rigor to 
    parity engine repo was absent from the box entirely, shipped ad hoc by bundle mid-window.
    This was discovered *under the lock*, on the clock.
 2. **Every live leg then died at the spawn seam** — `engine hello handshake failed: protocol
-   violation: engine closed the stream before returning a response` ([#134]). The GPU-free
+   violation: engine closed the stream before returning a response` (#134). The GPU-free
    preflight the window did run, `measure-job --preflight-only`, had returned `EXIT 0` minutes
    earlier, because it returns at `main.rs:1205-1215`, *before the first spawn*.
 
@@ -57,7 +57,7 @@ unconfirmed rather than staying silent.
 
 A miniature of the **real** path: the actual `benchctl` binary spawning the actual worker
 binary over the actual transport — env scrub, hello handshake, at least one real round trip.
-Roughly 60 seconds of GPU that would have caught [#134] before a whole window was spent on it.
+Roughly 60 seconds of GPU that would have caught #134 before a whole window was spent on it.
 
 Recipes are named and pinned (`WP_SMOKE_RECIPE`), and are built from pins the gate has *already
 asserted*, so the smoke leg cannot drift from the tree that was just cleared.
@@ -71,7 +71,7 @@ asserted*, so the smoke leg cannot drift from the tree that was just cleared.
 | `none` | — | nothing | A **declared waiver**, recorded in the attestation. The lock is still **acquired and held** — only the leg is waived. |
 
 There is deliberately **no new `benchctl smoke` subcommand**: adding one would mean editing the
-spawn-seam files the [#134] lane owns. The gate builds on the CLI surface that exists today.
+spawn-seam files the #134 lane owns. The gate builds on the CLI surface that exists today.
 If a first-class one-shot smoke verb is added later, `WP_SMOKE_RECIPE` gains a name and nothing
 else changes.
 
@@ -80,7 +80,7 @@ else changes.
 | observed | verdict | exit |
 |---|---|---|
 | `rc=0`, no error signature | **PASS** | 0 |
-| stderr matches `closed the stream before returning a response` / `hello handshake failed` | **FAIL** — spawn seam broken (the [#134] signature). The diagnostic names *both* causes it could be, because the engine also exits 1 on an unknown argv flag *before* the hello and that surfaces identically (`main.rs:1338-1348`). Forwarded worker stderr is quoted. | 8 |
+| stderr matches `closed the stream before returning a response` / `hello handshake failed` | **FAIL** — spawn seam broken (the #134 signature). The diagnostic names *both* causes it could be, because the engine also exits 1 on an unknown argv flag *before* the hello and that surfaces identically (`main.rs:1338-1348`). Forwarded worker stderr is quoted. | 8 |
 | stderr mentions `protocol_version` | **FAIL** — engine speaks a different protocol version | 8 |
 | no response within `WP_SMOKE_TIMEOUT_S` | **FAIL** — hung at the handshake (killed; the gate does not hang) | 8 |
 | `rc≠0` otherwise | **FAIL** — handshook but did not complete the round trip | 8 |
@@ -123,7 +123,7 @@ A real candidate leg spawns, through `sandbox-exec`:
 regime is free-run, i.e. `spec.mode != "serial"` (`measure_job.rs:179-185`, `:699-706`). The
 engine fences its own argv against `RUNTIME_WORKER_ACCEPTED_FLAGS` and exits 1 on an unknown
 option **before writing the hello** — which surfaces as exactly the same "engine closed the
-stream before returning a response" that [#134] reported.
+stream before returning a response" that #134 reported.
 
 So a `{"mode":"serial"}` smoke leg is a strict **prefix** of a real leg: it omits
 `--speculative-protocol` entirely, and an engine that rejects that flag would sail through the
@@ -137,7 +137,7 @@ round of shell parsing with its spec JSON intact.
 
 ## Expected posture against the current tree
 
-Until [PR #136] (the observability half of [#134]) lands and the engine seam is fixed, the
+Until PR #136 (the observability half of #134) lands and the engine seam is fixed, the
 `handshake` recipe is **EXPECTED to FAIL** against a real box. That is the gate working, not
 the gate broken.
 
@@ -681,8 +681,8 @@ Exercises:
 entire real-transport section could go green without exercising the transport. A skipped check
 is an untested claim, not a pass.
 
-The fake-worker matrix is how the [#134] verdicts are proven without a GPU. Against a real box
-the `handshake` recipe is *expected to fail* until [#134]'s fix lands — that is the gate working.
+The fake-worker matrix is how the #134 verdicts are proven without a GPU. Against a real box
+the `handshake` recipe is *expected to fail* until #134's fix lands — that is the gate working.
 
 ---
 
@@ -713,5 +713,3 @@ off is not the whole job, and a box handed over quietly not-serving is a failure
 
 `--provision` runs step 1 first. `--no-smoke` declares a smoke waiver (and takes no lock).
 
-[#134]: https://github.com/davidtai/mlxfast-bench/issues/134
-[PR #136]: https://github.com/davidtai/mlxfast-bench/pull/136

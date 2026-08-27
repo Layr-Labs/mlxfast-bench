@@ -4,8 +4,8 @@
 //! is the reproducibility spine (nvidia-smi -lgc). Values come from target.toml, not
 //! hardcoded Apple numbers. Readers are ring-0-owned (a gamed gate is a scoring attack).
 //!
-//! This crate implements the **macmon** provider (WS2-6, canonical issue
-//! davidtai/mlxfast-engine#7). Its normative spec is `docs/measure-job-contract.md`
+//! This crate implements the **macmon** provider (WS2-6, canonical issue #7 in the engine
+//! development tracker). Its normative spec is `docs/measure-job-contract.md`
 //! §3 "How macmon is sampled". Two things live here:
 //!
 //! 1. **Parsing** — [`MacmonSample`] turns one `macmon pipe` JSON object into the three

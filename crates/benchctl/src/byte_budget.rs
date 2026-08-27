@@ -11,7 +11,7 @@
 //!
 //! REFERENCE SEMANTICS (ported, not copied). The reference is the engine's Swift enforcer
 //! `Sources/MLXFastTrustedHarness/EditableSurfaceByteBudget.swift`, read at
-//! `Layr-Labs/qwen-3.8-mtp-challenge` fork `davidtai/mlxfast-qwen-38-27b-mtp-engine@736781ea`
+//! the qwen-era engine fork of `Layr-Labs/qwen-3.8-mtp-challenge`, at `736781ea`
 //! (read-only). Every rule below carries the reference rule id from
 //! `docs/submission-restriction-spec.md@736781ea` §2 (R1.x). A pinned byte-for-byte copy of the
 //! reference lives under `tests/parity_fixtures/swift/` so the parity test is hermetic.

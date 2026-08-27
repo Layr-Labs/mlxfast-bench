@@ -9,7 +9,7 @@
 //!
 //! REFERENCE SEMANTICS (ported, not copied). The reference is the engine's diff-level surface
 //! allowlist `\.github/scripts/enforce-modifiable-surface.sh` at
-//! `davidtai/mlxfast-qwen-38-27b-mtp-engine@736781ea` (a re-implementation of
+//! the qwen-era engine fork `@736781ea` (a re-implementation of
 //! `Layr-Labs/qwen-3.8-mtp-challenge@bfab0de`, read-only): it reads `editablePaths` from the BASE
 //! (trusted) contract — never the submission's own — and refuses any `git diff --name-only BASE
 //! HEAD` path that is neither an allowed path nor inside one. Here the "diff" is computed by

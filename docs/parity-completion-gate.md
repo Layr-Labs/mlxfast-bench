@@ -12,13 +12,15 @@
 > D-2 are sufficient evidence** for those three prongs.
 >
 > **Citation discipline (standing).** Every claim about corpora, rosters, classes or code is
-> `path@sha:line` or an issue URL. Claims no window has produced carry `UNVERIFIED`.
+> `path@sha:line` or an issue reference. Claims no window has produced carry `UNVERIFIED`.
+> Bare `#N` / `PR #N` references and the shas below cite this repo's development history, which
+> is not part of the published snapshot.
 >
 > | tag | repo / path | sha | role |
 > |---|---|---|---|
-> | **BENCHD** | `davidtai/mlxfast-bench` `main` | **`35c100aa`** | the frozen state — **the freeze snapshot** |
+> | **BENCHD** | this repo, `main` | **`35c100aa`** | the frozen state — **the freeze snapshot** |
 > | *(superseded)* | `98f44fa5` | | the earlier freeze point; **all `@98f44fa` / `@140878b` cites from prior drafts are re-derived here** |
-> | **REF** | `davidtai/mlxfast-qwen-38-27b-mtp-engine` | `b26f76f1` | the Swift reference |
+> | **REF** | the qwen-era engine fork | `b26f76f1` | the Swift reference |
 > | **TRACK** | `fixtures/qwen3_8_27b_mtp_track.json` | sha256 `5677d53f…83ad1`, 44589 B | the track contract — pins the prompt pool |
 > | **DIFFER** | `benchctl parity-diff` | `parity-diff v2 roster58/8c2f2d99` | `crates/benchctl/src/parity.rs@35c100a:392-408` |
 >
@@ -175,7 +177,7 @@ quotations, or genuine goldens. Family V's label changed from "across golden SEC
 
 A run is admissible only if its REPORT records: (1) benchd commit + binary sha256; (2)
 `mlxfast-swift` at REF + the standalone engine binary sha256 — the §8 re-verify used
-`davidtai/mlxfast-engine@c83f9de6`, explicitly *not* `mlxfast-qwen-38-27b-mtp-engine`;
+the standalone MLX engine at `c83f9de6`, explicitly *not* the qwen-era engine fork;
 (3) the differ version string, which
 fingerprints the roster and the three tolerances so a battery cannot silently run under a
 changed policy; (4) every **input document** by **sha256 + byte count** — both halves, the `bytes` half
@@ -273,7 +275,7 @@ series starts UNBANDED and no unattended bootstrap may author one; (5) floor/cei
 hardware — `decode_speedup_floor: 0.9`, `published_speedup_ceiling: 5.0`,
 `timed_mode: free_run_v1_1`, with a **measured median clearing the floor** (Proof A confirmed
 seal *shape* only; medians were `0.0` because no pair was accepted,
-[#117](https://github.com/davidtai/mlxfast-bench/issues/117)); (6) **runner identity pinned by
+#117); (6) **runner identity pinned by
 BYTES** — #135 found the first on-hardware `benchmark-integrity.results.json` names executables
 by **PATH** and digests **workspaces**, with **4 of 8** roster keys absent and
 `metrics.commit = ""`. **RULED (Q6): TWO ARTIFACTS** — `results.json`'s sidecar keeps the organizer shape; the local `benchmark-integrity.*.json` carries the full 8-key roster. D-1 seals both, and #123's justification stops citing measure-job as its bar.
@@ -457,7 +459,7 @@ is report-only). **RULED (Q3): `5677d53f…` / 44589 B is the pin authority**; t
 
 **FT-5 — one pool object is the known hard prompt.** Entry 6 (pinned `c1ec58669d032878`; name
 withheld — secret-tier) is that object, recorded on
-[#109](https://github.com/davidtai/mlxfast-bench/issues/109) at ratio `1.1057` with 87 of 103
+#109 at ratio `1.1057` with 87 of 103
 rounds non-drafting. Stated so a low number there reads as a workload property, not a defect.
 
 ### 3.4 What the primary leg must show
@@ -561,7 +563,7 @@ byte-pinned by `early_refuse_record_byte_matches_the_reference_capture` (`:2637`
 refusal*: `main.rs@35c100a:2051` (`execute_iterate`) propagates the loader `Err`; the terminal handler `:1972-1975`
 prints stderr and exits 1 — **no artifact at all**, where REF catches into `failedScore`
 (`QwenRuntimeLocalIterate.swift@b26f76f:197-198`) and writes it unconditionally
-(`main.swift@b26f76f:339-341`). [#131](https://github.com/davidtai/mlxfast-bench/issues/131),
+(`main.swift@b26f76f:339-341`). #131,
 **unruled**.
 
 **Axis C — §7 corruption classes.** `gen-failure-corpus.py@35c100a`: **6 defined, 5 generated, 5
@@ -591,9 +593,9 @@ observable failure classes on the local leg**, mapping 7-for-7:
 Plus **FC-0** = the passing class (families V, L, Z, A).
 
 **The F1(b) semantics (term (c) — MERGED at `35c100aa`).** **RULED David 2026-08-20 — MIRROR BLANK
-STRICTLY** ([#132](https://github.com/davidtai/mlxfast-bench/issues/132#issuecomment-5357895042)),
+STRICTLY** (#132 comment 5357895042),
 superseding the same-day
-[keep-and-declare](https://github.com/davidtai/mlxfast-bench/issues/132#issuecomment-5357754961).
+keep-and-declare (#132 comment 5357754961).
 Every local failure path producing no correctness report seals `golden_hash = ""`,
 `case_count = 0`, `checked_steps = 0`. **Zero DECLARED cells.** Implemented structurally —
 `failed_payload` blanks all three itself and no longer takes a case-count parameter
@@ -742,7 +744,7 @@ to the committed manifest** — the report says `ACCEPT=5 / REJECT=178 / 21 dive
 match); it also still calls the loader-parity corpus "12-fixture" (`:3`) where it is 15. The #77
 and #113 changes landed in generator and manifest but never reached the report, and
 `fuzz-corpus-check.sh` **rewrites it on every run**, dirtying any lane
-([#125](https://github.com/davidtai/mlxfast-bench/issues/125)). → §6 stage 1.
+(#125). → §6 stage 1.
 
 ### 4.5 Family T — `--golden` document-shape routing (6 cases) · *reach: multiple (P1, P3)*
 
@@ -786,7 +788,7 @@ organizer bytes are in this repository.**
 on CODE evidence only — *"no box run has written one of these sidecars yet"*
 (`docs/parity-matrix.md@35c100a:38`). Proof A's two `iterate` legs died at the engine handshake
 (#134) before sealing, so the 9+7 local sidecar is **still unwritten on hardware**
-([#135](https://github.com/davidtai/mlxfast-bench/issues/135)). These three are the first hardware
+(#135). These three are the first hardware
 evidence for the Yukon ingestion chain and must not be waved through.
 
 ### 4.7 Family R — failure RECORD SHAPE (12 cases, 1 excluded) · *reach: multiple*
@@ -889,7 +891,7 @@ hard-failed, not silently waived.
 | id | class | mode | expected |
 |---|---|---|---|
 | C-14 | `oracle` | OF | **both FAIL** — the class local cannot test; a both-PASS **aborts the harness LOUD** (`official-failure-map.sh@35c100a:97-106`) |
-| C-15 | `baseline-missing` | OF | **DECLARED (#127)** — benchd refuses where REF falls back to the constants (`Golden.swift@b26f76f:220-226`). **benchd STRICTER on the ranked path — declarable under P1**, and **CONFIRMED KEEP** ([#127](https://github.com/davidtai/mlxfast-bench/issues/127#issuecomment-5357341215)): the ranked runner measures its baseline in the same session (#61), so an official run with no pair is a missing measurement, not a cue to score against a cached constant |
+| C-15 | `baseline-missing` | OF | **DECLARED (#127)** — benchd refuses where REF falls back to the constants (`Golden.swift@b26f76f:220-226`). **benchd STRICTER on the ranked path — declarable under P1**, and **CONFIRMED KEEP** (#127 comment 5357341215): the ranked runner measures its baseline in the same session (#61), so an official run with no pair is a missing measurement, not a cue to score against a cached constant |
 | C-16 | `submit-1024-band` fixture | OF | both FAIL the acceptance band identically; both carry the band-failure signature; RULING-2 blanked surfaces byte-match |
 | C-11…C-13 | `primary`, `anchor`, `free-run` | OF | all FAIL, full correctness scope; anchor-fail `first_failing_step = 0` (`QwenRuntimeCorrectnessCompare.swift:481`), not null |
 | C-01…C-05 | `primary`, `anchor`, `free-run`, `oracle`, `baseline-missing` | IT | primary both FAIL (FC-7 retain); anchor/free-run/oracle both PASS; baseline-missing both PASS **identically** (#127 negative control) |
@@ -1058,14 +1060,14 @@ and `overlay-timing` are real subcommands that carried no matrix row and no disp
 | OOS-02 | 1-ULP read→emit creep on baseline fields | **none** | razor | Not submission-reachable, not ingested, within `Det` tolerance so no decision moves. Already a differ creep-watch class; less reachable still since #127 stopped benchd emitting a value read from the golden's baseline fields on the local leg. |
 | OOS-03 | benchctl **native** usage exit code `2` | **none** | razor | The **facade's** exit code is Yukon-visible and IS gated (A-05/A-10/A-15 + `compat-matrix.sh` Part 3). The native code is a developer-CLI convention the workflow never reads. RULED WAIVED 2026-08-17. |
 | OOS-04 | Exit-code asymmetry on a defective input (#109 Finding 7) | **none** | razor | The **wrapper** exit code is the Yukon-visible one and is gated by family A. REF's binary returning 0 on a failing local score is by design (pass/fail lives in the payload `passed`); `benchmark.sh` maps a failing payload → exit 1. Root-caused and fixed by PR #122. Listed so it is not re-litigated. |
-| OOS-05 | [#121](https://github.com/davidtai/mlxfast-bench/issues/121) `model_type` diagnostic prose (`{:?}` → `Some("gemma_text")` vs `String(describing:)` → `Optional("gemma_text")`) | **none** | razor | **The canonical razor case.** Decisions are identical, so benchd is not looser (P1 ✗); diagnostic prose is not ingested (P2 ✗); no decision, score or floor moves (P3 ✗). Out-of-scope **by definition** — no per-cell ruling needed. (The hook exists in L-03 and family N if David disagrees.) |
+| OOS-05 | #121 `model_type` diagnostic prose (`{:?}` → `Some("gemma_text")` vs `String(describing:)` → `Optional("gemma_text")`) | **none** | razor | **The canonical razor case.** Decisions are identical, so benchd is not looser (P1 ✗); diagnostic prose is not ingested (P2 ✗); no decision, score or floor moves (P3 ✗). Out-of-scope **by definition** — no per-cell ruling needed. (The hook exists in L-03 and family N if David disagrees.) |
 | ~~OOS-06~~ | ~~#119 — `iterate`/`correctness` take no `--contract`~~ | **WITHDRAWN** | merged | **Not out-of-scope.** Prior drafts demoted this on reachability; the razor-symmetry correction above shows the exposure RELOCATES onto our own paired flow (facade seam-1 → `benchctl iterate --mode official`, no `--contract`, so `model_provenance` is shape-only on a scoring-bearing default). **Merged into §5.1 item (ii)** as the second half of one root exposure, and covered by option (b′). |
 | OOS-07 | `transform-if-changed` (M20), `verify-transform` (M26) | **none** | razor | No benchd code exists (`benchctl transform` is a stub; `benchmark.sh` owns the skip/rebuild + marker), so nothing to run or diff. The one Yukon-visible consequence — `transform_source_sha256` in the integrity JSON — is already handled as a declared field-level exception in family A. M26 is a DECLARED deferral signed 2026-08-18, riding on M20. |
 | OOS-08 | semantic-GPQA judge (M29) | **none** *(for benchd)* | razor | RULED option (b) 2026-08-18 — workflow-owned. benchd stays judge-free and holds no judge-API credentials; the compared unit is the **pre-judge sealed score**, and `semantic_gpqa_*`/`gpqa_ttft_*` are 0/"" both sides. benchd produces no artifact here, so no prong attaches to benchd. (P1 note: keeping the judge out of benchd's trust boundary is itself the security-preferred arrangement.) |
 | OOS-09 | `--local-cool-gate-only` residual divergence | **none** | razor | Facade-only selector; offline-inert; not ingested. Deliberate — dispatching would emit `benchctl…:`-prefixed stderr and break the `benchmark.sh:` impersonation, a net parity loss. Real runs still thermally gate via `benchctl iterate --cool-gate`. |
 | OOS-10 | Parent-harness `MLXFAST_*` env surface | **none** *(local scope)* | razor | Recorded as a DECISION in the matrix; most are official/sandbox surface. #47 — the engine-subprocess env surface, which **is** the security-relevant one — is closed and separately gated (allowlist-from-empty + stderr redaction, GPU-verified). |
 | OOS-11 | Track-B code-verified rows: M27 (`cache_memory` #54 live worker), M28 (`MLXFAST_PAIRED_BASELINE_*` #61 GPU e2e), M24 (`correctness` sandboxing/golden-blocking) | **deferred, not excluded** | **deferral** | Each is VERIFIED-code / stub-tested; the **live halves belong to D-1 and D-2**, not to the differ battery. Listed so "VERIFIED (code)" is never read as "GPU-verified". M24's golden-deny is P1 and is D-2's item 4. |
-| OOS-12 | [#125](https://github.com/davidtai/mlxfast-bench/issues/125) stale fuzz report | **none** | razor | Documentation hygiene. But it **dirties the tree on every battery run**, so §6 stage 1 resolves it as a prerequisite, not a gated cell. |
+| OOS-12 | #125 stale fuzz report | **none** | razor | Documentation hygiene. But it **dirties the tree on every battery run**, so §6 stage 1 resolves it as a prerequisite, not a gated cell. |
 | OOS-13 | rustfmt drift on `main` (~6.2k lines) | **none** | razor | Orthogonal to all three prongs; a repo-wide reformat would destroy the line-number citations this document and the matrix depend on. |
 | OOS-14 | Prefill residual (M-5, 27.2 ms protocol floor) | **none** | razor | DECOMPOSED **physical** — the benchd↔engine protocol/spawn floor an in-process monolith never pays. It **cancels in scoring** under per-series benchd-measured baselines, so P3 ✗ (no scoring verdict moves). Grade A on the band with a standing band alarm. |
 | OOS-15 | Anything organizer-owned: the ranked `score.json` seal, the GPQA judge + score-patch + integrity re-anchor, the track fixture's per-prompt numeric values | **none** *(for benchd)* | razor | Ownership boundary — benchd does not author these. Organizer material is **report-only: never modified, never re-uploaded**, even where it looks defective (FT-4). **NARROWED per the Q1a ruling — see below.** |
@@ -1167,7 +1169,7 @@ sites**, and both scripts' own headers (`official-paired.sh:55,62` and `run-pair
 already *claim* the safe producer, so the fix brings code into line with documentation rather than
 the reverse.
 
-**Status at signing: implementation IN FLIGHT as [PR #139](https://github.com/davidtai/mlxfast-bench/pull/139)**
+**Status at signing: implementation IN FLIGHT as PR #139**
 (`lane/pre-window-debt`), commit **`933ed3c`** — *"Ruling Q1a: default the seam-1 gates producer to
 the reference chain, not our facade"*. It flips both defaults to `benchmark-sh` and updates
 `test-paired-offline.sh`. Recorded here as **signing-time fact** rather than left to a
@@ -1219,7 +1221,7 @@ was a signed hole *for coverage*; it is not a signed hole *for security*.
 **494 and 303 are TOKENS, not counts.** Any reading as "494 items vs 303 items" is wrong.
 
 **The facts.** In window 4's E2A leg
-([#109 comment 5353937166](https://github.com/davidtai/mlxfast-bench/issues/109)), benchd's
+(#109 comment 5353937166), benchd's
 local-iterate run reported `first_failing_step = 3`, `expected_token = 494`, `actual_token = 303`,
 `case_count = 1`, `checked_steps = 4`. `494` is what the window-4 golden `beefed.json`
 (`32045f7e…`, 16,940 B) declares at `expected_tokens[2]`; `303` is what the engine emitted on the
@@ -1397,7 +1399,7 @@ implausible s-per-tok / row-accounting) rather than a parity class.
 
 | # | deliverable | status | gate |
 |---|---|---|---|
-| **(b′)** | Flip the seam-1 default `facade` → `benchmark-sh` for scoring-bearing runs at **both** sites — `official-paired.sh:110` **and** `run-paired-window.sh:78`, which carries an independent default — plus the headers that already claim `benchmark-sh` (`official-paired.sh:55,62`, `run-paired-window.sh:74`) | **RULED; implementation IN FLIGHT at signing** — both sites still read `facade` at `35c100aa` and `1465393` | [PR #139](https://github.com/davidtai/mlxfast-bench/pull/139) `lane/pre-window-debt`, commit `933ed3c` |
+| **(b′)** | Flip the seam-1 default `facade` → `benchmark-sh` for scoring-bearing runs at **both** sites — `official-paired.sh:110` **and** `run-paired-window.sh:78`, which carries an independent default — plus the headers that already claim `benchmark-sh` (`official-paired.sh:55,62`, `run-paired-window.sh:74`) | **RULED; implementation IN FLIGHT at signing** — both sites still read `facade` at `35c100aa` and `1465393` | PR #139 `lane/pre-window-debt`, commit `933ed3c` |
 | **(a)** | Implement the behavior gate in bench-core conformance + gate it with a real corpus case | **RULED, post-flip** | gated on pulling the R2 hidden behavior-gate reference, now permitted by the **narrowed OOS-15** (§5) |
 
 ### Ledger at signing
@@ -1417,7 +1419,7 @@ implausible s-per-tok / row-accounting) rather than a parity class.
 Named explicitly, so nothing rides on silence:
 
 - **(b′) is ruled and in flight; (a) is ruled and unbuilt.** The P1 exposure in §5.1 (ii) is
-  closed *by ruling*; (b′)'s code is [PR #139](https://github.com/davidtai/mlxfast-bench/pull/139)
+  closed *by ruling*; (b′)'s code is PR #139
   (`933ed3c`), **not yet merged**. Until it lands, both facade defaults still stand and our paired
   flow's scoring-bearing default still runs benchd as the seam-1 gates producer.
 - **R-10 needs the #131 fix** before its case can run.

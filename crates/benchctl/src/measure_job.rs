@@ -118,12 +118,26 @@ pub const BATCHED_FREE_RUN_TIMED_REGIME: &str = "batched-free-run-v1_2-timed";
 /// naming-convention check.
 pub const SCORED_BATCH_SIZE_B8: u32 = 8;
 
-/// The per-cohort accepted-pair target (`pairs_per_cohort`). RULED 2 by David 2026-08-24
-/// ("do 2", choosing ~20-minute scored windows over 4-sample medians from the presented
-/// trade table) — SUPERSEDES the batch-8 brief D2 default of 4. The published even-n median
-/// over 2 samples is the mean of the two cohort ratios; `min_pairs` still floors it.
+/// The per-cohort accepted-pair target (`pairs_per_cohort`). RULED 4 by David 2026-08-26
+/// ("you run it using 4 pairs instead of 2 of 8 batches") — 8 prompts × 4 pairs is the
+/// challenger-grade sample mass the ruling buys, at the cost of the shorter scored window.
+///
+/// SUPERSESSION CHAIN (each entry supersedes the one above it):
+/// 1. batch-8 brief D2 — default 4.
+/// 2. David 2026-08-24 — RULED 2 ("do 2", choosing ~20-minute scored windows over 4-sample
+///    medians from the presented trade table).
+/// 3. David 2026-08-26 — RULED 4 (this constant), returning to the brief's sample count on
+///    sample-mass grounds. The 8/24 ruling is SUPERSEDED, not reinterpreted.
+///
+/// MEDIAN SUPPORT: the published score stays the shared even-n rule
+/// ([`MEDIAN_RULE_EVEN_N`], `bench_core::score::paired_decode_only_median`), and 4 keeps the
+/// support EVEN, so the rule still means "mean of the two central order statistics" — at n = 4
+/// that is the mean of the 2nd and 3rd sorted cohort ratios, a REAL median that discards the
+/// extremes. (At the superseded n = 2 the same rule degenerated to the mean of both samples,
+/// discarding nothing; the rule is unchanged, its support is strictly better.) `min_pairs`
+/// still floors the accepted count.
 /// NAMING: `pairs_per_cohort` is pending the orchestrator's naming-convention check.
-pub const PAIRS_PER_COHORT_TARGET: usize = 2;
+pub const PAIRS_PER_COHORT_TARGET: usize = 4;
 
 /// W3 — the top-level `timed_mode` SERIES DESCRIPTOR for a MIXED run: legs measured in two
 /// different §5 series. It is deliberately NOT one of the two series tags — the run is not
@@ -5491,9 +5505,30 @@ where
     if !cfg.local_pair_budget && cfg.target_pairs != PAIRS_PER_COHORT_TARGET {
         return Err(format!(
             "official batched cohort run declares target_pairs {} but the RULED pairs_per_cohort \
-             target is {PAIRS_PER_COHORT_TARGET} (David ruling 2026-08-24, superseding brief D2: 2 accepted pairs per scored window, \
-             mirroring today's target_pairs) — refused; --local-dev may explore other targets",
+             target is {PAIRS_PER_COHORT_TARGET} (David ruling 2026-08-26, superseding the \
+             2026-08-24 ruling of 2: {PAIRS_PER_COHORT_TARGET} accepted pairs per scored window) \
+             — refused; --local-dev may explore other targets",
             cfg.target_pairs
+        ));
+    }
+    // D2 (RULED) — THE FLOOR IS PART OF THE RULING, not a separate dial. `target_pairs` alone does
+    // not make an official run publish over the ruled support: the pair loop stops accepting at the
+    // TARGET but only FAILS below `min_pairs`, so an official run declaring
+    // `min_pairs < PAIRS_PER_COHORT_TARGET` would accept a short cohort — say 2 of the ruled 4 —
+    // and publish a median over half the support the ruling bought, with nothing downstream saying
+    // so. The parse-time check is only `min_pairs <= target_pairs`, which such a run satisfies, so
+    // the target refusal above does NOT cover this and the two are genuinely independent gates.
+    //
+    // Enforced at this same PRE-GPU seam, and OFFICIAL-ONLY: `--local-dev` still explores any
+    // floor below its target (that is the whole point of the dev path, and the retry-budget logic
+    // above depends on it), so this must never widen into a blanket min == target rule.
+    if !cfg.local_pair_budget && cfg.min_pairs != PAIRS_PER_COHORT_TARGET {
+        return Err(format!(
+            "official batched cohort run declares min_pairs {} but the RULED pairs_per_cohort \
+             floor is {PAIRS_PER_COHORT_TARGET} (David ruling 2026-08-26: the floor equals the \
+             target, so a short cohort cannot publish a median over a narrower support than the \
+             ruling defines) — refused; --local-dev may explore other floors",
+            cfg.min_pairs
         ));
     }
     // Belt-and-braces on the membership the caller validated pre-GPU: the seal below states these
@@ -6781,8 +6816,10 @@ fn build_cohort_results(
     };
 
     // D2 — THE PUBLISHED SCORE: the even-n median over the accepted pairs' cohort ratios (the
-    // same shared median rule as the per-prompt path; `pairs_per_cohort = 2` (RULED 2026-08-24) keeps
-    // the sample count EVEN (2), so the two-central-order-statistics rule matters).
+    // same shared median rule as the per-prompt path; `pairs_per_cohort = 4` (RULED 2026-08-26,
+    // superseding the 2026-08-24 ruling of 2) keeps the sample count EVEN, so the
+    // two-central-order-statistics rule matters — at n = 4 it is the mean of the 2nd and 3rd
+    // sorted ratios, so the fastest and slowest cohort windows do not enter the published score).
     let raw_decode_speedup_median = bench_core::score::paired_decode_only_median(&per_pair_ratios);
 
     // The per-COHORT floor (the D2 translation of the per-prompt floor; one cohort, so the
@@ -12575,7 +12612,7 @@ mod tests {
             members,
             &DirDigest::empty(),
             "deadbeef",
-            &cohort_cfg(2, PAIRS_PER_COHORT_TARGET),
+            &cohort_cfg(PAIRS_PER_COHORT_TARGET, PAIRS_PER_COHORT_TARGET),
             |_p| ok_cohort_serial(),
             |_p| inv_cohort_candidate(CANDIDATE_SPT),
             oracle,
@@ -13339,9 +13376,15 @@ mod tests {
 
     #[test]
     fn cohort_positive_control_seals_the_cohort_shape() {
-        // min 2, RULED target 2 (2026-08-24): a conformant run accepts exactly pairs_per_cohort = 2 pairs of
-        // the ONE cohort and seals the cohort shape.
-        let outcome = cohort_identity_run(&cohort_cfg(2, PAIRS_PER_COHORT_TARGET)).unwrap();
+        // min 4, RULED target 4 (2026-08-26, superseding the 2026-08-24 ruling of 2): a conformant
+        // run accepts exactly pairs_per_cohort = 4 pairs of the ONE cohort and seals the cohort
+        // shape. min == target mirrors the engine wrapper, which passes --min-pairs 4
+        // --target-pairs 4.
+        let outcome = cohort_identity_run(&cohort_cfg(
+            PAIRS_PER_COHORT_TARGET,
+            PAIRS_PER_COHORT_TARGET,
+        ))
+        .unwrap();
         assert!(outcome.candidate_accepted);
         let r = &outcome.results;
         assert_eq!(r.mode, COHORT_MEASURE_JOB_MODE);
@@ -13360,7 +13403,7 @@ mod tests {
         // The cohort seal: one cohort, 8 members in pool order, width pinned.
         assert_eq!(r.scored_batch_size, Some(8));
         assert_eq!(r.pairs_per_cohort, Some(PAIRS_PER_COHORT_TARGET));
-        assert_eq!(r.min_pairs_per_cohort, Some(2));
+        assert_eq!(r.min_pairs_per_cohort, Some(PAIRS_PER_COHORT_TARGET));
         assert!(
             r.per_prompt.is_empty(),
             "per_prompt is replaced by per_cohort"
@@ -13406,9 +13449,12 @@ mod tests {
             r.aggregate.published_speedup_ceiling,
             PUBLISHED_SPEEDUP_CEILING
         );
-        // The alternation still keys on the accepted-pair index.
-        assert_eq!(r.pairs[0].order, "mtp-first");
-        assert_eq!(r.pairs[1].order, "serial-first");
+        // The alternation still keys on the accepted-pair index, across ALL 4 ruled pairs.
+        let expected_orders = ["mtp-first", "serial-first", "mtp-first", "serial-first"];
+        assert_eq!(r.pairs.len(), expected_orders.len());
+        for (pair, expected) in r.pairs.iter().zip(expected_orders) {
+            assert_eq!(pair.order, expected);
+        }
     }
 
     #[test]
@@ -13422,6 +13468,70 @@ mod tests {
         let mut local = cohort_cfg(2, 3);
         local.local_pair_budget = true;
         assert!(cohort_identity_run(&local).is_ok());
+    }
+
+    #[test]
+    fn cohort_official_run_refuses_the_superseded_pairs_target_of_two() {
+        // MUTATION PROOF for the 2026-08-26 ruling: the conformance gate did not merely move, it
+        // RETARGETED. 2 was the RULED value under the superseded 2026-08-24 ruling and would have
+        // passed this gate before the change; an official run declaring it must now REFUSE, and
+        // the diagnostic must name the NEW target so an operator running the old wrapper is told
+        // what to change. Local-dev may still explore 2.
+        // Compile-time: this proof is vacuous unless the ruled target has moved off the superseded
+        // 2, so a revert should fail the BUILD rather than leave a green test asserting nothing.
+        const { assert!(PAIRS_PER_COHORT_TARGET != 2) };
+        let err = cohort_identity_run(&cohort_cfg(2, 2))
+            .err()
+            .expect("the superseded target of 2 must refuse on an official run");
+        assert!(err.contains("RULED pairs_per_cohort"), "{err}");
+        assert!(err.contains("target_pairs 2"), "{err}");
+        assert!(
+            err.contains(&format!("target is {PAIRS_PER_COHORT_TARGET}")),
+            "the refusal must name the ruled target: {err}"
+        );
+        let mut local = cohort_cfg(2, 2);
+        local.local_pair_budget = true;
+        assert!(cohort_identity_run(&local).is_ok());
+    }
+
+    #[test]
+    fn cohort_official_run_requires_the_ruled_pairs_floor_not_just_the_target() {
+        // THE FLOOR IS PART OF THE RULING. An official run at the ruled TARGET but a slack FLOOR
+        // (min 2 / target 4) satisfies the parse-time `min_pairs <= target_pairs` check and passes
+        // the target refusal above, yet would accept a 2-pair cohort and publish a median over half
+        // the ruled support. It must refuse, by name, at the same pre-GPU seam.
+        // Compile-time, so a future ruling that moved the target back to 2 would fail to BUILD
+        // rather than leave this control silently vacuous (a floor of 2 must be genuinely below
+        // the ruled target for the refusal below to be about the floor at all).
+        const { assert!(PAIRS_PER_COHORT_TARGET > 2) };
+        let err = cohort_identity_run(&cohort_cfg(2, PAIRS_PER_COHORT_TARGET))
+            .err()
+            .expect("an official run with a floor below the ruled target must refuse");
+        assert!(err.contains("RULED pairs_per_cohort"), "{err}");
+        assert!(err.contains("min_pairs 2"), "{err}");
+        assert!(
+            err.contains(&format!("floor is {PAIRS_PER_COHORT_TARGET}")),
+            "the refusal must name the ruled floor: {err}"
+        );
+
+        // NON-VACUITY — the SAME run at the ruled floor accepts, so the refusal is about the floor
+        // and not about some unrelated defect in this fixture.
+        assert!(
+            cohort_identity_run(&cohort_cfg(
+                PAIRS_PER_COHORT_TARGET,
+                PAIRS_PER_COHORT_TARGET
+            ))
+            .is_ok(),
+            "min == target == the ruled count must still run"
+        );
+
+        // LOCAL-DEV IS NOT OVER-RESTRICTED — the dev path still explores a floor below its target.
+        let mut local = cohort_cfg(2, PAIRS_PER_COHORT_TARGET);
+        local.local_pair_budget = true;
+        assert!(
+            cohort_identity_run(&local).is_ok(),
+            "--local-dev must keep min < target available"
+        );
     }
 
     #[test]
@@ -13439,7 +13549,7 @@ mod tests {
             members,
             &DirDigest::empty(),
             "deadbeef",
-            &cohort_cfg(2, PAIRS_PER_COHORT_TARGET),
+            &cohort_cfg(PAIRS_PER_COHORT_TARGET, PAIRS_PER_COHORT_TARGET),
             |_p| {
                 let mut inv = ok_cohort_serial()?;
                 inv.cohort_audit = Some(cohort_audit(&vec![2u32; n / 2], n));
@@ -13471,7 +13581,7 @@ mod tests {
             members,
             &DirDigest::empty(),
             "deadbeef",
-            &cohort_cfg(2, PAIRS_PER_COHORT_TARGET),
+            &cohort_cfg(PAIRS_PER_COHORT_TARGET, PAIRS_PER_COHORT_TARGET),
             |_p| ok_cohort_serial(),
             |_p| {
                 let mut inv = inv_cohort_candidate(CANDIDATE_SPT)?;
@@ -13505,7 +13615,7 @@ mod tests {
             members,
             &DirDigest::empty(),
             "deadbeef",
-            &cohort_cfg(2, PAIRS_PER_COHORT_TARGET),
+            &cohort_cfg(PAIRS_PER_COHORT_TARGET, PAIRS_PER_COHORT_TARGET),
             |_p| ok_cohort_serial(),
             |_p| {
                 let mut inv = inv_cohort_candidate(CANDIDATE_SPT)?;
@@ -13582,7 +13692,7 @@ mod tests {
             track_id: "qwen3.8-27b-mtp-v1".to_string(),
             source: "targets[test]".to_string(),
         };
-        let mut cfg = cohort_cfg(2, PAIRS_PER_COHORT_TARGET);
+        let mut cfg = cohort_cfg(PAIRS_PER_COHORT_TARGET, PAIRS_PER_COHORT_TARGET);
         cfg.calibration = Some(resolved.clone());
         let outcome = cohort_identity_run(&cfg).unwrap();
         let band = outcome
@@ -13595,7 +13705,7 @@ mod tests {
         assert!(band.passed && band.window_ok && band.in_band);
 
         // Out of band: the cohort serial mean drifted 3x from the calibrated mean — die-6 verdict.
-        let mut drifted = cohort_cfg(2, PAIRS_PER_COHORT_TARGET);
+        let mut drifted = cohort_cfg(PAIRS_PER_COHORT_TARGET, PAIRS_PER_COHORT_TARGET);
         drifted.calibration = Some(ResolvedCalibration {
             serial_mean: SERIAL_SPT / 3.0,
             ..resolved
@@ -13646,7 +13756,7 @@ mod tests {
             members,
             &DirDigest::empty(),
             "deadbeef",
-            &cohort_cfg(2, PAIRS_PER_COHORT_TARGET),
+            &cohort_cfg(PAIRS_PER_COHORT_TARGET, PAIRS_PER_COHORT_TARGET),
             |_p| ok_cohort_serial(),
             move |_p| {
                 if first {
@@ -13739,7 +13849,7 @@ mod tests {
             members,
             &DirDigest::empty(),
             "deadbeef",
-            &cohort_cfg(2, PAIRS_PER_COHORT_TARGET),
+            &cohort_cfg(PAIRS_PER_COHORT_TARGET, PAIRS_PER_COHORT_TARGET),
             |_p| {
                 let i = serial_calls.get();
                 serial_calls.set(i + 1);
@@ -13768,25 +13878,36 @@ mod tests {
         outcome
     }
 
-    /// TWO pairs with DIFFERENT windows on every component, chosen so that the RATIO OF SUMS is
-    /// numerically DISTINCT from the mean (and the median) of the per-pair ratios — the whole
-    /// point of the fixture, since an implementation that averaged per-pair gains would otherwise
-    /// pass an exact-value test unnoticed.
+    /// One plan entry per RULED accepted pair ([`PAIRS_PER_COHORT_TARGET`], 4 since David's
+    /// 2026-08-26 ruling), each with DIFFERENT windows on every component, chosen so that the
+    /// RATIO OF SUMS is numerically DISTINCT from the mean (and the median) of the per-pair
+    /// ratios — the whole point of the fixture, since an implementation that averaged per-pair
+    /// gains would otherwise pass an exact-value test unnoticed.
     ///
-    /// * prefill per-pair ratios 0.400/0.100 = 4.0 and 0.300/0.200 = 1.5 (mean 2.75), while the
-    ///   ratio of sums is 0.700/0.300 = 2.333…
-    /// * decode per-pair ratios 0.004/0.002 = 2.0 and 0.009/0.003 = 3.0 (mean 2.5), while the
-    ///   ratio of sums is 0.013/0.005 = 2.6 (the `B * N` factor cancels out of the ratio).
-    const UNEVEN_PAIR_PLAN: [PairWindows; 2] =
-        [(0.004, 0.002, 0.400, 0.100), (0.009, 0.003, 0.300, 0.200)];
+    /// * prefill per-pair ratios 4.0, 1.5, 6.0, 0.5 (mean 3.0, even-n median 2.75), while the
+    ///   ratio of sums is 1.500/0.800 = 1.875.
+    /// * decode per-pair ratios 2.0, 3.0, 4.0, 1.0 (mean 2.5, even-n median 2.5), while the
+    ///   ratio of sums is 0.029/0.0135 = 2.148… (the `B * N` factor cancels out of the ratio).
+    ///
+    /// The array LENGTH is tied to the ruled target on purpose: a future pairs ruling that moves
+    /// the constant without re-authoring this fixture fails to COMPILE rather than driving the
+    /// mock plan off its end at runtime.
+    const UNEVEN_PAIR_PLAN: [PairWindows; PAIRS_PER_COHORT_TARGET] = [
+        (0.004, 0.002, 0.400, 0.100),
+        (0.009, 0.003, 0.300, 0.200),
+        (0.010, 0.0025, 0.600, 0.100),
+        (0.006, 0.006, 0.200, 0.400),
+    ];
 
     /// The gains [`UNEVEN_PAIR_PLAN`] must produce, accumulated in the SAME order and association
-    /// the implementation uses (pair 0 then pair 1), so the comparison is exact rather than
+    /// the implementation uses (pair 0 through pair 3), so the comparison is exact rather than
     /// epsilon-dependent on how the literals were folded.
     fn uneven_plan_gains() -> (f64, f64) {
         let bn = (COHORT_B * FREE_RUN_DECODE_TOKENS) as f64;
-        let prefill = (0.400f64 + 0.300f64) / (0.100f64 + 0.200f64);
-        let decode = (0.004f64 * bn + 0.009f64 * bn) / (0.002f64 * bn + 0.003f64 * bn);
+        let prefill = (0.400f64 + 0.300f64 + 0.600f64 + 0.200f64)
+            / (0.100f64 + 0.200f64 + 0.100f64 + 0.400f64);
+        let decode = (0.004f64 * bn + 0.009f64 * bn + 0.010f64 * bn + 0.006f64 * bn)
+            / (0.002f64 * bn + 0.003f64 * bn + 0.0025f64 * bn + 0.006f64 * bn);
         (prefill, decode)
     }
 
@@ -13797,7 +13918,7 @@ mod tests {
         let outcome = cohort_run_with_windows(&UNEVEN_PAIR_PLAN, None, None);
         assert!(outcome.candidate_accepted);
         let c = &outcome.results.per_cohort.as_ref().unwrap()[0];
-        assert_eq!(c.accepted_pair_count, 2);
+        assert_eq!(c.accepted_pair_count, PAIRS_PER_COHORT_TARGET);
         let composite = c
             .composite
             .expect("a conformant cohort must seal a composite");
@@ -13815,16 +13936,16 @@ mod tests {
 
         // NON-VACUITY 1 — ratio-of-SUMS, not mean-of-per-pair-ratios. Both alternatives are
         // computed here and must MISS the sealed value by a wide margin.
-        let mean_of_prefill_ratios = (4.0f64 + 1.5f64) / 2.0;
-        let mean_of_decode_ratios = (2.0f64 + 3.0f64) / 2.0;
+        let mean_of_prefill_ratios = (4.0f64 + 1.5f64 + 6.0f64 + 0.5f64) / 4.0;
+        let mean_of_decode_ratios = (2.0f64 + 3.0f64 + 4.0f64 + 1.0f64) / 4.0;
         assert!(
-            (composite.prefill_gain - mean_of_prefill_ratios).abs() > 0.4,
+            (composite.prefill_gain - mean_of_prefill_ratios).abs() > 1.0,
             "prefill_gain {} must be the ratio of sums ({prefill_gain}), not the mean of per-pair \
              ratios ({mean_of_prefill_ratios})",
             composite.prefill_gain
         );
         assert!(
-            (composite.decode_gain - mean_of_decode_ratios).abs() > 0.09,
+            (composite.decode_gain - mean_of_decode_ratios).abs() > 0.3,
             "decode_gain {} must be the ratio of sums ({decode_gain}), not the mean of per-pair \
              ratios ({mean_of_decode_ratios})",
             composite.decode_gain
@@ -13941,7 +14062,7 @@ mod tests {
             members,
             &DirDigest::empty(),
             "deadbeef",
-            &cohort_cfg(2, PAIRS_PER_COHORT_TARGET),
+            &cohort_cfg(PAIRS_PER_COHORT_TARGET, PAIRS_PER_COHORT_TARGET),
             |_p| ok_cohort_serial(),
             |_p| {
                 Err(RunnerError::Protocol(
@@ -13973,11 +14094,12 @@ mod tests {
         // FAIL-LOUD, defence in depth: a pair ACCEPTS (nothing upstream rejects a zero-length
         // phase window) but its candidate PREFILL window is 0.0 seconds. The composite must refuse
         // by name rather than divide by zero and seal an infinity.
-        let plan = [(0.004, 0.002, 0.400, 0.0), (0.009, 0.003, 0.300, 0.200)];
+        let mut plan = UNEVEN_PAIR_PLAN;
+        plan[0].3 = 0.0;
         let outcome = cohort_run_with_windows(&plan, None, None);
         let c = &outcome.results.per_cohort.as_ref().unwrap()[0];
         assert_eq!(
-            c.accepted_pair_count, 2,
+            c.accepted_pair_count, PAIRS_PER_COHORT_TARGET,
             "the pairs themselves still accept"
         );
         assert!(
@@ -14001,7 +14123,11 @@ mod tests {
         // and the per-cohort MEANS remain what they always were. `serial_prefill_window_seconds_
         // mean` equals the fixture's SERIAL_PREFILL_ELAPSED constant directly (a MEAN over
         // identical per-pair windows), and NOTHING on `PairCohortPhaseWindows` computes a ratio.
-        let outcome = cohort_identity_run(&cohort_cfg(2, PAIRS_PER_COHORT_TARGET)).unwrap();
+        let outcome = cohort_identity_run(&cohort_cfg(
+            PAIRS_PER_COHORT_TARGET,
+            PAIRS_PER_COHORT_TARGET,
+        ))
+        .unwrap();
         assert!(outcome.candidate_accepted);
         let c = &outcome.results.per_cohort.as_ref().unwrap()[0];
 
@@ -14034,7 +14160,11 @@ mod tests {
         // The standard fixture cohort (every pair identical): prefill_gain 0.400/0.100 = 4,
         // decode_gain SERIAL_SPT/CANDIDATE_SPT = 2, so the composite is 4^0.25 * 2^0.75 = 2^1.25 —
         // a closed form that pins the exponent application independently of the uneven fixture.
-        let outcome = cohort_identity_run(&cohort_cfg(2, PAIRS_PER_COHORT_TARGET)).unwrap();
+        let outcome = cohort_identity_run(&cohort_cfg(
+            PAIRS_PER_COHORT_TARGET,
+            PAIRS_PER_COHORT_TARGET,
+        ))
+        .unwrap();
         let c = &outcome.results.per_cohort.as_ref().unwrap()[0];
         let composite = c.composite.expect("a conformant cohort seals a composite");
         assert!(
@@ -14056,7 +14186,11 @@ mod tests {
         // The JSON shape on a scored run: `composite` is PRESENT with both gains and the score,
         // `composite_absent_reason` is OMITTED (skip_serializing_if), `composite_scored_exponents`
         // is PRESENT — the seal is visible in the actual artifact bytes, not just the struct.
-        let outcome = cohort_identity_run(&cohort_cfg(2, PAIRS_PER_COHORT_TARGET)).unwrap();
+        let outcome = cohort_identity_run(&cohort_cfg(
+            PAIRS_PER_COHORT_TARGET,
+            PAIRS_PER_COHORT_TARGET,
+        ))
+        .unwrap();
         let json = outcome.results.to_sealed_json().unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         let cohort = &value["per_cohort"][0];
@@ -14093,7 +14227,7 @@ mod tests {
             members,
             &DirDigest::empty(),
             "deadbeef",
-            &cohort_cfg(2, PAIRS_PER_COHORT_TARGET),
+            &cohort_cfg(PAIRS_PER_COHORT_TARGET, PAIRS_PER_COHORT_TARGET),
             |_p| ok_cohort_serial(),
             |_p| {
                 Err(RunnerError::Protocol(
@@ -14236,7 +14370,7 @@ mod tests {
             members,
             &DirDigest::empty(),
             "deadbeef",
-            &cohort_cfg(2, PAIRS_PER_COHORT_TARGET),
+            &cohort_cfg(PAIRS_PER_COHORT_TARGET, PAIRS_PER_COHORT_TARGET),
             |p: &CohortTimingParams| cohort_engine_leg(&serial_engine, timed_decode_wire_spec(), p),
             |p: &CohortTimingParams| {
                 cohort_engine_leg(&candidate_engine, SpecConfig::mtp(FREE_RUN_DEPTH), p)
@@ -14629,7 +14763,7 @@ mod tests {
         // a `None` here is a wiring defect) is refused at `build_cohort_results`, never silently
         // falling back to the code constants. This is the "absence under the batched regime"
         // refusal, exercised at the seam this crate can drive without main.rs's CLI plumbing.
-        let mut cfg = cohort_cfg(2, PAIRS_PER_COHORT_TARGET);
+        let mut cfg = cohort_cfg(PAIRS_PER_COHORT_TARGET, PAIRS_PER_COHORT_TARGET);
         cfg.scored_exponents = None;
         let goldens = cohort_goldens();
         let members =

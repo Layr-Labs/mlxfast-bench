@@ -1,0 +1,157 @@
+# syntax=docker/dockerfile:1
+#
+# Dockerfile.dist-linux -- the reproducible Linux directories of the dist
+# channel: every binary in DIST_BINARIES (scripts/dist-lib.sh) plus the one
+# manifest that describes them.
+#
+# The channel carried only the Mac binary. The CUDA engine runs on Linux
+# aarch64 (DGX Spark, GB10), so it needs a benchd built for
+# aarch64-unknown-linux-gnu FROM THE SAME source_commit as the Mac binary. No
+# Mac can build that binary, and no box may build its own measurement harness,
+# so the Linux half of the channel is built in this container.
+#
+# The container makes the build independent of the machine that runs it:
+#
+#   * THE COMPILER IS PINNED TWICE. The base image is pinned by exact version
+#     AND by digest, so `rust:1.95.0-bookworm` cannot be re-tagged under the
+#     recipe. The build then asserts that the image compiler is the version the
+#     source pins in rust-toolchain.toml, so a toolchain bump in the source
+#     fails the build loudly instead of producing bytes from a different rustc.
+#   * THE SOURCE IS FETCHED BY SHA AND ASSERTED. Nothing is copied from the
+#     builder's working tree. `source_commit` is fetched from the bench
+#     repository and the checked-out HEAD must equal it, so the manifest claim
+#     "these bytes are mlxfast-bench@<commit>" is true by construction. The
+#     commit must therefore be pushed and reachable before the build.
+#   * THE DEPENDENCIES ARE LOCKED. scripts/build-dist.sh builds with
+#     `--locked`, so a dependency cannot resolve to a different version between
+#     two builds of the same commit. That flag arrived after some commits this
+#     recipe can be asked to build, so the recipe also checks the tree after
+#     the build and fails if Cargo.lock (or anything else) moved.
+#   * NO BUILDER PATH IS IN THE BINARY. scripts/build-dist.sh remaps the
+#     workspace, the cargo home and the toolchain sysroot to /build, /cargo and
+#     /rust, and sets SOURCE_DATE_EPOCH from the commit date. This recipe then
+#     PROVES it: the produced binary is searched for the container's real
+#     paths, and the build fails if any is found.
+#
+# The output is the same set, and the same manifest shape, that the Mac build
+# produces: `benchd`, `record-correctness-golden` and
+# `benchd.manifest.json` ({version, branch, source_commit, target_triple,
+# sha256, bytes, binaries}).
+#
+# Drive it with scripts/build-dist-linux.sh; that wrapper passes the arguments
+# below and writes the pair into dist/linux-aarch64/ or dist/linux-x86_64/.
+#
+# Build arguments:
+#   SOURCE_COMMIT   full 40-character commit sha to build. Required.
+#   DIST_BRANCH     branch name recorded in the manifest (the PROJECT branch,
+#                   for example qwen3.8-125b-a6b-v1). Required.
+#   BENCH_REPO      https clone URL of the bench repository.
+#   TARGET_TRIPLE   rust target. Default: aarch64-unknown-linux-gnu;
+#                   x86_64-unknown-linux-gnu builds the participant x86 pair.
+#
+# Build secret:
+#   gh_token        a GitHub token, needed while the bench repository is
+#                   private. It is used for one fetch on the command line, so
+#                   it is never written to a layer or to the repository config.
+
+ARG RUST_IMAGE=rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
+
+FROM ${RUST_IMAGE} AS build
+
+ARG SOURCE_COMMIT
+ARG DIST_BRANCH
+ARG BENCH_REPO=https://github.com/Layr-Labs/mlxfast-bench.git
+ARG TARGET_TRIPLE=aarch64-unknown-linux-gnu
+
+# rust-toolchain.toml lists components and extra targets for developer
+# machines. RUSTUP_TOOLCHAIN names the toolchain the image already carries, so
+# the build does not download them. The version is still checked against the
+# source below, so this cannot hide a toolchain change.
+ENV RUSTUP_TOOLCHAIN=1.95.0
+
+WORKDIR /src
+
+RUN test -n "${SOURCE_COMMIT}" || { echo "SOURCE_COMMIT is required" >&2; exit 1; }
+RUN test -n "${DIST_BRANCH}" || { echo "DIST_BRANCH is required" >&2; exit 1; }
+
+# -- source, by sha ----------------------------------------------------------
+RUN --mount=type=secret,id=gh_token \
+    git init -q . \
+ && git remote add origin "${BENCH_REPO}" \
+ && if [ -s /run/secrets/gh_token ]; then \
+      auth="$(printf 'x-access-token:%s' "$(cat /run/secrets/gh_token)" | base64 -w0)"; \
+      git -c http.extraheader="Authorization: Basic ${auth}" \
+        fetch --depth=1 origin "${SOURCE_COMMIT}"; \
+    else \
+      git fetch --depth=1 origin "${SOURCE_COMMIT}"; \
+    fi \
+ && git checkout -q FETCH_HEAD \
+ && test "$(git rev-parse HEAD)" = "${SOURCE_COMMIT}" \
+ && ! grep -q "Authorization" .git/config
+
+# -- the compiler the source pins --------------------------------------------
+RUN channel="$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml)" \
+ && rustv="$(rustc --version | awk '{print $2}')" \
+ && if [ "${channel}" != "${rustv}" ]; then \
+      echo "rust-toolchain.toml pins ${channel} but this image carries ${rustv}; update RUST_IMAGE and RUSTUP_TOOLCHAIN together" >&2; \
+      exit 1; \
+    fi
+
+# -- build -------------------------------------------------------------------
+RUN BENCHD_DIST_BRANCH="${DIST_BRANCH}" \
+    BENCHD_DIST_TARGET="${TARGET_TRIPLE}" \
+    BENCHD_DIST_OUT=/out \
+    ./scripts/build-dist.sh
+
+# -- prove the build changed nothing -----------------------------------------
+# The source was clean when the build started (build-dist.sh refuses a dirty
+# tree). If it is dirty now, the build resolved a dependency to a version the
+# commit does not record, and source_commit no longer describes the bytes.
+RUN dirty="$(git status --porcelain -- . ':(exclude)dist')"; \
+    if [ -n "${dirty}" ]; then \
+      echo "the build modified the source tree:" >&2; \
+      printf '%s\n' "${dirty}" >&2; \
+      exit 1; \
+    fi
+
+# -- prove no builder path is in the binary ----------------------------------
+# Two halves, because absence alone can be true for the wrong reason (an empty
+# or truncated binary has no paths either).
+#
+#   NEGATIVE: the container's real directories must not appear. These are the
+#   paths that differ from builder to builder, so any one of them in the bytes
+#   makes the sha256 machine-specific.
+#   POSITIVE: the remap placeholders must appear, which shows the remap ran.
+#   Only /cargo and /rust are checked. The workspace remap has nothing to
+#   remap: cargo records the crates of the workspace relatively
+#   ("crates/bench-core/src/score.rs"), so /build never appears in a correct
+#   build either.
+#
+# EVERY PUBLISHED BINARY IS CHECKED. The roster is read from the manifest the
+# build just wrote, so a binary added to DIST_BINARIES is covered here without
+# a second edit -- an unchecked binary in the channel would carry the builder's
+# username exactly as benchd once did.
+RUN set -eu; \
+    sysroot="$(rustc --print sysroot)"; \
+    names="$(sed -n 's/^[[:space:]]*"\([A-Za-z0-9_-]*\)"[[:space:]]*:[[:space:]]*{"sha256".*$/\1/p' /out/benchd.manifest.json)"; \
+    test -n "${names}" || { echo "the manifest lists no binaries" >&2; exit 1; }; \
+    for bin in ${names}; do \
+      test -f "/out/${bin}" || { echo "the manifest lists ${bin} but /out/${bin} is missing" >&2; exit 1; }; \
+      for needle in /src/crates/ /src/target/ "${CARGO_HOME:-/usr/local/cargo}/registry/" "${sysroot}/lib/"; do \
+        if LC_ALL=C grep -qF -- "${needle}" "/out/${bin}"; then \
+          echo "build path leaked into ${bin}: ${needle}" >&2; \
+          exit 1; \
+        fi; \
+      done; \
+      for placeholder in /cargo/registry/ /rust/; do \
+        LC_ALL=C grep -qF -- "${placeholder}" "/out/${bin}" \
+          || { echo "the path remap did not take effect in ${bin} (no ${placeholder})" >&2; exit 1; }; \
+      done; \
+    done
+
+# The export stage names each file: COPY cannot loop. A binary added to
+# DIST_BINARIES needs one line here as well as the roster entry.
+FROM scratch AS export
+COPY --from=build /out/benchd /benchd
+COPY --from=build /out/record-correctness-golden /record-correctness-golden
+COPY --from=build /out/benchd.manifest.json /benchd.manifest.json

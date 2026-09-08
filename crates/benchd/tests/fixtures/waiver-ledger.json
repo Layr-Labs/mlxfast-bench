@@ -1,0 +1,18 @@
+{
+  "note": "Waiver ledger — David's recorded sign-offs. Every ScoreMetrics field bucketed `Env` in parity.rs ROSTER (waived from the ranking surface) MUST carry a signed row here. No field enters the Env bucket / EXPECT_DIFFER without a `signed_off: true` line in this ledger. Migrated verbatim from the former docs/parity-matrix.md §13 table; parity.rs reads THIS structured file, not the doc.",
+  "scope": "LOCAL modes",
+  "signed_date": "2026-08-17",
+  "rereview": "Re-reviewed when official mode lands (Track B adds fields; nothing inherits the waiver silently).",
+  "unwaived_note": "weights_hash stays UNWAIVED — it closes via the directoryDigest port (P2), not a waiver.",
+  "waivers": [
+    { "field": "runtime", "rationale": "producer label (rust-* vs swift-*)", "signed_off": true, "signed_by": "David", "scope": "LOCAL" },
+    { "field": "commit", "rationale": "producer git commit", "signed_off": true, "signed_by": "David", "scope": "LOCAL" },
+    { "field": "harness_hash", "rationale": "producer harness identity", "signed_off": true, "signed_by": "David", "scope": "LOCAL" },
+    { "field": "process_resident_memory_gb", "rationale": "producer-process RSS", "signed_off": true, "signed_by": "David", "scope": "LOCAL" },
+    { "field": "benchmark_wall_seconds", "rationale": "wall time", "signed_off": true, "signed_by": "David", "scope": "LOCAL" },
+    { "field": "timed_benchmark_seconds", "rationale": "measured section seconds", "signed_off": true, "signed_by": "David", "scope": "LOCAL" },
+    { "field": "preflight_seconds", "rationale": "section seconds", "signed_off": true, "signed_by": "David", "scope": "LOCAL" },
+    { "field": "correctness_seconds", "rationale": "section seconds", "signed_off": true, "signed_by": "David", "scope": "LOCAL" },
+    { "field": "timestamp", "rationale": "ISO-8601 \"now\"", "signed_off": true, "signed_by": "David", "scope": "LOCAL" }
+  ]
+}

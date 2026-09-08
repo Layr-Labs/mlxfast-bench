@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "track_id": "loader-parity-corpus-v1",
+  "target": {
+    "upstream_model_id": "Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP",
+    "upstream_revision": "327c8a604de613b42f84ba5e6b796c0931e8aa3b"
+  }
+}

@@ -1,0 +1,21 @@
+[package]
+name = "bench-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+bench-protocol.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The `asm` feature is what turns ON sha2 0.10's aarch64 backend: without it
+# `sha2/src/sha256.rs` falls through to the portable `soft` compressor on every
+# aarch64 target. With it, the crate uses the ARMv8 SHA-256 instructions when the
+# CPU reports them (runtime `cpufeatures` check, soft fallback otherwise). Both
+# build targets — aarch64-apple-darwin and aarch64-unknown-linux-gnu — are aarch64.
+# The digest is unchanged; only the time to compute it is.
+sha2 = { version = "0.10", features = ["asm"] }
+
+[dev-dependencies]
+proptest = "1"

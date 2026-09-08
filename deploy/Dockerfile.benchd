@@ -1,0 +1,5 @@
+# benchd container image. Sketch — the live flows run benchd natively on the box; this
+# is the containerized-deployment stub that architecture.md §6 describes.
+# distroless arm64; cargo build --locked with a pinned toolchain (aarch64).
+# benchd image contains CODE ONLY — goldens are runtime read-only mounts, never layers.
+# TODO(phase-5): multi-stage build; sign + publish by digest.

@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+#
+# pre-commit -- refuse a dist publish whose binaries the current source does not
+# produce.
+#
+# Consumers never build benchd. They resolve a {branch, commit, sha256, bytes}
+# pin and download the bytes in dist/benchd. The pin is a claim that those
+# bytes are this source, built for this triple. A stale or hand-placed binary
+# makes the claim false, and nothing downstream can detect it. This hook
+# rebuilds from the working tree and byte-compares before the commit exists.
+#
+# EVERY BINARY THE CHANNEL PUBLISHES is checked, not only benchd: the roster
+# is scripts/dist-lib.sh's DIST_BINARIES, and a stale `record-correctness-golden`
+# would author goldens from source no manifest names.
+#
+# The Linux directories of the channel (dist/linux-aarch64/, dist/linux-x86_64/) are built in a container
+# from a PUSHED commit, not from the working tree, so this hook cannot rebuild
+# it. It checks the weaker thing it can check: the staged binaries and the
+# staged manifest must describe each other. That catches the hand-placed or
+# half-updated set, which is what the engine's fetch script would otherwise
+# refuse on the box. deploy/Dockerfile.dist-linux is what proves those bytes are
+# the named commit; anyone can re-run it.
+#
+# Only dist publishes pay the build cost. Commits that leave dist/ alone exit
+# immediately.
+#
+# Enable once per clone:
+#
+#     git config core.hooksPath .githooks
+#
+# Bypass for a deliberate non-publish edit: git commit --no-verify
+set -euo pipefail
+
+staged="$(git diff --cached --name-only)"
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+# shellcheck source=scripts/dist-lib.sh
+. "${REPO_ROOT}/scripts/dist-lib.sh"
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "${TMP_DIR}"' EXIT
+
+# The staged path of every published binary, as one alternation, so the hook
+# fires on a publish of any of them.
+roster_re="$(IFS='|'; printf '%s' "${DIST_BINARIES[*]}")"
+
+# -- the Linux sets: staged binaries and staged manifest must agree ----------
+# One directory per Linux target; the directory name fixes the triple it may
+# carry, so a pair built for the other machine cannot be published under it.
+check_linux_set() {
+  local subdir="$1" want_triple="$2" dir manifest name
+  grep -qE "^dist/${subdir}/(${roster_re}|benchd\.manifest\.json)$" <<< "${staged}" || return 0
+  dir="${TMP_DIR}/${subdir}"
+  mkdir -p "${dir}"
+  manifest="${dir}/benchd.manifest.json"
+  git show ":dist/${subdir}/benchd.manifest.json" > "${manifest}" 2>/dev/null \
+    || { echo "pre-commit: dist publish refused -- dist/${subdir}/benchd.manifest.json is not in the index." >&2; exit 1; }
+  for name in "${DIST_BINARIES[@]}"; do
+    git show ":dist/${subdir}/${name}" > "${dir}/${name}" 2>/dev/null \
+      || { echo "pre-commit: dist publish refused -- dist/${subdir}/${name} is not in the index; the channel publishes ${DIST_BINARIES[*]}." >&2; exit 1; }
+  done
+
+  if ! dist_manifest_verify "${manifest}" "${dir}"; then
+    echo "pre-commit: dist publish refused -- dist/${subdir}/benchd.manifest.json does not describe the staged binaries (see the mismatch above)." >&2
+    exit 1
+  fi
+  if [[ "$(dist_manifest_field "${manifest}" target_triple)" != "${want_triple}" ]]; then
+    echo "pre-commit: dist publish refused -- dist/${subdir}/ must carry a ${want_triple} build." >&2
+    exit 1
+  fi
+}
+check_linux_set linux-aarch64 aarch64-unknown-linux-gnu
+check_linux_set linux-x86_64 x86_64-unknown-linux-gnu
+
+# -- the Mac set: the staged binaries must be what this source builds --------
+if ! grep -qE "^dist/(${roster_re}|benchd\.manifest\.json)$" <<< "${staged}"; then
+  exit 0
+fi
+
+# Build to a scratch directory. dist/ holds the staged bytes under test, so the
+# default output path would overwrite the very thing being verified.
+BUILD_LOG="${TMP_DIR}/build.log"
+if ! BENCHD_DIST_OUT="${TMP_DIR}/build" "${REPO_ROOT}/scripts/build-dist.sh" \
+      > "${BUILD_LOG}" 2>&1; then
+  cat "${BUILD_LOG}" >&2
+  echo "pre-commit: dist publish refused -- scripts/build-dist.sh failed (output above)." >&2
+  exit 1
+fi
+
+# Compare against the INDEX, not the worktree: the staged bytes are what the
+# commit would carry.
+for name in "${DIST_BINARIES[@]}"; do
+  STAGED_BIN="${TMP_DIR}/staged-${name}"
+  if ! git show ":dist/${name}" > "${STAGED_BIN}" 2>/dev/null; then
+    echo "pre-commit: dist publish refused -- dist/${name} is not in the index; the channel publishes ${DIST_BINARIES[*]}." >&2
+    exit 1
+  fi
+  if ! cmp -s "${TMP_DIR}/build/${name}" "${STAGED_BIN}"; then
+    echo "pre-commit: dist publish refused -- staged dist/${name} is not what this source builds; re-run scripts/build-dist.sh and stage its output." >&2
+    exit 1
+  fi
+done

@@ -1,0 +1,59 @@
+{
+  "_comment": [
+    "#127 (RULED David 2026-08-20, 'MIRROR REFERENCE') — the LOCAL-ITERATE scoring denominator,",
+    "captured from the reference source rather than restated in a Rust literal.",
+    "",
+    "The ruling makes the local legs score against these values, so a stale copy in bench-core is a",
+    "live scoring defect. It was stale: bench-core carried the RETIRED mlxfast-challenge-dev fork's",
+    "Gemma-era pair (recorded below as `retired_fork`) under a doc comment naming",
+    "MLXFastConstants.officialBaseline* — 28.9x / 9.64x off the reference's. The same two numbers",
+    "were ALSO what the window-4 golden declared, which is how the split reached ~12x on score off",
+    "a ~5% timing split (docs/iterate-128-window-reverify.md).",
+    "",
+    "Re-capture with:",
+    "  git -C <reference> show b26f76f:Sources/MLXFastCore/Constants.swift | sed -n '255,256p'"
+  ],
+  "source_file": "Sources/MLXFastCore/Constants.swift",
+  "source_lines": "255-256",
+  "source_commit": "b26f76f1cd874082318601aa38474a9b7c3036e2",
+  "captured": "2026-08-20",
+  "reference": {
+    "officialBaselinePrefillSecondsPerToken": 0.00036751938916015626,
+    "officialBaselineDecodeSecondsPerToken": 0.01385621216015625
+  },
+  "retired_fork": {
+    "_source": "mlxfast-challenge-dev/Sources/MLXFastCore/Constants.swift:124-125 @ 242b19d",
+    "officialBaselinePrefillSecondsPerToken": 0.010605031949609375,
+    "officialBaselineDecodeSecondsPerToken": 0.1336139485703125
+  },
+  "mlx": {
+    "source_file": "correctness_prompts/qwen3.8-125b-a6b-mlx-v1/botany.golden.json",
+    "source_lines": "benchmark.baseline_{prefill,decode}_seconds_per_token",
+    "source_commit": "d42b70f0165c4372954ffa99414d61e553ac9c0a12a6283d016cd51283306379",
+    "captured": "2026-09-06",
+    "reference": {
+      "officialBaselinePrefillSecondsPerToken": 0.0006282488193359375,
+      "officialBaselineDecodeSecondsPerToken": 0.0329116748046875,
+      "prefillBandUpTolerance": 0.05,
+      "prefillBandDownTolerance": 0.05,
+      "decodeBandUpTolerance": 0.02,
+      "decodeBandDownTolerance": 0.05,
+      "decodeBandDownEnabled": false
+    }
+  },
+  "cuda": {
+    "source_file": "correctness_prompts/qwen3.8-125b-a6b-cuda-v1/botany.golden.json",
+    "source_lines": "QWEN38-125B-A6B-CUDA-PENDING-ORGANIZER",
+    "source_commit": "QWEN38-125B-A6B-CUDA-PENDING-ORGANIZER",
+    "captured": "QWEN38-125B-A6B-CUDA-PENDING-ORGANIZER",
+    "reference": {
+      "officialBaselinePrefillSecondsPerToken": "QWEN38-125B-A6B-CUDA-PENDING-ORGANIZER",
+      "officialBaselineDecodeSecondsPerToken": "QWEN38-125B-A6B-CUDA-PENDING-ORGANIZER",
+      "prefillBandUpTolerance": "QWEN38-125B-A6B-CUDA-PENDING-ORGANIZER",
+      "prefillBandDownTolerance": "QWEN38-125B-A6B-CUDA-PENDING-ORGANIZER",
+      "decodeBandUpTolerance": "QWEN38-125B-A6B-CUDA-PENDING-ORGANIZER",
+      "decodeBandDownTolerance": "QWEN38-125B-A6B-CUDA-PENDING-ORGANIZER",
+      "decodeBandDownEnabled": "QWEN38-125B-A6B-CUDA-PENDING-ORGANIZER"
+    }
+  }
+}

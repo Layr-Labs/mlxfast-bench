@@ -1,0 +1,11 @@
+{
+  "passed": true,
+  "score": 1.723,
+  "metrics": {
+    "prefill_seconds_per_token": 0.001300,
+    "decode_seconds_per_token": 0.006000,
+    "prefill_speedup": 1.4,
+    "decode_speedup": 1.9,
+    "runtime": "rust-local-iterate"
+  }
+}

@@ -159,30 +159,49 @@ absent or does not match this track and this box. The `--baseline-workspace`,
 `--baseline-calibration` and `--box` flags name the same values on the command
 line.
 
-## 7. The per-leg resident engine (CUDA)
+## 7. The per-leg resident engine (both platforms)
 
-On MLX the worker holds the model, so benchd's own worker spawn IS the
-residency, and nothing else runs.
+On EITHER platform the model is owned by a RESIDENT process, and that process
+belongs to ONE leg's tree:
 
-On CUDA the worker is an adapter over a resident engine, and each leg needs its
-own resident from its own tree. benchd boots and tears one down per leg through
-a fixed convention. Both commands run with the working directory set to that
-leg's workspace:
+* CUDA: the worker is a thin adapter over a resident `ds4-resident`.
+* MLX: the worker attaches to a resident `bench-worker` that holds the whole
+  checkpoint, because an in-process load per phase is unaffordable.
+
+So each leg needs its own resident from its own tree. benchd boots and tears one
+down per leg through a fixed convention. The argv contract is IDENTICAL on both
+platforms; only the script name differs. Both commands run with the working
+directory set to that leg's workspace:
 
 ```
-<workspace>/tools/serve-up.sh --boot --spec <serial|mtp> --draft-len <N> --socket-out <FILE>
-<workspace>/tools/serve-up.sh --stop --socket <PATH>
+<workspace>/<script> --boot --spec <serial|mtp> --draft-len <N> --socket-out <FILE>
+<workspace>/<script> --stop --socket <PATH>
 ```
+
+| platform | script | socket injected as |
+|---|---|---|
+| MLX | `tools/resident-up.sh` | `BENCH_WORKER_RESIDENT_SOCKET` |
+| CUDA | `tools/serve-up.sh` | `DS4_RESIDENT_SOCKET` and `BENCH_WORKER_RESIDENT_SOCKET` |
 
 `--boot` boots exactly one resident, waits until it answers a healthy hello,
 writes the resident's Unix-socket path as the first line of `<FILE>`, and exits
-0 with the resident still running. `--stop` tears it down. Leg 1 is always
-booted `--spec serial --draft-len 0`, whatever the submission declares.
+0 with the resident still running. `--stop` tears it down and is idempotent: a
+resident that is already gone is not an error. Leg 1 is always booted
+`--spec serial --draft-len 0`, whatever the submission declares. benchd runs
+`--stop` when the leg ends, on success and on failure alike, so the two legs
+never hold GPU memory at the same time.
 
-Do NOT wrap benchd in `tools/serve-up.sh`. benchd runs it itself, twice. A
-resident socket inherited from benchd's own environment is refused by name
-(`LEG-SERVE-INHERITED-SOCKET`): one resident for both legs would price the
-candidate against itself.
+Do NOT wrap benchd in the resident wrapper on the paired path. benchd runs it
+itself, twice. A resident socket inherited from benchd's own environment is
+refused by name (`LEG-SERVE-INHERITED-SOCKET`): one resident for both legs
+prices the candidate against itself on CUDA, and on MLX it does not even reach a
+number — the reference leg's worker refuses, because the resident holds the
+candidate tree's weights and the leg asked for the reference tree's.
+
+The refusal is scoped to the PAIRED path. The single-resident shapes are
+untouched: a LOCAL UNSCORED run has one tree and one leg, so a measure script
+that wraps benchd in `tools/resident-up.sh` for it is exactly right, and the
+inherited socket is used as before.
 
 ## 8. Refusals, by name
 

@@ -4105,43 +4105,45 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
         let commit_env = std::env::var("MLXFAST_COMMIT_SHA").ok();
         let commit = official::commit_identifier(commit_env.as_deref());
 
-        // PER-LEG RESIDENT ENGINES. On a platform whose worker HOLDS the model (MLX) benchd's own
-        // worker spawn is the residency and nothing boots here. On a platform whose worker is an
-        // ADAPTER over a resident engine (CUDA/ds4) benchd boots that leg's resident from that
-        // leg's OWN tree, one at a time, through the fixed `tools/serve-up.sh --boot/--stop`
-        // convention (`legserve.rs`). The socket each boot reports is put into THAT leg's worker
-        // spawns only; benchd's own environment is never mutated, so the two legs cannot bleed
+        // PER-LEG RESIDENT ENGINES, on BOTH platforms. The model is owned by a RESIDENT process
+        // on either engine — a `ds4-resident` on CUDA, a `bench-worker resident` holding the whole
+        // checkpoint on MLX — and that process belongs to ONE leg's tree. So benchd boots that
+        // leg's resident from that leg's OWN tree, one at a time, through the fixed
+        // `--boot`/`--stop` convention (`legserve.rs`), and puts the socket into THAT leg's worker
+        // spawns only. benchd's own environment is never mutated, so the two legs cannot bleed
         // into each other.
-        let leg_serve = legserve::leg_serve_required(platform);
-        if leg_serve {
-            legserve::refuse_inherited_socket(
-                std::env::var(legserve::DS4_RESIDENT_SOCKET_ENV)
-                    .ok()
-                    .as_deref(),
-                std::env::var(legserve::BENCH_WORKER_RESIDENT_SOCKET_ENV)
-                    .ok()
-                    .as_deref(),
-            )?;
-        }
+        //
+        // An INHERITED socket is refused here: the measure scripts used to wrap the whole benchd
+        // invocation in their own resident wrapper, which boots ONE resident for the window. On
+        // MLX that reached the worker as a refusal — the resident held the candidate tree's
+        // weights and the reference leg asked for the reference tree's (ranked run 34230122059).
+        legserve::refuse_inherited_socket(
+            platform,
+            std::env::var(legserve::DS4_RESIDENT_SOCKET_ENV)
+                .ok()
+                .as_deref(),
+            std::env::var(legserve::BENCH_WORKER_RESIDENT_SOCKET_ENV)
+                .ok()
+                .as_deref(),
+        )?;
         let leg_env: std::cell::RefCell<Vec<(String, String)>> =
             std::cell::RefCell::new(Vec::new());
         let candidate_spec = args.spec.clone();
-        let open_baseline_leg = || -> Result<Option<legserve::LegServe>, String> {
-            if !leg_serve {
-                return Ok(None);
-            }
+        let open_baseline_leg = || -> Result<legserve::LegServe, String> {
             // ALWAYS SERIAL, whatever the submission declares: this is the control.
-            let serve = legserve::boot_leg(&workspace, None, "serial-control")?;
+            let serve = legserve::boot_leg(&workspace, None, "serial-control", platform)?;
             *leg_env.borrow_mut() = serve.spawn_env();
-            Ok(Some(serve))
+            Ok(serve)
         };
-        let open_candidate_leg = || -> Result<Option<legserve::LegServe>, String> {
-            if !leg_serve {
-                return Ok(None);
-            }
-            let serve = legserve::boot_leg(&workspace_root, candidate_spec.as_ref(), "candidate")?;
+        let open_candidate_leg = || -> Result<legserve::LegServe, String> {
+            let serve = legserve::boot_leg(
+                &workspace_root,
+                candidate_spec.as_ref(),
+                "candidate",
+                platform,
+            )?;
             *leg_env.borrow_mut() = serve.spawn_env();
-            Ok(Some(serve))
+            Ok(serve)
         };
 
         eprintln!(
@@ -4249,9 +4251,9 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                 // symmetric, decode +2% up with the down band disabled. What changed is the
                 // reference the shape is applied to — a live measurement instead of a stored pair.
                 bands: bench_core::constants::MTP_SINGLE_LEG_BANDS,
-                // A per-leg resident engine accepts ONE connection, so a leg that boots its own
-                // drives every phase over ONE attached worker — the same load-once window MLX runs.
-                residency: worker_residency(platform, leg_serve || ds4_resident_socket_present()),
+                // A per-leg resident engine accepts ONE connection, so every phase of a leg runs
+                // over ONE attached worker: the load-once window, on both platforms.
+                residency: worker_residency(platform, true),
                 spec: args.spec.clone(),
                 platform,
                 cool_gate: official_cool_gate,

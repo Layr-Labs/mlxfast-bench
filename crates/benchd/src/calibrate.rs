@@ -340,23 +340,21 @@ fn execute(args: &[String]) -> Result<Option<()>, String> {
         None
     };
     // The calibration passes run the RANKED leg-1 shape exactly, including its per-leg engine
-    // lifecycle: on a platform whose worker is an adapter over a resident engine, each pass boots
-    // the reference tree's own resident and tears it down again.
-    let leg_serve = crate::legserve::leg_serve_required(platform);
-    if leg_serve {
-        crate::legserve::refuse_inherited_socket(
-            std::env::var(crate::legserve::DS4_RESIDENT_SOCKET_ENV)
-                .ok()
-                .as_deref(),
-            std::env::var(crate::legserve::BENCH_WORKER_RESIDENT_SOCKET_ENV)
-                .ok()
-                .as_deref(),
-        )?;
-    }
-    let residency = crate::worker_residency(
+    // lifecycle: each pass boots the reference tree's OWN resident and tears it down again, on
+    // both platforms. An inherited socket is refused for the same reason the ranked path refuses
+    // it — a calibration measured against another tree's resident describes another tree.
+    crate::legserve::refuse_inherited_socket(
         platform,
-        leg_serve || std::env::var_os(crate::legserve::DS4_RESIDENT_SOCKET_ENV).is_some(),
-    );
+        std::env::var(crate::legserve::DS4_RESIDENT_SOCKET_ENV)
+            .ok()
+            .as_deref(),
+        std::env::var(crate::legserve::BENCH_WORKER_RESIDENT_SOCKET_ENV)
+            .ok()
+            .as_deref(),
+    )?;
+    // A per-leg resident accepts ONE connection, so every phase of a pass runs over ONE attached
+    // worker.
+    let residency = crate::worker_residency(platform, true);
 
     let cool_gate_on = args.cool_gate;
     let mut cool_gate = move |phase: &str| -> Result<(), RunnerError> {
@@ -370,16 +368,9 @@ fn execute(args: &[String]) -> Result<Option<()>, String> {
     let mut decode_legs: Vec<f64> = Vec::with_capacity(args.passes as usize);
     for pass in 1..=args.passes {
         // ALWAYS SERIAL: a control leg is the serial denominator, so the resident boots serial.
-        let serve = if leg_serve {
-            Some(crate::legserve::boot_leg(
-                &args.baseline_workspace,
-                None,
-                "serial-control",
-            )?)
-        } else {
-            None
-        };
-        let leg_env = serve.as_ref().map(|s| s.spawn_env()).unwrap_or_default();
+        let serve =
+            crate::legserve::boot_leg(&args.baseline_workspace, None, "serial-control", platform)?;
+        let leg_env = serve.spawn_env();
         let spawn = || -> bench_runner::Result<Session<ChildStdioTransport>> {
             let transport = crate::spawn_official_worker(
                 sandbox.as_ref(),

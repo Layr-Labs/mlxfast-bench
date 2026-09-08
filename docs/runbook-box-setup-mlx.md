@@ -105,11 +105,22 @@ hidden correctness golden is not part of the ranked job.
 
 ## 7. The measurement topology
 
-The engine's `bench-worker` runs as one resident per window, started by
-`tools/resident-up.sh`; every phase attaches to it, so the model loads once
-per window. The measure script starts the resident itself and holds the GPU
-lock for the whole window. Three concurrent fresh workers would need about
-190 GiB, which is what the resident prevents.
+The engine's `bench-worker` runs as a resident that every phase attaches to, so
+the model loads once. Three concurrent fresh workers would need about 190 GiB,
+which is what the resident prevents. WHO starts it depends on the path:
+
+- **A PAIRED run** measures two legs from two trees, so benchd boots ONE
+  resident PER LEG from that leg's own tree — `<workspace>/tools/resident-up.sh
+  --boot …` before the leg, `--stop …` after it — and injects that leg's socket
+  into that leg's worker spawns only. The measure script must NOT wrap benchd on
+  this path: a single resident serves the candidate tree's weights, and the
+  reference leg's worker refuses them by name. An inherited
+  `BENCH_WORKER_RESIDENT_SOCKET` is refused (`LEG-SERVE-INHERITED-SOCKET`).
+- **A single-leg run** (a LOCAL UNSCORED run) has one tree and one leg, so the
+  measure script's own `tools/resident-up.sh` wrap is exactly right and is
+  untouched.
+
+The GPU lock is held by the outermost process for the whole window either way.
 
 ## 8. Local checks
 

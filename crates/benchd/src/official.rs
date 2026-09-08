@@ -32,7 +32,7 @@
 //! unit-tested against a stub `MockEngine` (no real engine, no GPU).
 
 use bench_core::conformance::{run_conformance, ConformanceReport, CorrectnessScope};
-use bench_core::constants::AcceptanceBands;
+use bench_core::constants::{AcceptanceBands, Platform};
 use bench_core::golden::GoldenFixture;
 use bench_core::score::evaluate_timed_run;
 use bench_protocol::SpecConfig;
@@ -377,6 +377,7 @@ where
         // Test-only wrapper: the historical no-spec request, byte-for-byte.
         None,
         // Test-only wrapper: no cool gate. The ranked entry point (main.rs) passes the real one.
+        Platform::Mlx,
         |_phase: &str| Ok(()),
     )
 }
@@ -399,12 +400,14 @@ where
 /// (timed-first → floors/bands → full correctness) is shared, in [`finish_official`], regardless of
 /// residency.
 /// The TIMED leg's parameters: the golden's benchmark oracle, the resolved spec, and
-/// [`bench_core::constants::OFFICIAL_PREFILL_WARMUP_RUNS`] unmeasured prefill passes in the timed
-/// session ahead of the one timed prefill (the timed session is a fresh attach, and its first
-/// prefill is not a steady reading — see the constant).
+/// the platform's [`Platform::official_prefill_warmup_runs`] unmeasured prefill passes in the
+/// timed session ahead of the one timed prefill (on MLX the timed session is a fresh attach, and
+/// its first prefill is not a steady reading; on CUDA the resident engine is already warm and the
+/// adapter refuses a second opener — see the constants).
 pub fn official_timed_params(
     benchmark: &bench_core::golden::BenchmarkGolden,
     spec: Option<SpecConfig>,
+    platform: Platform,
 ) -> TimingParams {
     TimingParams::new(
         benchmark.prefill_prompt_tokens.clone(),
@@ -415,7 +418,7 @@ pub fn official_timed_params(
         Mode::Official.decode_steps(),
     )
     .with_spec(spec)
-    .with_prefill_warmup_runs(bench_core::constants::OFFICIAL_PREFILL_WARMUP_RUNS)
+    .with_prefill_warmup_runs(platform.official_prefill_warmup_runs())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -430,6 +433,7 @@ pub fn official_core_windowed<T, FT, FC, G>(
     spawn_correctness: FC,
     residency: WorkerResidency,
     spec: Option<SpecConfig>,
+    platform: Platform,
     mut cool_gate: G,
 ) -> ScorePayload
 where
@@ -464,7 +468,7 @@ where
     // being scored against the MTP oracle. The resolved spec now rides the timed window, and the
     // engine's `effective_spec` echo must equal it or the leg is discarded (spec-never-ignored,
     // enforced in `bench_runner`). `None` is byte-for-byte the historical bare request.
-    let params = official_timed_params(benchmark, spec.clone());
+    let params = official_timed_params(benchmark, spec.clone(), platform);
 
     // MEASUREMENT-INTEGRITY WARMUP (coordinator ruling 2026-08-31) — ONE unmeasured, DISCARDED
     // warmup leg runs BEFORE the timed legs so the official path is a fair WARM-vs-WARM comparison
@@ -2391,10 +2395,16 @@ mod tests {
         // David 2026-09-07: the timed session's first prefill is not a steady reading, so the
         // official timed leg runs ONE unmeasured prefill in that session before the timed one.
         let golden = official_golden(None);
-        let params = official_timed_params(golden.benchmark.as_ref().unwrap(), None);
+        let params = official_timed_params(golden.benchmark.as_ref().unwrap(), None, Platform::Mlx);
         assert_eq!(params.prefill_warmup_runs, 1);
         assert_eq!(params.prefill_timed_runs, 1);
-        assert_eq!(bench_core::constants::OFFICIAL_PREFILL_WARMUP_RUNS, 1);
+        assert_eq!(bench_core::constants::OFFICIAL_PREFILL_WARMUP_RUNS_MLX, 1);
+        // CUDA: the resident engine is warm and the ds4 adapter refuses a second `prefill` opener
+        // without a `phase_diagnostics` barrier, so the timed session runs no warm-up pass there.
+        let cuda = official_timed_params(golden.benchmark.as_ref().unwrap(), None, Platform::Cuda);
+        assert_eq!(cuda.prefill_warmup_runs, 0);
+        assert_eq!(cuda.prefill_timed_runs, 1);
+        assert_eq!(bench_core::constants::OFFICIAL_PREFILL_WARMUP_RUNS_CUDA, 0);
         // The local modes are untouched: their default is still the reference's zero.
         let local = TimingParams::new(vec![1], 1, vec![1], 1, vec![1, 2], 1);
         assert_eq!(local.prefill_warmup_runs, bench_core::constants::BENCHMARK_PREFILL_WARMUP_RUNS);
@@ -2419,6 +2429,7 @@ mod tests {
             || Session::connect(conformant_engine()).map(|(s, _)| s),
             WorkerResidency::PersistentWindow,
             None,
+            Platform::Mlx,
             |phase: &str| {
                 phases.borrow_mut().push(phase.to_string());
                 Ok(())
@@ -2436,6 +2447,7 @@ mod tests {
             || Session::connect(conformant_engine()).map(|(s, _)| s),
             WorkerResidency::PersistentWindow,
             None,
+            Platform::Mlx,
             |phase: &str| {
                 Err(bench_runner::RunnerError::GateRejected {
                     phase: phase.to_string(),
@@ -2474,6 +2486,7 @@ mod tests {
             },
             WorkerResidency::PersistentWindow,
             None,
+            Platform::Mlx,
             |_phase: &str| Ok(()),
         );
         assert!(!payload.passed);
@@ -2519,6 +2532,7 @@ mod tests {
             || Session::connect(conformant_engine()).map(|(s, _)| s),
             WorkerResidency::FreshPerPhase,
             None,
+            Platform::Mlx,
             |_phase: &str| Ok(()),
         );
         assert!(!payload.passed);
@@ -2557,6 +2571,7 @@ mod tests {
             || Session::connect(conformant_engine()).map(|(s, _)| s),
             WorkerResidency::FreshPerPhase,
             None,
+            Platform::Mlx,
             |_phase: &str| Ok(()),
         );
         assert!(!payload.passed);
@@ -2594,6 +2609,7 @@ mod tests {
             || Session::connect(conformant_engine()).map(|(s, _)| s),
             WorkerResidency::PersistentWindow,
             None,
+            Platform::Mlx,
             |_phase: &str| Ok(()),
         );
         assert!(!payload.passed);
@@ -3127,6 +3143,7 @@ mod tests {
             || Session::connect(conformant_engine()).map(|(s, _)| s),
             WorkerResidency::FreshPerPhase,
             Some(spec),
+            Platform::Mlx,
             |_phase: &str| Ok(()),
         )
     }
@@ -3269,6 +3286,7 @@ mod tests {
             || Session::connect(conformant_engine()).map(|(s, _)| s),
             WorkerResidency::FreshPerPhase,
             Some(SpecConfig::mtp(2)),
+            Platform::Mlx,
             |_phase: &str| Ok(()),
         );
         assert!(!payload.passed);
@@ -3340,6 +3358,7 @@ mod tests {
             || Session::connect(conformant_engine()).map(|(s, _)| s),
             WorkerResidency::FreshPerPhase,
             Some(SpecConfig::mtp(1)),
+            Platform::Mlx,
             |_phase: &str| Ok(()),
         );
         assert_eq!(payload.metrics.spec_verification_mode.as_deref(), Some("rectangular"));

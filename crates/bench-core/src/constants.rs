@@ -323,6 +323,15 @@ impl Platform {
         }
     }
 
+    /// Unmeasured prefill passes the OFFICIAL timed session runs before its one timed prefill.
+    /// Each platform's count matches the way its official baseline pair was captured.
+    pub fn official_prefill_warmup_runs(self) -> usize {
+        match self {
+            Platform::Mlx => OFFICIAL_PREFILL_WARMUP_RUNS_MLX,
+            Platform::Cuda => OFFICIAL_PREFILL_WARMUP_RUNS_CUDA,
+        }
+    }
+
     /// The platform's pending sentinel (see [`OFFICIAL_BASELINE_PENDING_MLX`]).
     pub fn official_baseline_pending(self) -> &'static str {
         match self {
@@ -994,7 +1003,13 @@ pub const BENCHMARK_PREFILL_WARMUP_RUNS: usize = 0;
 /// random even after the process was warm. ONE unmeasured pass in the timed session, then the
 /// timed one, mirrors what every serving engine does before it measures. Fixed count, no
 /// settling loop; the local modes keep [`BENCHMARK_PREFILL_WARMUP_RUNS`].
-pub const OFFICIAL_PREFILL_WARMUP_RUNS: usize = 1;
+pub const OFFICIAL_PREFILL_WARMUP_RUNS_MLX: usize = 1;
+/// The CUDA counterpart of [`OFFICIAL_PREFILL_WARMUP_RUNS_MLX`]: ZERO. The CUDA track runs against a
+/// resident engine that serve-up boots and health-checks before the window, so its first prefill
+/// is already a steady reading, and its official baseline pair was captured with no warm-up pass.
+/// The ds4 adapter also fails closed on a second `prefill` opener without a `phase_diagnostics`
+/// barrier between them, so a warm-up pass there is a protocol error, not a warmer number.
+pub const OFFICIAL_PREFILL_WARMUP_RUNS_CUDA: usize = 0;
 /// `MLXFastConstants.benchmarkPrefillTimedRuns` — one measured prefill run.
 pub const BENCHMARK_PREFILL_TIMED_RUNS: usize = 1;
 

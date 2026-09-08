@@ -4061,6 +4061,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                     spawn_correctness,
                     residency,
                     args.spec.clone(),
+                    platform,
                     official_cool_gate,
                 );
                 if let Some(hello) = timed_hello.borrow().as_ref() {

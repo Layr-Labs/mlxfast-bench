@@ -192,6 +192,21 @@ OPTIONS:
                                  score=null, baseline_source=\"none (local mode: unscored)\").
     --box <RUNNER>               PAIRED PATH. The runner name this box answers to, for the
                                  calibration file's `box` check. RUNNER_NAME wins when set.
+    --control-golden <PATH>      PAIRED PATH. The golden the SERIAL-CONTROL leg (leg 1) verifies
+                                 its decode tokens against. ABSENT means leg 1 uses --golden, which
+                                 is only correct when the timed oracle at the declared draft depth
+                                 is byte-identical to the serial tape. A track that carries
+                                 PER-DEPTH oracle tapes must pass its serial live golden here: leg
+                                 1 is serial by construction, so a per-depth tape refuses it at the
+                                 first step the two tapes disagree on. It must name the SAME prompt
+                                 as --golden, and it is refused by name on a run that measures no
+                                 control leg.
+    --control-golden-sha256 <HEX>
+                                 Integrity pin for --control-golden: refuse it unless its sha256
+                                 matches.
+    --control-golden-bytes <N>   Integrity pin for --control-golden: refuse it unless its byte
+                                 count matches (both pin flags must be given together; checked
+                                 before parse).
     --mode <local-iterate|local-submit|official>
                                  Decode window: 128 (local-iterate, default), 1023 (local-submit), 128 (official)
     --score-path <OUT>           Output score path (default: score.local-iterate.json for
@@ -3348,6 +3363,17 @@ struct IterateArgs {
     /// job's own `RUNNER_NAME` wins when it is set (Actions sets it); this flag is how an operator
     /// names the box off Actions. A run that can name neither refuses by name.
     box_name: Option<String>,
+    /// `--control-golden <PATH>` — the golden the SERIAL-CONTROL leg (leg 1) verifies its decode
+    /// tokens against. `None` means leg 1 verifies against `--golden`, which is correct ONLY when
+    /// the timed oracle at the declared draft depth is byte-identical to the serial tape. A track
+    /// that ships PER-DEPTH oracle tapes passes its serial live golden here: leg 1 is serial by
+    /// construction, and on the MLX engine the per-depth tape diverges from the serial one at step
+    /// 1, so a shared golden kills leg 1. Paired path only — refused BY NAME on a run that
+    /// measures no control leg, never silently ignored.
+    control_golden: Option<PathBuf>,
+    /// The `--control-golden-sha256` / `--control-golden-bytes` integrity pin, checked on the raw
+    /// bytes before the parse exactly as `golden_pin` is.
+    control_golden_pin: Option<GoldenIntegrityPin>,
     /// `--engine-resource NAME=PATH` (repeatable) — the out-of-checkpoint inputs the runner needs
     /// to LOAD the model (Darkbloom runner contract §8.1/§13b). Each becomes `--resource NAME=PATH`
     /// on EVERY engine spawn this run makes. THE VALUE COMES FROM THIS COMMAND LINE, as the engine
@@ -3929,6 +3955,22 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
     let paired_inputs_present = paired_inputs_present(args);
     let paired_track =
         live_control_leg_track && (args.mode == Mode::Official || paired_inputs_present);
+    // `--control-golden` is LEG 1's golden, so it has meaning only on a run that measures leg 1.
+    // A run that measures none is refused BY NAME rather than dropping the flag: an operator who
+    // wired the serial tape and got a candidate-only run must be told so, not left reading a
+    // verdict the flag never reached.
+    if let Some(control) = args.control_golden.as_ref() {
+        if !paired_inputs_present {
+            return Err(format!(
+                "{}: --control-golden {} names the golden the serial-control leg verifies against, \
+                 but this run measures no control leg — a reference workspace and a calibration \
+                 file must both be in reach (--baseline-workspace/--baseline-calibration, or the \
+                 runner environment) before leg 1 exists",
+                baseline::CONTROL_GOLDEN_WITHOUT_PAIRED_PATH,
+                control.display(),
+            ));
+        }
+    }
     if live_control_leg_track && args.mode == Mode::Official {
         baseline::refuse_stored_baseline_override(
             std::env::var("MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN")
@@ -4119,6 +4161,53 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
             .calibration
             .check_identity(&track_id, &box_name, &prompt)?;
 
+        // LEG 1's OWN GOLDEN. The control leg is SERIAL, so it must verify its decode tokens
+        // against the SERIAL tape. On a track whose timed oracle at the declared depth is
+        // byte-identical to the serial tape that IS `--golden`; on a track that ships PER-DEPTH
+        // oracle tapes the two disagree (on MLX from step 1 on), and leg 1 dies against the
+        // candidate's tape. `--control-golden` is that track's serial live golden, loaded with the
+        // same arity, the same track and the same model identity the candidate golden is loaded
+        // with, and pinned by its own two flags.
+        //
+        // BOTH LEGS MEASURE ONE PROMPT. A control golden naming another prompt would make the
+        // ratio a comparison of two different prompts, so it is refused BY NAME.
+        let control_golden_loaded = match args.control_golden.as_ref() {
+            Some(path) => {
+                let control_prompt = baseline::golden_prompt_name(path).ok_or_else(|| {
+                    format!(
+                        "{}: --control-golden {} has no file name to take a prompt name from, so \
+                         it cannot be checked against --golden {}",
+                        baseline::CONTROL_GOLDEN_PROMPT_MISMATCH,
+                        path.display(),
+                        args.golden.display()
+                    )
+                })?;
+                if control_prompt != prompt {
+                    return Err(format!(
+                        "{}: --control-golden {} measures prompt {control_prompt:?} but --golden \
+                         {} measures prompt {prompt:?}; the two legs of a paired run measure ONE \
+                         prompt, so their ratio would compare two different prompts",
+                        baseline::CONTROL_GOLDEN_PROMPT_MISMATCH,
+                        path.display(),
+                        args.golden.display()
+                    ));
+                }
+                Some(load_golden_checked(
+                    path,
+                    args.control_golden_pin.as_ref(),
+                    args.mode.golden_required_steps(),
+                    None,
+                    &track_id,
+                    &identity,
+                )?)
+            }
+            // ABSENT ⇒ leg 1 verifies against the candidate golden, which is today's behaviour and
+            // is correct exactly when that golden's oracle is the serial tape.
+            None => None,
+        };
+        let control_golden = control_golden_loaded.as_ref().unwrap_or(&golden);
+        let control_golden_path = args.control_golden.as_deref().unwrap_or(&args.golden);
+
         // THE TWO ROOTS. The reference leg runs the SAME root-relative engine path inside the
         // organizer's tree that the candidate leg runs inside the submission tree, so the two legs
         // differ by their tree and by nothing else. The re-rooting starts from the RESOLVED
@@ -4181,7 +4270,12 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
         // the reference leg reads the reference tree's own weights and metallib without any
         // checkout-rooted allowance — the deny rules name only the private golden and the private
         // dir.
+        //
+        // The GOLDEN the profile denies reads of is likewise per spawn: leg 1 reads the SERIAL
+        // golden and leg 2 the candidate's, and a leg must be denied the file it is verified
+        // against, not the other leg's.
         let leg_sandbox_plan = |engine: &str,
+                                golden: &Path,
                                 honor_executable_override: bool|
          -> bench_runner::Result<Option<OfficialSandboxPlan>> {
             if !sandboxed {
@@ -4190,7 +4284,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
             let socket = spawn_resident_socket(&leg_env.borrow(), None);
             resolve_official_sandbox_from_env(
                 engine,
-                &args.golden,
+                golden,
                 honor_executable_override,
                 socket.as_deref(),
             )
@@ -4231,7 +4325,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
         // the CANDIDATE's — the leg that is scored.
         let baseline_hello = std::cell::RefCell::new(None);
         let spawn_baseline = || -> bench_runner::Result<Session<ChildStdioTransport>> {
-            let plan = leg_sandbox_plan(&reference_engine_str, false)?;
+            let plan = leg_sandbox_plan(&reference_engine_str, control_golden_path, false)?;
             let transport = spawn_official_worker(
                 plan.as_ref(),
                 &reference_engine_str,
@@ -4247,7 +4341,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
         // Leg 2's workers, rooted at the SUBMISSION tree — byte-for-byte the single-leg path's.
         let timed_hello = std::cell::RefCell::new(None);
         let spawn_timed = || -> bench_runner::Result<Session<ChildStdioTransport>> {
-            let plan = leg_sandbox_plan(&args.engine, true)?;
+            let plan = leg_sandbox_plan(&args.engine, &args.golden, true)?;
             let transport = spawn_official_worker(
                 plan.as_ref(),
                 &args.engine,
@@ -4261,7 +4355,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
             Ok(session)
         };
         let spawn_correctness = || -> bench_runner::Result<Session<ChildStdioTransport>> {
-            let plan = leg_sandbox_plan(&args.engine, true)?;
+            let plan = leg_sandbox_plan(&args.engine, &args.golden, true)?;
             let transport = spawn_official_worker(
                 plan.as_ref(),
                 &args.engine,
@@ -4297,11 +4391,15 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
             calibration.path.display(),
         );
         let mut payload = official::official_core_paired(
-            &golden,
+            official::PairedGoldens {
+                candidate: &golden,
+                control: control_golden,
+            },
             &calibration.calibration,
             official::PairedBaselineSeal {
                 box_name: &box_name,
                 calibration_sha256: &calibration.sha256,
+                control_golden_sha256: &control_golden.sha256,
                 reference_commit: &calibration.calibration.reference_commit,
                 // Both are filled in by the paired core from what it measured; the caller states
                 // nothing about a leg that has not run.
@@ -4958,15 +5056,43 @@ fn parse_golden_pin(
     sha256: Option<String>,
     bytes: Option<String>,
 ) -> Result<Option<GoldenIntegrityPin>, String> {
+    parse_named_golden_pin(sha256, bytes, "--golden-sha256", "--golden-bytes")
+}
+
+/// The same pin rule for the SERIAL-CONTROL leg's own golden, so `--control-golden` is pinned
+/// exactly as `--golden` is and names its own flags when it refuses.
+fn parse_control_golden_pin(
+    sha256: Option<String>,
+    bytes: Option<String>,
+) -> Result<Option<GoldenIntegrityPin>, String> {
+    parse_named_golden_pin(
+        sha256,
+        bytes,
+        "--control-golden-sha256",
+        "--control-golden-bytes",
+    )
+}
+
+/// The pin rule itself, stated once: both flags together or neither, and the byte count parses as
+/// a u64. `sha_flag` / `bytes_flag` are the names the refusal reports, so each golden surface
+/// names its own flags.
+fn parse_named_golden_pin(
+    sha256: Option<String>,
+    bytes: Option<String>,
+    sha_flag: &str,
+    bytes_flag: &str,
+) -> Result<Option<GoldenIntegrityPin>, String> {
     match (sha256, bytes) {
         (None, None) => Ok(None),
         (Some(sha256), Some(bytes)) => {
             let bytes: u64 = bytes
                 .parse()
-                .map_err(|_| format!("invalid u64 for --golden-bytes: {bytes:?}"))?;
+                .map_err(|_| format!("invalid u64 for {bytes_flag}: {bytes:?}"))?;
             Ok(Some(GoldenIntegrityPin { sha256, bytes }))
         }
-        _ => Err("--golden-sha256 and --golden-bytes must be given together".to_string()),
+        _ => Err(format!(
+            "{sha_flag} and {bytes_flag} must be given together"
+        )),
     }
 }
 
@@ -5883,6 +6009,9 @@ fn parse_iterate_args(args: &[String]) -> Result<Option<IterateArgs>, String> {
     let mut baseline_workspace: Option<PathBuf> = None;
     let mut baseline_calibration: Option<PathBuf> = None;
     let mut box_name: Option<String> = None;
+    let mut control_golden: Option<PathBuf> = None;
+    let mut control_golden_sha256: Option<String> = None;
+    let mut control_golden_bytes: Option<String> = None;
 
     // A flag that needs a value reads args[i+1] and advances the index by 2.
     fn value<'a>(args: &'a [String], i: usize, name: &str) -> Result<&'a str, String> {
@@ -5995,6 +6124,21 @@ fn parse_iterate_args(args: &[String]) -> Result<Option<IterateArgs>, String> {
             }
             "--box" => {
                 box_name = Some(value(args, i, "--box")?.to_string());
+                i += 2;
+            }
+            // LEG 1's OWN GOLDEN. The control leg is serial, so on a track that ships per-depth
+            // oracle tapes it cannot be verified against the candidate's tape.
+            "--control-golden" => {
+                control_golden = Some(PathBuf::from(value(args, i, "--control-golden")?));
+                i += 2;
+            }
+            "--control-golden-sha256" => {
+                control_golden_sha256 =
+                    Some(value(args, i, "--control-golden-sha256")?.to_string());
+                i += 2;
+            }
+            "--control-golden-bytes" => {
+                control_golden_bytes = Some(value(args, i, "--control-golden-bytes")?.to_string());
                 i += 2;
             }
             // Repeatable resource passthrough. The value is taken from THIS command line and is
@@ -6182,6 +6326,9 @@ fn parse_iterate_args(args: &[String]) -> Result<Option<IterateArgs>, String> {
     let weights = weights.ok_or("missing required --weights")?;
     let golden = golden.ok_or("missing required --golden")?;
     let golden_pin = parse_golden_pin(golden_sha256, golden_bytes)?;
+    // The control golden is pinned by the SAME rule as the candidate golden: both flags together
+    // or neither.
+    let control_golden_pin = parse_control_golden_pin(control_golden_sha256, control_golden_bytes)?;
     // Default score name mirrors benchmark.sh: local-ITERATE writes `score.local-iterate.json`
     // (benchmark.sh:92-95); local-SUBMIT writes the DEFAULT `score.json`, as does official.
     let score_path = score_path.unwrap_or_else(|| {
@@ -6211,6 +6358,8 @@ fn parse_iterate_args(args: &[String]) -> Result<Option<IterateArgs>, String> {
         baseline_workspace,
         baseline_calibration,
         box_name,
+        control_golden,
+        control_golden_pin,
         engine_resources,
     }))
 }
@@ -7053,6 +7202,61 @@ mod tests {
                 denied_reads,
                 vec!["(deny file-read* (literal \"/private/goldens/botany.golden.json\"))"],
                 "the only denied read is the private golden: {profile}"
+            );
+        }
+    }
+
+    /// LEG 1's OWN GOLDEN parses, and it is pinned by the SAME rule the candidate golden is:
+    /// both pin flags together or neither, each refusal naming its own two flags.
+    #[test]
+    fn the_control_golden_and_its_pin_parse_as_flags() {
+        let args: Vec<String> = [
+            "--engine",
+            "e",
+            "--weights",
+            "w",
+            "--golden",
+            "/goldens/botany.mtp1.golden.json",
+            "--control-golden",
+            "/goldens/botany.golden.json",
+            "--control-golden-sha256",
+            "abc",
+            "--control-golden-bytes",
+            "10",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let parsed = parse_iterate_args(&args).unwrap().unwrap();
+        assert_eq!(
+            parsed.control_golden.as_deref(),
+            Some(Path::new("/goldens/botany.golden.json"))
+        );
+        let pin = parsed
+            .control_golden_pin
+            .expect("both pin flags were given");
+        assert_eq!(pin.sha256, "abc");
+        assert_eq!(pin.bytes, 10);
+
+        // ABSENT ⇒ leg 1 verifies against `--golden`, which is today's behaviour.
+        let bare: Vec<String> = ["--engine", "e", "--weights", "w", "--golden", "g"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parsed = parse_iterate_args(&bare).unwrap().unwrap();
+        assert!(parsed.control_golden.is_none());
+        assert!(parsed.control_golden_pin.is_none());
+
+        // HALF A PIN is refused BY ITS OWN FLAG NAMES: an operator holding a control-golden sha
+        // with no byte count must not be told about `--golden-bytes`.
+        for half in [
+            parse_control_golden_pin(Some("abc".into()), None),
+            parse_control_golden_pin(None, Some("10".into())),
+        ] {
+            let err = half.expect_err("half a pin must be refused");
+            assert!(
+                err.contains("--control-golden-sha256") && err.contains("--control-golden-bytes"),
+                "a half pin must name BOTH of its own flags: {err}"
             );
         }
     }

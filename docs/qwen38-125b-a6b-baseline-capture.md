@@ -159,6 +159,17 @@ absent or does not match this track and this box. The `--baseline-workspace`,
 `--baseline-calibration` and `--box` flags name the same values on the command
 line.
 
+Leg 1 is serial, so it verifies its decode tokens against the SERIAL tape. On a
+track that ships one oracle tape per draft depth, give leg 1 its own golden with
+`--control-golden <PATH>`: pass the serial live golden there and keep the
+depth-N golden on `--golden`. Pin it with `--control-golden-sha256` and
+`--control-golden-bytes`, which work exactly like the `--golden` pin flags: give
+both or neither. Without the flag, leg 1 verifies against `--golden`, which is
+correct only when the depth-N tape is byte-identical to the serial tape. The
+control golden must name the SAME prompt as `--golden`, and a run that measures
+no control leg refuses the flag by name. The digest of the golden leg 1 used is
+sealed as `metrics.baseline_golden_sha256`.
+
 ## 7. The per-leg resident engine (both platforms)
 
 On EITHER platform the model is owned by a RESIDENT process, and that process
@@ -226,6 +237,8 @@ inherited socket is used as before.
 | `BASELINE-CALIBRATION-BOX-MISMATCH` | the file was captured on another box |
 | `BASELINE-CALIBRATION-PROMPT-MISMATCH` | the file was captured on another prompt than the golden this run measures |
 | `BASELINE-BOX-UNRESOLVED` | neither `RUNNER_NAME` nor `--box` names this box |
+| `CONTROL-GOLDEN-PROMPT-MISMATCH` | `--control-golden` names another prompt than `--golden` |
+| `CONTROL-GOLDEN-WITHOUT-PAIRED-PATH` | `--control-golden` was given on a run that measures no control leg |
 | `SERIAL-CONTROL-LEG-FAILED` | the control leg did not complete |
 | `SERIAL-CONTROL-LEG-OUTSIDE-BAND` | the control leg is outside this box's band |
 | `GOLDEN-CARRIES-STORED-BASELINE` | the golden still declares a baseline pair |

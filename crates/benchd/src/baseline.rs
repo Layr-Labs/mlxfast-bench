@@ -75,6 +75,12 @@ pub const STORED_BASELINE_OVERRIDE_REFUSED: &str = "STORED-BASELINE-OVERRIDE-REF
 pub const BASELINE_WORKSPACE_NO_WEIGHTS: &str = "BASELINE-WORKSPACE-NO-WEIGHTS";
 /// No box name is resolvable, so the calibration file's `box` field cannot be checked.
 pub const BASELINE_BOX_UNRESOLVED: &str = "BASELINE-BOX-UNRESOLVED";
+/// `--control-golden` names another prompt than `--golden`, so the two legs would measure two
+/// different prompts and the ratio between them would mean nothing.
+pub const CONTROL_GOLDEN_PROMPT_MISMATCH: &str = "CONTROL-GOLDEN-PROMPT-MISMATCH";
+/// `--control-golden` was given on a run that measures no control leg, where it would be silently
+/// ignored.
+pub const CONTROL_GOLDEN_WITHOUT_PAIRED_PATH: &str = "CONTROL-GOLDEN-WITHOUT-PAIRED-PATH";
 
 /// The band literals [`calibration_from_passes`] writes. benchd READS the band from the file — a
 /// box that needs a different band re-calibrates, it does not edit a constant here.

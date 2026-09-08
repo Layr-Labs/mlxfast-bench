@@ -1920,6 +1920,7 @@ pub(crate) fn base_metrics(
         baseline_source: None,
         baseline_box: None,
         baseline_calibration_sha256: None,
+        baseline_golden_sha256: None,
         baseline_reference_commit: None,
         baseline_band_passed: None,
         baseline_leg_prefill_seconds_per_token: None,

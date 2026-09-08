@@ -328,6 +328,14 @@ pub struct ScoreMetrics {
         skip_serializing_if = "Option::is_none"
     )]
     pub baseline_calibration_sha256: Option<String>,
+    /// ADDITIVE — the digest of the GOLDEN the serial-control leg verified its decode tokens
+    /// against. The control leg is serial, so on a track that carries per-depth oracle tapes it
+    /// reads a different golden than the candidate leg (`--control-golden`); this states which one.
+    #[serde(
+        rename = "baseline_golden_sha256",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub baseline_golden_sha256: Option<String>,
     /// ADDITIVE — the reference tree's engine commit the calibration was captured at.
     #[serde(
         rename = "baseline_reference_commit",
@@ -543,6 +551,7 @@ impl ScoreMetrics {
             baseline_source: self.baseline_source.clone(),
             baseline_box: self.baseline_box.clone(),
             baseline_calibration_sha256: self.baseline_calibration_sha256.clone(),
+            baseline_golden_sha256: self.baseline_golden_sha256.clone(),
             baseline_reference_commit: self.baseline_reference_commit.clone(),
             baseline_band_passed: self.baseline_band_passed,
             baseline_leg_prefill_seconds_per_token: self.baseline_leg_prefill_seconds_per_token,
@@ -736,6 +745,7 @@ mod tests {
             baseline_source: None,
             baseline_box: None,
             baseline_calibration_sha256: None,
+            baseline_golden_sha256: None,
             baseline_reference_commit: None,
             baseline_band_passed: None,
             baseline_leg_prefill_seconds_per_token: None,

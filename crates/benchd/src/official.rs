@@ -767,10 +767,16 @@ pub const SERIAL_CONTROL_LEG_FAILED: &str = "SERIAL-CONTROL-LEG-FAILED";
 
 /// LEG 1 of a paired ranked run: the SERIAL-CONTROL leg on the organizer-staged REFERENCE tree.
 ///
-/// It is the same window the candidate leg runs — same golden, same benchmark oracle, same
-/// 128-token decode depth, same per-platform prefill warm-up count, same unmeasured warmup leg,
-/// same per-phase cool gate — with ONE difference: **no spec**. The control is serial by
-/// construction, because the score is a speculative leg divided by a serial one.
+/// It is the same window the candidate leg runs — same prompt, same 128-token decode depth, same
+/// per-platform prefill warm-up count, same unmeasured warmup leg, same per-phase cool gate — with
+/// ONE difference: **no spec**. The control is serial by construction, because the score is a
+/// speculative leg divided by a serial one.
+///
+/// `golden` is therefore the SERIAL golden: the tape a serial decode of that prompt produces. On a
+/// track whose timed oracle at the candidate's depth is byte-identical to the serial tape it is
+/// the candidate's own golden; on a track with per-depth oracle tapes it is the separate serial
+/// live golden (`--control-golden`). Verifying a serial leg against a per-depth tape refuses at
+/// the first step the two tapes disagree on.
 ///
 /// It is also the WHOLE of what `benchd calibrate-baseline` measures: the calibrator calls this
 /// function, once per pass, so a box's band and a box's ranked denominator can never be measured
@@ -827,6 +833,10 @@ where
 pub struct PairedBaselineSeal<'a> {
     pub box_name: &'a str,
     pub calibration_sha256: &'a str,
+    /// The digest of the GOLDEN leg 1 verified its decode tokens against. It is the candidate
+    /// golden's on a track whose timed oracle at the declared depth IS the serial tape, and the
+    /// serial live golden's on a track that carries per-depth oracle tapes.
+    pub control_golden_sha256: &'a str,
     pub reference_commit: &'a str,
     /// `true` once the control leg passed this box's band. A run whose leg failed the band seals
     /// no score, so this is `true` wherever it is sealed.
@@ -852,6 +862,7 @@ pub fn seal_paired_baseline(metrics: &mut ScoreMetrics, seal: &PairedBaselineSea
     metrics.baseline_source = Some(crate::baseline::BASELINE_SOURCE_SERIAL_CONTROL_LEG.to_string());
     metrics.baseline_box = Some(seal.box_name.to_string());
     metrics.baseline_calibration_sha256 = Some(seal.calibration_sha256.to_string());
+    metrics.baseline_golden_sha256 = Some(seal.control_golden_sha256.to_string());
     metrics.baseline_reference_commit = Some(seal.reference_commit.to_string());
     metrics.baseline_band_passed = Some(seal.band_passed);
     if let Some((prefill, decode)) = seal.leg {
@@ -903,6 +914,21 @@ fn paired_refusal(
     payload
 }
 
+/// THE TWO GOLDENS a paired run verifies against — one per leg, because the two legs decode two
+/// different ways.
+///
+/// `candidate` is the golden the CANDIDATE leg (leg 2) verifies against, at the depth the
+/// submission declares. `control` is the golden the SERIAL-CONTROL leg (leg 1) verifies against.
+/// They are the SAME golden on a track whose timed oracle at that depth is byte-identical to the
+/// serial tape, and DIFFERENT on a track that carries per-depth oracle tapes: leg 1 is serial by
+/// construction, so it can only be verified against the serial tape. On the MLX engine the
+/// per-depth tape diverges from the serial one at step 1, so one shared golden kills leg 1.
+#[derive(Clone, Copy)]
+pub struct PairedGoldens<'a> {
+    pub candidate: &'a GoldenFixture,
+    pub control: &'a GoldenFixture,
+}
+
 /// The ENGINE and WORKER lifecycles of a paired run's two legs, in one value so the paired entry
 /// point states its inputs as two groups — WHO runs the legs, and WHAT window they run.
 ///
@@ -929,13 +955,13 @@ pub struct PairedWindow<G> {
 /// THE RANKED PAIRED PATH (David ruling 2026-09-08): two legs on one box in one job.
 ///
 /// 1. **Serial-control leg** on the REFERENCE tree (`spawn_baseline`), no speculation
-///    ([`run_serial_control_leg`]).
+///    ([`run_serial_control_leg`]), verified against `goldens.control` — the SERIAL tape.
 /// 2. **Band check** of that leg against THIS BOX's calibration file. The band is a health gate on
 ///    leg 1; no number in the file is ever a denominator. Outside the band, the run dies by name
 ///    and seals no score.
 /// 3. **Candidate leg** on the submission tree (`spawn_timed`) at its declared depth, followed by
-///    the full correctness set — [`official_core_windowed`], unchanged, with the LIVE measurement
-///    from step 1 as its baseline pair. The score is therefore
+///    the full correctness set — [`official_core_windowed`], unchanged, verified against
+///    `goldens.candidate`, with the LIVE measurement from step 1 as its baseline pair. The score is therefore
 ///    `(ref_prefill/cand_prefill)^0.25 * (ref_decode/cand_decode)^0.75`, with the floors and the
 ///    band shape untouched.
 ///
@@ -950,7 +976,7 @@ pub struct PairedWindow<G> {
 /// The paired seal rides on EVERY payload this returns, including the refusals, because "which box
 /// and which calibration" is exactly what a reader of a refused run needs.
 pub fn official_core_paired<T, L, LB, LC, FB, FT, FC, G>(
-    golden: &GoldenFixture,
+    goldens: PairedGoldens<'_>,
     calibration: &crate::baseline::BaselineCalibration,
     seal: PairedBaselineSeal<'_>,
     digests: RunDigests<'_>,
@@ -967,6 +993,10 @@ where
     FC: FnMut() -> bench_runner::Result<Session<T>>,
     G: FnMut(&str) -> bench_runner::Result<()>,
 {
+    let PairedGoldens {
+        candidate: golden,
+        control: control_golden,
+    } = goldens;
     let PairedLegs {
         open_baseline_leg,
         open_candidate_leg,
@@ -986,8 +1016,13 @@ where
         Ok(guard) => guard,
         Err(e) => return paired_refusal(golden, digests, commit, e, seal, None),
     };
-    let control_result =
-        run_serial_control_leg(golden, residency, platform, spawn_baseline, &mut cool_gate);
+    let control_result = run_serial_control_leg(
+        control_golden,
+        residency,
+        platform,
+        spawn_baseline,
+        &mut cool_gate,
+    );
     drop(baseline_leg);
     let control = match control_result {
         Ok(t) => t,
@@ -1853,6 +1888,15 @@ mod tests {
     /// A golden whose benchmark oracle is (5, 6, [700..828)) and whose primary case is
     /// conformant to teacher-forced [2; 64]. `gates` is spliced into `correctness_gates`.
     fn official_golden(gates: Option<serde_json::Value>) -> GoldenFixture {
+        official_golden_with_oracle(oracle_decode_tokens(), gates)
+    }
+
+    /// The same golden with a CHOSEN benchmark oracle tape, so a test can put two goldens that
+    /// disagree on the decode tokens in front of the two legs of a paired run.
+    fn official_golden_with_oracle(
+        decode_tokens: Vec<i64>,
+        gates: Option<serde_json::Value>,
+    ) -> GoldenFixture {
         let mut doc = json!({
             "version": 1,
             "model_type": "qwen4_exp_text",
@@ -1864,7 +1908,7 @@ mod tests {
                 "expected_prefill_token": PREFILL_TOKEN,
                 "decode_seed_tokens": vec![1i64; BENCHMARK_DECODE_SEED_TOKENS],
                 "expected_decode_seed_token": SEED_TOKEN,
-                "expected_decode_tokens": oracle_decode_tokens(),
+                "expected_decode_tokens": decode_tokens,
             }
         });
         if let Some(g) = gates {
@@ -4028,6 +4072,7 @@ mod tests {
         PairedBaselineSeal {
             box_name: &calibration.box_name,
             calibration_sha256: "c0ffee",
+            control_golden_sha256: "5e21a1",
             reference_commit: &calibration.reference_commit,
             band_passed: false,
             leg: None,
@@ -4080,7 +4125,10 @@ mod tests {
         }
 
         let payload = official_core_paired(
-            &golden,
+            PairedGoldens {
+                candidate: &golden,
+                control: &golden,
+            },
             &calibration,
             paired_seal_for_test(&calibration),
             RunDigests::for_test(&DirDigest::empty()),
@@ -4182,7 +4230,10 @@ mod tests {
         let candidate_engine_ups = Cell::new(0usize);
 
         let payload = official_core_paired(
-            &golden,
+            PairedGoldens {
+                candidate: &golden,
+                control: &golden,
+            },
             &calibration,
             paired_seal_for_test(&calibration),
             RunDigests::for_test(&DirDigest::empty()),
@@ -4255,7 +4306,10 @@ mod tests {
         let calibration = wide_calibration();
         let baseline_spawns = Cell::new(0usize);
         let payload = official_core_paired(
-            &golden,
+            PairedGoldens {
+                candidate: &golden,
+                control: &golden,
+            },
             &calibration,
             paired_seal_for_test(&calibration),
             RunDigests::for_test(&DirDigest::empty()),
@@ -4285,6 +4339,151 @@ mod tests {
         assert_eq!(baseline_spawns.get(), 0, "no worker before its engine");
         assert_eq!(payload.metrics.baseline_band_passed, Some(false));
         assert_eq!(payload.metrics.baseline_leg_prefill_seconds_per_token, None);
+    }
+
+    /// The MLX shape: a per-depth oracle tape that agrees with the serial tape at step 0 and
+    /// DIVERGES at step 1 — `botany.mtp1.golden.json` against `botany.golden.json`.
+    fn per_depth_oracle_tokens() -> Vec<i64> {
+        let mut tokens = oracle_decode_tokens();
+        tokens[1] += 1_000;
+        tokens
+    }
+
+    /// A stub engine conformant on the teacher-forced base case and on the oracle tape it is
+    /// given, so the two legs of a paired run can be driven with two different tapes.
+    fn engine_on_tape(decode_tokens: Vec<i64>) -> MockEngine {
+        MockEngine::new()
+            .teacher_forced_tokens(vec![2i64; 64])
+            .free_run_capable()
+            .oracle_tokens(PREFILL_TOKEN, SEED_TOKEN, decode_tokens)
+    }
+
+    /// EACH LEG VERIFIES AGAINST ITS OWN TAPE. On a track with per-depth oracle tapes the serial
+    /// leg decodes the SERIAL tape and the candidate leg decodes the depth-N tape, and the two
+    /// disagree from step 1 on. Given the serial golden as the CONTROL golden, leg 1 passes
+    /// against the serial tape and leg 2 still verifies against the candidate golden's — so the
+    /// run reaches the band gate, which is as far as a ~0-wall-clock mock can go.
+    #[test]
+    fn the_control_leg_verifies_against_the_control_golden_and_the_candidate_against_its_own() {
+        let candidate_golden = official_golden_with_oracle(per_depth_oracle_tokens(), None);
+        let control_golden = official_golden_with_oracle(oracle_decode_tokens(), None);
+        let calibration = wide_calibration();
+        let candidate_spawns = Cell::new(0usize);
+
+        let payload = official_core_paired(
+            PairedGoldens {
+                candidate: &candidate_golden,
+                control: &control_golden,
+            },
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: || Ok(()),
+                open_candidate_leg: || Ok(()),
+                // The REFERENCE tree runs serial, so its engine emits the SERIAL tape.
+                spawn_baseline: || {
+                    Session::connect(engine_on_tape(oracle_decode_tokens())).map(|(s, _)| s)
+                },
+                // The CANDIDATE runs at its declared depth, so its engine emits the depth-N tape.
+                spawn_timed: || {
+                    candidate_spawns.set(candidate_spawns.get() + 1);
+                    Session::connect(engine_on_tape(per_depth_oracle_tokens())).map(|(s, _)| s)
+                },
+                spawn_correctness: || {
+                    Session::connect(engine_on_tape(per_depth_oracle_tokens())).map(|(s, _)| s)
+                },
+            },
+            paired_window_for_test(|_phase: &str| Ok(())),
+        );
+
+        // LEG 1 PASSED: it was verified against the control golden's tape, not the candidate's.
+        assert!(
+            !payload.metrics.error.contains(SERIAL_CONTROL_LEG_FAILED),
+            "{}",
+            payload.metrics.error
+        );
+        assert_eq!(payload.metrics.baseline_band_passed, Some(true));
+        let leg_decode = payload
+            .metrics
+            .baseline_leg_decode_seconds_per_token
+            .expect("leg 1 measured");
+        assert!(leg_decode.is_finite() && leg_decode > 0.0);
+        // LEG 2 RAN, and it verified against the CANDIDATE golden's tape — a leg driven on the
+        // depth-N tape and checked against the serial one would have failed the oracle here.
+        assert_eq!(candidate_spawns.get(), 1);
+        assert!(
+            !payload
+                .metrics
+                .error
+                .contains("benchmark free-run decode token mismatch"),
+            "{}",
+            payload.metrics.error
+        );
+        assert!(payload
+            .metrics
+            .candidate_leg_decode_seconds_per_token
+            .is_some());
+        // The seal names the golden leg 1 was verified against.
+        assert_eq!(
+            payload.metrics.baseline_golden_sha256.as_deref(),
+            Some("5e21a1")
+        );
+    }
+
+    /// THE BUG THIS FLAG FIXES. The SAME two engines, with NO separate control golden: leg 1 is
+    /// verified against the candidate's per-depth tape, which its serial decode cannot produce, so
+    /// the run dies BY NAME at the first step the two tapes disagree on — step 1 — and leg 2 never
+    /// runs. This is the MLX ranked failure `--control-golden` exists for.
+    #[test]
+    fn one_shared_golden_kills_the_serial_control_leg_on_a_per_depth_oracle_track() {
+        let candidate_golden = official_golden_with_oracle(per_depth_oracle_tokens(), None);
+        let calibration = wide_calibration();
+        let candidate_spawns = Cell::new(0usize);
+
+        let payload = official_core_paired(
+            PairedGoldens {
+                candidate: &candidate_golden,
+                control: &candidate_golden,
+            },
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: || Ok(()),
+                open_candidate_leg: || Ok(()),
+                spawn_baseline: || {
+                    Session::connect(engine_on_tape(oracle_decode_tokens())).map(|(s, _)| s)
+                },
+                spawn_timed: || {
+                    candidate_spawns.set(candidate_spawns.get() + 1);
+                    Session::connect(engine_on_tape(per_depth_oracle_tokens())).map(|(s, _)| s)
+                },
+                spawn_correctness: || {
+                    Session::connect(engine_on_tape(per_depth_oracle_tokens())).map(|(s, _)| s)
+                },
+            },
+            paired_window_for_test(|_phase: &str| Ok(())),
+        );
+
+        assert!(!payload.passed);
+        assert!(payload.score.is_none());
+        assert!(
+            payload.metrics.error.contains(SERIAL_CONTROL_LEG_FAILED),
+            "{}",
+            payload.metrics.error
+        );
+        assert!(
+            payload
+                .metrics
+                .error
+                .contains("benchmark free-run decode token mismatch at step 1"),
+            "{}",
+            payload.metrics.error
+        );
+        assert_eq!(candidate_spawns.get(), 0, "leg 2 never runs");
     }
 
     /// THE SEALED FIELDS OF A PASSING PAIRED RUN. The control leg is MEASURED through the mock

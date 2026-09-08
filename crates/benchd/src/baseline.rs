@@ -570,13 +570,15 @@ pub fn reference_engine_path(
 /// it is measuring. `None` for a path with no file name at all.
 pub fn golden_prompt_name(golden: &Path) -> Option<String> {
     let name = golden.file_name()?.to_str()?;
-    let stem = name
-        .strip_suffix(".golden.json")
-        .unwrap_or_else(|| name.split('.').next().unwrap_or(name));
-    if stem.is_empty() {
+    let stem = name.strip_suffix(".golden.json").unwrap_or(name);
+    // A per-depth oracle is the SAME prompt with a depth-specific tape: `botany.mtp1.golden.json`
+    // measures prompt `botany`. The prompt is the first `.`-segment of the stem; the depth suffix
+    // names the tape, not the prompt, so a box calibrated on `botany` bands every depth of it.
+    let prompt = stem.split('.').next().unwrap_or(stem);
+    if prompt.is_empty() {
         return None;
     }
-    Some(stem.to_string())
+    Some(prompt.to_string())
 }
 
 /// The default weights directory inside a tree: the directory the tree's own transform writes to.
@@ -856,6 +858,15 @@ mod tests {
         );
         assert_eq!(golden_prompt_name(Path::new("/")), None);
         assert_eq!(golden_prompt_name(Path::new(".golden.json")), None);
+        // A per-depth oracle is the same prompt with a depth-specific tape.
+        assert_eq!(
+            golden_prompt_name(Path::new("/goldens/botany.mtp1.golden.json")).as_deref(),
+            Some("botany")
+        );
+        assert_eq!(
+            golden_prompt_name(Path::new("botany.mtp6.golden.json")).as_deref(),
+            Some("botany")
+        );
     }
 
     #[test]

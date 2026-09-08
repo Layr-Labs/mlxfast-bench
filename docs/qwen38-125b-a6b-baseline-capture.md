@@ -1,277 +1,243 @@
-# Qwen 3.8 125B-A6B baseline capture
+# Qwen 3.8 125B-A6B per-box calibration
 
-This page tells the box agent how to capture the official baselines for the
-Qwen 3.8 125B-A6B tracks. One bench tree serves two engines. The track id
-selects the platform: `qwen3.8-125b-a6b-mlx-v1` or `qwen3.8-125b-a6b-cuda-v1`.
-Do the procedure once for each platform.
+This page tells the box agent how to calibrate ONE ranked box for the Qwen 3.8
+125B-A6B tracks. One bench tree serves two engines. The track id selects the
+platform: `qwen3.8-125b-a6b-mlx-v1` or `qwen3.8-125b-a6b-cuda-v1`.
 
-Do not run this procedure on a laptop. Run it on the ranked box only. This page
-names that box `ai-server`.
+Do the procedure once for each ranked box. Do it again when the organizer moves
+the reference tree. Do not run it on a laptop. Run it on the ranked box only.
 
-## 1. What you measure
+## 1. What a ranked run measures
 
-The tracks are single-stream. Each track fixture declares `scored_batch_size: 1`.
-benchd never runs the batched cohort for these tracks.
+These tracks store NO baseline pair. There is no pair in the constants, no pair
+in the track fixture, and no pair in a golden. A ranked run measures its own
+denominator (David ruling, 2026-09-08).
 
-Scoring is SINGLE-LEG. `benchd iterate --mode official` times one leg (MTP on
-the timed leg) and scores it against the pinned baseline. The composite formula
-is unchanged. There is no paired serial-control leg.
+A ranked run measures TWO legs on ONE box in ONE job, on the one fixed prompt
+the fixture's live golden carries:
 
-You capture ONE thing for each platform: the official baseline. It is the serial
-prefill and decode seconds-per-token pair plus the four acceptance-band
-tolerances, held in `OfficialBaseline` in `crates/bench-core/src/constants.rs`.
-Every scored `benchd iterate` run scores against it. Until you capture them,
-`OFFICIAL_BASELINE_MLX` and `OFFICIAL_BASELINE_CUDA` are `None`, and benchd
-refuses to score by name:
+1. The SERIAL-CONTROL leg, on the organizer-staged reference tree. No
+   speculation.
+2. The CANDIDATE leg, on the submission tree, at its declared draft depth.
 
-- `QWEN38-125B-A6B-MLX-PENDING-ORGANIZER`
-- `QWEN38-125B-A6B-CUDA-PENDING-ORGANIZER`
+The score is the live ratio of the two:
 
-The pool has EIGHT prompts. Each prompt carries its OWN baseline in its golden:
-`baseline_prefill_seconds_per_token` and `baseline_decode_seconds_per_token`.
-A scored run of one prompt scores against that prompt's own pair.
+```
+(ref_prefill_spt / cand_prefill_spt)^0.25 * (ref_decode_spt / cand_decode_spt)^0.75
+```
 
-### Band shape
+The speedup floors and the acceptance bands do not change. The band shape stays
+the MTP single-leg shape: prefill +/-5 % symmetric, decode +2 % up, decode down
+band DISABLED. What changed is the reference the shape is applied to. It is a
+live measurement, not a stored pair.
 
-The bands are FIXED LITERALS. Do NOT derive them from a session CV. The shape is
-the one the MTP timed leg needs (David ruling):
+Leg 1 runs the reference tree's OWN engine and the reference tree's OWN weights.
+benchd finds both by re-rooting the candidate's own root-relative path into the
+reference tree, so the two legs differ by their tree and by nothing else. The
+transform that writes the weights is participant-editable, so the control leg
+never loads the candidate's transform output. When the weights are an
+organizer-staged tree outside every checkout, and the reference tree holds no
+`weights/` of its own, both legs load that one tree; no participant transform
+can reach it.
 
-- Prefill: +/-5 %, SYMMETRIC.
-- Decode UP: +2 %.
-- Decode DOWN: DISABLED. MTP spec-decode decode is much faster than the serial
-  baseline, so a lower band would wrongly fail a healthy run as "improvement too
-  large". The 0.95 decode speedup FLOOR is the only lower guard the decode axis
-  needs.
+## 2. What this page calibrates
 
-The `decode_down_enabled` field on `AcceptanceBands` carries the disabled state.
-Set it `false` for these tracks; the scored path then skips the decode lower
-bound and keeps the decode upper bound. The band VALUES land at calibration; the
-`OFFICIAL_BASELINE_*` constants stay `None` until then.
+The calibration file is a HEALTH BAND for leg 1 only. It says what a control leg
+costs on this box when the box is well. A ranked run compares its measured
+control leg against that band, and refuses the run when the leg falls outside
+it. No number in the file is ever a denominator.
 
-## 2. Before you start
+Each ranked box carries its own file. A file captured on another box is refused
+by name.
 
-1. Merge the engine PR first. Then verify it independently. Record the merged
-   head SHA. Write that SHA into the capture record. A capture from an
-   unmerged or unverified engine is void.
-2. Confirm the track fixture (`benchmark.json` in the engine repository)
-   declares:
-   - `track_id` = `qwen3.8-125b-a6b-mlx-v1` or `qwen3.8-125b-a6b-cuda-v1`;
-   - `scored_batch_size` = `1`;
-   - `target.upstream_model_id` and `target.upstream_revision` equal to the
-     platform's `TrackReferenceModel` in `constants.rs`.
-   benchd refuses a fixture that pins another checkpoint (die 8, before any
-   golden loads).
+## 3. Before you start
+
+1. Stage the REFERENCE tree on the box. It is the track's promoted baseline
+   engine commit, built. Record its path. This page calls it
+   `$REFERENCE_WORKSPACE`.
+2. Build the reference tree's own worker or adapter, at the same path inside the
+   tree that a submission builds its own at:
+   - MLX: `$REFERENCE_WORKSPACE/.build/release/bench-worker`, staged by that
+     tree's `tools/stage-bench-worker.sh`.
+   - CUDA: the adapter that tree's `tools/stage-cuda-engine.sh` stages under
+     `$REFERENCE_WORKSPACE/.build/release/`.
 3. Build benchd from the merged bench branch. Record its commit SHA.
-4. Export the track id for every command below:
+4. Hold the box GPU lock for the whole procedure.
+5. Export the track id, the box name and the benchd source commit:
 
 ```sh
 export MLXFAST_QWEN_MTP_TRACK_ID=qwen3.8-125b-a6b-mlx-v1   # or ...-cuda-v1
+export RUNNER_NAME=m5-max-128gb-4-qwen38-125b-a6b-mlx      # this box's runner name
+export MLXFAST_BENCHD_SOURCE_COMMIT=<40-hex benchd commit>
 ```
 
-## 3. GPU lock protocol on `ai-server`
+## 4. Run the calibration
 
-The box agent fills in the concrete commands. Keep the order.
-
-1. Take the lock.
-2. Unload the resident Qwen service.
-3. Run the capture (sections 4 and 5).
-4. Reload the resident Qwen service.
-5. Release the lock.
-
-`scripts/baseline-capture.sh` has one function for each step. The functions
-`lock`, `unload`, `reload` and `release` exit with code 2 until the box agent
-fills them in.
-
-## 4. Capture the per-prompt baselines
-
-Preconditions. Confirm all of them before the first run:
-
-1. The hidden pool material is staged on the box. Staging is organizer-gated;
-   ask David before you stage anything new.
-2. The track is NOT armed yet (`official_scoring_enabled` is absent or false).
-   The capture uses `--capture-baseline`, which writes no score and no integrity
-   sidecar, so it never seals a ranked artifact while the track is unarmed.
-3. The official correctness golden is staged; every run passes it as `--golden`.
-
-The pool has EIGHT prompts. Each prompt gets its OWN baseline pair. Capture uses
-`benchd iterate --capture-baseline <RECORD>` on the stock (unmodified) tree.
-The mode appends the run's prefill and decode seconds-per-token to the capture
-record and writes NO score. On a track whose baseline is already captured the
-mode refuses by name, so it can never double as a scoring bypass.
-
-**Run the correctness gate ONCE per prompt per window (a8/David ruling).** The
-engine cannot change between passes of your own calibration, so the teacher-forced
-correctness gate is redundant after the first pass. That gate is PLE-SSD-bound and
-takes about 7 to 8 minutes per pass. Run it on the WARMUP pass of each prompt (the
-`[W]`-labeled pass, WITHOUT `--capture-timed-only`); its timing is EXCLUDED. Run
-every measured pass — the two A passes and the two B passes — WITH
-`--capture-timed-only`. That flag skips the gate and runs ONLY the timed prefill
-and decode pass, then appends the pair. The timed pass and its free-run seed check
-are unchanged on every pass.
-
-**Hash the weights ONCE per window (Option B digest-hoist).** The weights tree is
-immutable for the whole window, and hashing the ~105 GB tree costs time on every
-pass. benchd hashes the files in parallel, and it uses the CPU SHA-256
-instructions: an M5 digests 6.4 GB in about 1.5 seconds, where one thread of
-portable code needs about 23 seconds. The cost is still paid once per pass, so
-the hoist still removes it from every pass but the first. Compute the digest ONCE
-at window start with
-`benchd weights-digest --weights "$WEIGHTS_DIR"`, which prints the stable form
-`<sha256>:<bytes>:<files>`, and pass that value to every subsequent pass via
-`--weights-digest`. The passed digest is BYTE-IDENTICAL to the per-pass
-`dir_digest` a run would compute for itself — it is produced by the SAME
-`dir_digest`, not a shell-side sha reimplementation — so no measured or scored
-number changes. Each weights digest also prints one line to stderr —
-`weights digest: <bytes> in <s> s, <threads> threads` — so you can see what the
-seal cost on this box; stderr is not sealed. `--weights-digest` is refused at
-parse WITHOUT `--capture-baseline`
-(mirroring `--capture-timed-only`): an official/scored run always hashes for
-itself, so a passed-in digest can never reach a scored seal.
-
-Calibration shape (David ruling). Per prompt: **1 unmeasured warmup + A×2 + B×2**.
-Over the EIGHT prompts that is **40 runs total, 32 scored into the mean** (four
-measured passes per prompt). The CV is computed over the four MEASURED passes per
-prompt. A==B is compared 2-vs-2: `mean(A1, A2)` against `mean(B1, B2)`. The one
-warmup pass per prompt is `[W]`-labeled and EXCLUDED from the mean, the CV, and the
-A==B comparison.
-
-Cost: one per-prompt teacher-forced warmup gate plus cheap timed passes, and ONE
-weights hash for the whole window. A full window is about boot + 1 weights hash + 8
-warmup gates (one per prompt) + 32 fast timed passes — not the roughly 9 to 10
-hours a re-gated, re-hashed window would hold the GPU lock.
-
-Rules for the capture:
-
-1. **Five runs per prompt: one warmup, then A×2 and B×2.** Each is a fresh
-   invocation gated on the box's cool-down rule. Only the warmup runs the
-   correctness gate; the four measured passes use `--capture-timed-only`. The
-   warmup is `[W]`-labeled and excluded; only the four measured passes score.
-2. **One window per box.** Measure ALL EIGHT prompts in ONE calibration window
-   — a single model boot. Do not reboot the model between prompts; the weights
-   load once for the whole window and are hashed once for the whole window.
-3. **Arm ONE live prompt first.** Author the baseline for the one live prompt
-   first. Author the other seven and keep them ready for the organizer to rotate
-   in; do not arm them yet.
-
-`--capture-timed-only` and `--weights-digest` both need `--capture-baseline`. Each
-is refused by name without it, so neither can ever reach a scored or official run.
+Run this ONCE on the box:
 
 ```sh
-export MLXFAST_QWEN_MTP_TRACK_ID=qwen3.8-125b-a6b-mlx-v1   # or ...-cuda-v1
-
-# Hash the immutable weights ONCE at window start; every pass below reuses this.
-WEIGHTS_DIGEST=$(benchd weights-digest --weights "$WEIGHTS_DIR")
-
-# WARMUP [W] — runs the correctness gate once for this prompt; timing EXCLUDED.
-benchd iterate --mode local-iterate \
-  --engine "$STOCK_WORKER" --weights "$WEIGHTS_DIR" \
-  --golden "$POOL_DIR/<prompt>.json" \
-  --capture-baseline "$CAPTURE_DIR/baseline.<prompt-id>.W.json" \
-  --weights-digest "$WEIGHTS_DIGEST"
-
-# A record, PASSES A1 A2 (repeat x2) — skip the gate, time and append only.
-benchd iterate --mode local-iterate \
-  --engine "$STOCK_WORKER" --weights "$WEIGHTS_DIR" \
-  --golden "$POOL_DIR/<prompt>.json" \
-  --capture-baseline "$CAPTURE_DIR/baseline.<prompt-id>.A.json" \
-  --capture-timed-only --weights-digest "$WEIGHTS_DIGEST"
-
-# B record, PASSES B1 B2 (repeat x2) — skip the gate; the warmup already gated
-# this prompt for the window.
-benchd iterate --mode local-iterate \
-  --engine "$STOCK_WORKER" --weights "$WEIGHTS_DIR" \
-  --golden "$POOL_DIR/<prompt>.json" \
-  --capture-baseline "$CAPTURE_DIR/baseline.<prompt-id>.B.json" \
-  --capture-timed-only --weights-digest "$WEIGHTS_DIGEST"
+benchd calibrate-baseline \
+  --baseline-workspace "$REFERENCE_WORKSPACE" \
+  --engine .build/release/bench-worker \
+  --golden "$LIVE_GOLDEN" \
+  --passes 4 \
+  --out "$REFERENCE_WORKSPACE/baseline-calibration.json"
 ```
 
-The record carries the identity (track id, mode, engine sha256, golden sha256 —
-a run from a different engine or golden refuses to merge), every run's pair, and
-the run count.
+`--weights` defaults to `$REFERENCE_WORKSPACE/weights`, the reference tree's own
+transform output. Name another directory only for a track whose weights are an
+organizer-staged tree outside every checkout.
 
-If the timed pass fails (for example, the cool gate stops because the GPU stays
-hot), the mode records nothing and prints `capture refused: timed phase failed:`
-with the cause. Correct the cause and run the pass again.
+`--engine` is a path RELATIVE to the reference workspace root. A ranked run
+resolves the reference leg's engine by re-rooting the candidate's own relative
+engine path into the reference tree, so the two paths must be the same.
 
-## 5. Assemble the official baseline
+The verb runs the ranked path's own serial-control leg `--passes` times, under
+the full official methodology: the cool gate before every timed phase, the
+unmeasured warm-up leg, the per-platform prefill warm-up count, one resident
+worker per pass, and the live golden's own oracle. On CUDA it boots and tears
+down the reference tree's resident engine once per pass (see section 7).
 
-For each prompt, the baseline pair is the MEAN of the four MEASURED passes
-(A1, A2, B1, B2), per axis — the warmup pass is excluded. Write
-`baseline_prefill_seconds_per_token` and `baseline_decode_seconds_per_token` into
-that prompt's golden. Use the fixed band shape from section 1 (prefill +/-5 %
-symmetric; decode +2 % up; decode down disabled) for every prompt.
+It writes the file and refuses by name when the passes are too noisy:
 
-The A and B passes are captured into separate record files within the one window,
-so the 2-vs-2 A==B check (section 6) can read them apart.
-
-## 6. Double generation: A must equal B
-
-Do not commit a value until A equals B.
-
-- For every prompt, compare the two record halves 2-vs-2 — `mean(A1, A2)` against
-  `mean(B1, B2)` — per axis. They must agree within 1 % per axis. If any prompt is
-  outside 1 % on either axis, discard that prompt's passes and run section 4 again
-  for it.
-- Compute the CV over the four measured passes per prompt (A1, A2, B1, B2); the
-  warmup pass is not part of it.
-- The bands are fixed literals (section 1), so they are identical by
-  construction — there is nothing to reconcile there.
-
-Keep the A and B artifacts. Attach them to the pull request that commits the
-values.
-
-## 7. Replace the sentinel with the value
-
-Do these steps in one commit. The mirror test fails if you do only one side.
-
-1. In `crates/bench-core/src/constants.rs`, set `OFFICIAL_BASELINE_MLX` (or
-   `OFFICIAL_BASELINE_CUDA`) to `Some(OfficialBaseline { ... })`. Use the exact
-   bits from the capture for the pair. The bands are the FIXED LITERALS from
-   section 1 (prefill +/-5 % symmetric; decode +2 % up; `decode_down_enabled:
-   false`) — do not derive them.
-2. In `crates/benchd/tests/fixtures/swift-official-baseline-constants.json`,
-   under the platform key (`mlx` or `cuda`), replace each sentinel string with
-   the same value (including `decodeBandDownEnabled`). Replace `source_commit`
-   with the engine commit SHA that carries the same values in its
-   `Constants.swift`. Replace `captured` with the capture date. Replace
-   `source_lines` with the line range in that file.
-3. Run:
-
-```sh
-cargo test -p benchd official_baseline_mirrors_the_reference_constants_capture_per_platform
+```
+CALIBRATION-CV-EXCEEDED
 ```
 
-4. Run the negative controls again. They must stay red for gemma and green for
-   the track:
+A box that refuses is not quiet enough for a mean to describe it. Find out why
+before you calibrate again. Do not widen the gate. The maximum is fixed at 1 %
+per axis and no flag can relax it.
 
-```sh
-cargo test -p bench-core --test loader_parity negative_control_gemma_golden_refuses_by_name
-cargo test -p bench-core --test loader_parity positive_control_pinned_track_golden_is_accepted
-cargo test -p bench-core --test loader_parity cuda_platform_pin_controls
-cargo test -p benchd run_baselines_refuses_by_name_while_the_official_baseline_is_pending
+## 5. The file
+
+`baseline-calibration.json` holds values only:
+
+```json
+{
+  "version": 1,
+  "track_id": "qwen3.8-125b-a6b-mlx-v1",
+  "box": "m5-max-128gb-4-qwen38-125b-a6b-mlx",
+  "reference_commit": "<40 hex>",
+  "prompt": "botany",
+  "passes": 4,
+  "prefill_seconds_per_token_mean": 0.0006282488193359375,
+  "decode_seconds_per_token_mean": 0.0329116748046875,
+  "prefill_cv": 0.004,
+  "decode_cv": 0.002,
+  "prefill_band_low": 0.95,
+  "prefill_band_high": 1.05,
+  "decode_band_low": 0.98,
+  "decode_band_high": 1.02,
+  "captured_at": "2026-09-08T00:00:00Z",
+  "benchd_source_commit": "<40 hex>"
+}
 ```
 
-   The last test skips a platform whose baseline is captured. It must still
-   pass for the other platform while that one is pending.
+`box` must equal the runner name the ranked job runs under, and `prompt` must
+equal the name of the golden the ranked run measures (the file name minus
+`.golden.json`). A band describes the leg it was measured from, so a file
+captured on another box or another prompt is refused. benchd reads the band from
+the file; the values above are the defaults the calibrator writes. The CV fields
+are fractions: `0.004` is 0.4 %.
 
-5. Stage each prompt's golden — carrying its `baseline_prefill_seconds_per_token`
-   and `baseline_decode_seconds_per_token` (section 5) — to the place the track's
-   runner reads its goldens from. Staging is organizer-gated. Arm the one live
-   prompt first; keep the other seven ready for rotation. Do not commit the
-   goldens into this repository.
+The re-rooting that finds the reference tree's engine and weights refuses a
+candidate path that walks out of the workspace root with `..`, and refuses a
+re-rooted path that resolves outside the reference workspace through a symlink.
+The control leg runs the organizer's tree and nothing else.
 
-6. Run the full suites and clippy:
+## 6. Wire the box
 
-```sh
-cargo test -p benchd --bin benchd
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+A ranked job needs both of these:
+
+| variable | meaning |
+|---|---|
+| `MLXFAST_BASELINE_WORKSPACE` | the built reference tree on this box |
+| `MLXFAST_BASELINE_CALIBRATION` | this box's calibration file |
+
+Both are required on the ranked path. benchd refuses by name when either is
+absent or does not match this track and this box. The `--baseline-workspace`,
+`--baseline-calibration` and `--box` flags name the same values on the command
+line.
+
+## 7. The per-leg resident engine (CUDA)
+
+On MLX the worker holds the model, so benchd's own worker spawn IS the
+residency, and nothing else runs.
+
+On CUDA the worker is an adapter over a resident engine, and each leg needs its
+own resident from its own tree. benchd boots and tears one down per leg through
+a fixed convention. Both commands run with the working directory set to that
+leg's workspace:
+
+```
+<workspace>/tools/serve-up.sh --boot --spec <serial|mtp> --draft-len <N> --socket-out <FILE>
+<workspace>/tools/serve-up.sh --stop --socket <PATH>
 ```
 
-## 8. What a value must never be
+`--boot` boots exactly one resident, waits until it answers a healthy hello,
+writes the resident's Unix-socket path as the first line of `<FILE>`, and exits
+0 with the resident still running. `--stop` tears it down. Leg 1 is always
+booted `--spec serial --draft-len 0`, whatever the submission declares.
 
-- Never type a number from memory or from another track. The gemma values
-  and the Qwen 3.8 27B values are not valid for these tracks.
-- Never put a number in place of a sentinel on one side only.
-- Never capture on a box that is not `ai-server`, or from an engine head that
-  is not the merged and verified head.
+Do NOT wrap benchd in `tools/serve-up.sh`. benchd runs it itself, twice. A
+resident socket inherited from benchd's own environment is refused by name
+(`LEG-SERVE-INHERITED-SOCKET`): one resident for both legs would price the
+candidate against itself.
+
+## 8. Refusals, by name
+
+| name | meaning |
+|---|---|
+| `BASELINE-WORKSPACE-MISSING` | no reference tree was named, or it is not a directory |
+| `BASELINE-WORKSPACE-NO-ENGINE` | the tree holds no engine at the candidate's own relative path |
+| `BASELINE-WORKSPACE-NO-WEIGHTS` | the tree holds no weights at the candidate's own relative path |
+| `BASELINE-ENGINE-NOT-ROOT-RELATIVE` | the candidate engine is not addressable from the workspace root, or its re-rooted path leaves the reference tree |
+| `BASELINE-WEIGHTS-NOT-ROOT-RELATIVE` | the candidate weights' re-rooted path leaves the reference tree |
+| `BASELINE-CALIBRATION-MISSING` | no calibration file was named, or it could not be read |
+| `BASELINE-CALIBRATION-INVALID` | the file is not a valid version-1 calibration |
+| `BASELINE-CALIBRATION-TRACK-MISMATCH` | the file names another track |
+| `BASELINE-CALIBRATION-BOX-MISMATCH` | the file was captured on another box |
+| `BASELINE-CALIBRATION-PROMPT-MISMATCH` | the file was captured on another prompt than the golden this run measures |
+| `BASELINE-BOX-UNRESOLVED` | neither `RUNNER_NAME` nor `--box` names this box |
+| `SERIAL-CONTROL-LEG-FAILED` | the control leg did not complete |
+| `SERIAL-CONTROL-LEG-OUTSIDE-BAND` | the control leg is outside this box's band |
+| `GOLDEN-CARRIES-STORED-BASELINE` | the golden still declares a baseline pair |
+| `STORED-BASELINE-OVERRIDE-REFUSED` | `MLXFAST_PAIRED_BASELINE_*` or `--baseline-*` reached the ranked path |
+| `CALIBRATION-CV-EXCEEDED` | the calibration passes vary by more than 1 % |
+| `LEG-SERVE-SCRIPT-MISSING` | a leg's tree holds no `tools/serve-up.sh` |
+| `LEG-SERVE-BOOT-FAILED` | a leg's resident did not boot |
+| `LEG-SERVE-INHERITED-SOCKET` | a resident socket was inherited instead of booted per leg |
+
+## 9. Local runs
+
+A participant iterates locally without a reference tree. `--mode local-iterate`
+and `--mode local-submit` therefore keep working on these tracks:
+
+* With NO reference tree named, the run measures the CANDIDATE LEG ONLY and
+  seals NO score. It writes the real timings, the real correctness verdict,
+  `score: null`, an empty `metrics.error`, and
+  `baseline_source: "none (local mode: unscored)"`. The printed summary reports
+  the candidate leg in tokens per second. The run is not a failure; it simply
+  has no denominator, and a score with no denominator is not a score.
+* With BOTH `MLXFAST_BASELINE_WORKSPACE` and `MLXFAST_BASELINE_CALIBRATION`
+  present, the local modes run the FULL PAIRED PATH, exactly as ranked: the
+  control leg, the band check, the candidate leg, and the live ratio.
+
+Half the inputs is not the paired path. One leg cannot be checked against a band
+that is not there, so a run with only one of the two takes the unscored branch.
+
+## 10. What the run seals
+
+A ranked paired run seals these fields in `score.json` `metrics`:
+
+- `baseline_source` — `serial-control-leg`.
+- `baseline_box`, `baseline_calibration_sha256`, `baseline_reference_commit`.
+- `baseline_band_passed`.
+- `baseline_leg_prefill_seconds_per_token`,
+  `baseline_leg_decode_seconds_per_token` — leg 1's measurement.
+- `candidate_leg_prefill_seconds_per_token`,
+  `candidate_leg_decode_seconds_per_token` — leg 2's measurement.
+
+`baseline_prefill_seconds_per_token` and `baseline_decode_seconds_per_token`
+carry the leg-1 values, so the board reads them unchanged.
+`prefill_speedup`, `decode_speedup` and the score are the live ratios.

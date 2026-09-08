@@ -339,6 +339,18 @@ official_benchd_run() {
   if [ -n "${OFFICIAL_PIN_SHA:-}" ] && [ -n "${OFFICIAL_PIN_BYTES:-}" ]; then
     pin=(--golden-sha256 "$OFFICIAL_PIN_SHA" --golden-bytes "$OFFICIAL_PIN_BYTES")
   fi
+  # THE RANKED PAIRED PATH's two runner inputs (David 2026-09-08). A live-control-leg track
+  # measures its own denominator on the box: leg 1 runs on the organizer-staged REFERENCE tree
+  # and leg 2 on the submission tree. Both are forwarded when the box names them; benchd also
+  # reads the same two environment variables itself, so a box that exports them and a driver
+  # that forwards them agree.
+  local paired=()
+  if [ -n "${MLXFAST_BASELINE_WORKSPACE:-}" ]; then
+    paired+=(--baseline-workspace "$MLXFAST_BASELINE_WORKSPACE")
+  fi
+  if [ -n "${MLXFAST_BASELINE_CALIBRATION:-}" ]; then
+    paired+=(--baseline-calibration "$MLXFAST_BASELINE_CALIBRATION")
+  fi
   # shellcheck disable=SC2086
   env \
     MLXFAST_USE_RUNTIME_WORKER=1 \
@@ -349,6 +361,7 @@ official_benchd_run() {
       --weights "$WEIGHTS" \
       --golden "$OFFICIAL_GOLDEN" \
       ${pin[@]+"${pin[@]}"} \
+      ${paired[@]+"${paired[@]}"} \
       --mode official \
       --score-path "$dir/score.json" \
     > "$dir/stdout" 2> "$dir/stderr"

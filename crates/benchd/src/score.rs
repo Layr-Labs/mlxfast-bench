@@ -311,6 +311,65 @@ pub struct ScoreMetrics {
         skip_serializing_if = "Option::is_none"
     )]
     pub resident_load_epoch: Option<u64>,
+    /// ADDITIVE — THE PAIRED-BASELINE SEAL (David 2026-09-08). WHERE the denominator came from:
+    /// `"serial-control-leg"` says it was MEASURED, on this box, in this job, on the reference
+    /// tree, immediately before the candidate leg. Absent on every path that did not measure a
+    /// control leg, so an absent key is not a claim about one.
+    #[serde(rename = "baseline_source", skip_serializing_if = "Option::is_none")]
+    pub baseline_source: Option<String>,
+    /// ADDITIVE — the ranked BOX the paired run measured both legs on (the runner name the
+    /// calibration file names). IDENTITY, never an input to the score.
+    #[serde(rename = "baseline_box", skip_serializing_if = "Option::is_none")]
+    pub baseline_box: Option<String>,
+    /// ADDITIVE — the digest of the per-box calibration FILE this run checked its control leg
+    /// against. The file is a health band, never a denominator; the digest states which band.
+    #[serde(
+        rename = "baseline_calibration_sha256",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub baseline_calibration_sha256: Option<String>,
+    /// ADDITIVE — the reference tree's engine commit the calibration was captured at.
+    #[serde(
+        rename = "baseline_reference_commit",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub baseline_reference_commit: Option<String>,
+    /// ADDITIVE — whether the measured control leg sat inside this box's band. It is `true`
+    /// wherever it is present: a leg outside the band seals no score at all, so `false` never
+    /// reaches a sealed artifact. It is sealed so a reader can see the gate ran.
+    #[serde(
+        rename = "baseline_band_passed",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub baseline_band_passed: Option<bool>,
+    /// ADDITIVE — the SERIAL-CONTROL leg's measured prefill seconds-per-token. The same value
+    /// [`ScoreMetrics::baseline_prefill_seconds_per_token`] carries, named for what it is.
+    #[serde(
+        rename = "baseline_leg_prefill_seconds_per_token",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub baseline_leg_prefill_seconds_per_token: Option<f64>,
+    /// ADDITIVE — the SERIAL-CONTROL leg's measured decode seconds-per-token.
+    #[serde(
+        rename = "baseline_leg_decode_seconds_per_token",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub baseline_leg_decode_seconds_per_token: Option<f64>,
+    /// ADDITIVE — the CANDIDATE leg's measured prefill seconds-per-token, READ BACK from
+    /// [`ScoreMetrics::prefill_seconds_per_token`] so the two cannot drift. Absent when the
+    /// candidate leg produced no timing.
+    #[serde(
+        rename = "candidate_leg_prefill_seconds_per_token",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub candidate_leg_prefill_seconds_per_token: Option<f64>,
+    /// ADDITIVE — the CANDIDATE leg's measured decode seconds-per-token, READ BACK from
+    /// [`ScoreMetrics::decode_seconds_per_token`].
+    #[serde(
+        rename = "candidate_leg_decode_seconds_per_token",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub candidate_leg_decode_seconds_per_token: Option<f64>,
 }
 
 /// One timed prompt's board-facing record, sealed in [`ScoreMetrics::per_prompt`].
@@ -478,6 +537,18 @@ impl ScoreMetrics {
             runner_build: self.runner_build.clone(),
             resident_pid: self.resident_pid,
             resident_load_epoch: self.resident_load_epoch,
+            // The PAIRED-BASELINE seal is carried VERBATIM. Its two leg pairs mirror the ranking
+            // fields `baseline_*_seconds_per_token` / `*_seconds_per_token`, which are not
+            // coarsened either, and the rest is identity.
+            baseline_source: self.baseline_source.clone(),
+            baseline_box: self.baseline_box.clone(),
+            baseline_calibration_sha256: self.baseline_calibration_sha256.clone(),
+            baseline_reference_commit: self.baseline_reference_commit.clone(),
+            baseline_band_passed: self.baseline_band_passed,
+            baseline_leg_prefill_seconds_per_token: self.baseline_leg_prefill_seconds_per_token,
+            baseline_leg_decode_seconds_per_token: self.baseline_leg_decode_seconds_per_token,
+            candidate_leg_prefill_seconds_per_token: self.candidate_leg_prefill_seconds_per_token,
+            candidate_leg_decode_seconds_per_token: self.candidate_leg_decode_seconds_per_token,
         }
     }
 }
@@ -662,6 +733,15 @@ mod tests {
             runner_build: None,
             resident_pid: None,
             resident_load_epoch: None,
+            baseline_source: None,
+            baseline_box: None,
+            baseline_calibration_sha256: None,
+            baseline_reference_commit: None,
+            baseline_band_passed: None,
+            baseline_leg_prefill_seconds_per_token: None,
+            baseline_leg_decode_seconds_per_token: None,
+            candidate_leg_prefill_seconds_per_token: None,
+            candidate_leg_decode_seconds_per_token: None,
         }
     }
 

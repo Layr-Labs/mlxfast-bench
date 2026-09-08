@@ -1,92 +1,102 @@
-//! `calibrate-baseline` — turn a track's CAPTURE RECORDS into the pinned official baseline.
+//! `benchd calibrate-baseline` — measure ONE box's serial-control band, once, on that box.
 //!
-//! The calibration has two halves, and this verb is the SECOND one. The first half already
-//! exists and is not re-invented here: `benchd iterate --capture-baseline <REC>
-//! --capture-passes <W,A,A,...>` runs the listed legs over ONE resident engine on the official
-//! measurement path — same `iterate_flow_windowed`, same decode window, same golden-oracle
-//! workload the scored run times — and appends each leg's parent-measured
-//! prefill/decode seconds-per-token to the record ([`crate::capture`]). Every one of those legs
-//! is SERIAL by construction: `run_capture_passes_over_session` puts no spec on the wire, the
-//! spec flags are refused beside `--capture-baseline` at parse, and
-//! [`crate::capture::refuse_spec_armed_engine`] refuses a leg whose engine speculated anyway.
+//! Under the paired ranked design (David 2026-09-08) a ranked run measures its OWN denominator: a
+//! SERIAL-CONTROL leg on the organizer-staged reference tree, on the box, in the same job. Nothing
+//! is pinned in the constants, in a fixture or in a golden. What a box still needs is a HEALTH
+//! BAND: a statement of what that box's control leg costs when the box is well, so a ranked run can
+//! refuse a leg that is not.
 //!
-//! What was missing is the DECISION the records feed: is the spread small enough for the mean to
-//! describe the box, and what exactly gets pinned where. That is this verb:
+//! This verb writes that statement. It runs the SAME function the ranked leg 1 runs
+//! ([`crate::official::run_serial_control_leg`]) `--passes` times, under the full official
+//! methodology — the per-platform prefill warm-up, the unmeasured warmup leg, one resident worker
+//! per pass, the cool gate before every timed phase, the live golden's own oracle — then writes the
+//! per-box calibration file. It refuses by name
+//! ([`bench_core::constants::CALIBRATION_CV_EXCEEDED`]) when the passes vary by more than the fixed
+//! maximum: a box that noisy has no mean that describes it, so it has no band either.
 //!
-//! * it recomputes each record's per-axis SAMPLE CV from the legs themselves (never trusting the
-//!   number the record carries) and refuses by name — [`CALIBRATION_CV_EXCEEDED`] — above
-//!   [`CALIBRATION_MAX_CV_PERCENT`];
-//! * it prints the baseline PAIR (the mean of the legs, per axis, at full f64 precision);
-//! * it prints the exact `OFFICIAL_BASELINES_BY_TRACK` constants patch for the track's platform
-//!   constant, and the `baseline_*_seconds_per_token` fields each golden's `benchmark` block
-//!   needs (the golden recorder writes both as `null`).
-//!
-//! It APPLIES NOTHING. The patch is text for a reviewed PR against `bench-core`, and the golden
-//! fields are text for the golden re-author — pinning a scored denominator is David's call, not a
-//! tool's.
+//! It is an ORGANIZER step, run once per ranked box (and again after an organizer re-baseline
+//! moves the reference tree). It writes NO score and NO integrity sidecar.
 
-use bench_core::constants::{Platform, CALIBRATION_CV_EXCEEDED, CALIBRATION_MAX_CV_PERCENT};
+use crate::baseline;
+use crate::iterate::Mode;
+use bench_runner::{ChildStdioTransport, RunnerError, Session};
 use std::path::{Path, PathBuf};
 
 pub const USAGE: &str = "\
-benchd calibrate-baseline — gate a track's capture records and print the baseline pin
+benchd calibrate-baseline — measure this box's serial-control health band
 
 USAGE:
-    benchd calibrate-baseline --record <REC> [--record <REC> ...]
-                                [--track <TRACK-ID>] [--pin <RECORD-STEM>]
-                                [--json-out <PATH>]
+    benchd calibrate-baseline --baseline-workspace <DIR> --engine <PATH> --golden <PATH>
+                              --out <FILE> [--weights <DIR>] [--passes N] [--box <RUNNER>]
 
-The records are the files `benchd iterate --capture-baseline <REC> --capture-passes <SPEC>`
-wrote — one per timed-pool golden, each holding that golden's N serial legs measured over one
-resident engine on the official measurement path.
+The verb runs the RANKED path's own serial-control leg `--passes` times on the reference tree and
+writes the per-box calibration file the ranked path checks its leg against. Run it ON the ranked
+box, and again whenever the organizer re-baselines the reference tree.
+
+REQUIRED:
+    --baseline-workspace <DIR>   The built REFERENCE tree on this box (default: env
+                                 MLXFAST_BASELINE_WORKSPACE).
+    --engine <PATH>              The engine executable INSIDE that tree, as a path relative to the
+                                 workspace root (the same relative path a ranked run gives for the
+                                 candidate).
+    --golden <PATH>              The track's LIVE golden — the one fixed prompt both ranked legs
+                                 measure.
+    --out <FILE>                 Where to write the calibration file.
 
 OPTIONS:
-    --record <REC>       A capture record (repeatable; at least one). Its file STEM names the
-                         golden in the report and in the golden-field block.
-    --track <TRACK-ID>   The track being calibrated (default: env MLXFAST_QWEN_MTP_TRACK_ID).
-                         Its `-{platform}-v{N}` suffix names the constant the patch patches, and
-                         every record must declare this same track.
-    --pin <STEM>         WHICH record's pair becomes the platform constant (the track's required
-                         default; each golden still carries its own pair). Required when more
-                         than one record is given.
-    --json-out <PATH>    Also write the whole report as JSON.
-    -h, --help           Show this help
+    --weights <DIR>              The transformed weights the control leg loads. Default:
+                                 <baseline-workspace>/weights, the reference tree's OWN transform
+                                 output. Name another directory only for a track whose weights are
+                                 an organizer-staged tree outside every checkout.
+    --passes <N>                 Control legs to measure (default 4; at least 2, because the file
+                                 records a coefficient of variation).
+    --box <RUNNER>               The runner name this box answers to (default: env RUNNER_NAME).
+                                 The ranked run refuses a calibration captured on another box.
+    --track <TRACK-ID>           The track being calibrated (default: env
+                                 MLXFAST_QWEN_MTP_TRACK_ID).
+    --prompt <NAME>              The golden's prompt name recorded in the file (default: the
+                                 golden's file stem).
+    --reference-commit <SHA40>   The reference tree's engine commit (default: `git -C
+                                 <baseline-workspace> rev-parse HEAD`).
+    --benchd-source-commit <SHA40>
+                                 The benchd commit that measured the legs (default: env
+                                 MLXFAST_BENCHD_SOURCE_COMMIT). benchd cannot resolve its own
+                                 source from a deployed binary, so one of the two must be given.
+    --engine-resource <NAME=PATH>
+                                 Repeatable out-of-checkpoint input, passed to every worker spawn
+                                 exactly as `benchd iterate` passes it.
+    --no-cool-gate               Skip the pre-phase GPU cool gate (dev only; a calibration that
+                                 skipped it does not describe a cool box).
+    -h, --help                   Show this help
 
 REFUSALS (by name):
-    CALIBRATION-CV-EXCEEDED   a record's per-axis sample CV exceeds the fixed maximum
-    CALIBRATION-SPEC-ARMED    (raised by `iterate --capture-baseline`) a leg was not serial
+    BASELINE-WORKSPACE-MISSING     no reference tree was named, or it is not a directory
+    BASELINE-WORKSPACE-NO-ENGINE   the tree holds no engine at the given relative path
+    BASELINE-WORKSPACE-NO-WEIGHTS  the tree holds no transform output to measure against
+    BASELINE-BOX-UNRESOLVED        neither RUNNER_NAME nor --box names this box
+    SERIAL-CONTROL-LEG-FAILED      a control leg did not complete
+    CALIBRATION-CV-EXCEEDED        the legs vary by more than the fixed maximum
 ";
 
-/// One record's verdict: the legs, their per-axis sample CV, and the mean pair they pin.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct RecordVerdict {
-    /// The record file's stem — the golden this pair belongs to.
-    pub name: String,
-    pub path: String,
-    pub run_count: usize,
-    pub prefill_seconds_per_token: f64,
-    pub decode_seconds_per_token: f64,
-    pub prefill_cv_percent: f64,
-    pub decode_cv_percent: f64,
-    pub golden_sha256: String,
-    pub engine_sha256: String,
-    pub weights_sha256: String,
-    pub benchd_sha256: String,
-    pub decode_steps: i64,
-    pub mode: String,
-}
+/// The environment variable naming the benchd source commit, for boxes that run a deployed binary.
+pub const BENCHD_SOURCE_COMMIT_ENV: &str = "MLXFAST_BENCHD_SOURCE_COMMIT";
 
-/// The whole calibration: every record's verdict, plus the pair that gets pinned as the
-/// platform constant and the two patches an operator applies by hand.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct CalibrationReport {
-    pub track_id: String,
-    pub platform: String,
-    pub max_cv_percent: f64,
-    pub records: Vec<RecordVerdict>,
-    pub pinned_record: String,
-    pub constants_patch: String,
-    pub golden_fields: Vec<String>,
+/// The parsed command line.
+#[derive(Debug)]
+struct Args {
+    baseline_workspace: PathBuf,
+    engine: String,
+    weights: PathBuf,
+    golden: PathBuf,
+    out: PathBuf,
+    passes: u32,
+    box_name: String,
+    track_id: String,
+    prompt: String,
+    reference_commit: String,
+    benchd_source_commit: String,
+    engine_resources: Vec<crate::engine_resource::EngineResource>,
+    cool_gate: bool,
 }
 
 pub fn run(args: &[String]) -> std::process::ExitCode {
@@ -95,10 +105,7 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
             print!("{USAGE}");
             std::process::ExitCode::SUCCESS
         }
-        Ok(Some(report)) => {
-            print!("{}", render(&report));
-            std::process::ExitCode::SUCCESS
-        }
+        Ok(Some(())) => std::process::ExitCode::SUCCESS,
         Err(msg) => {
             eprintln!("benchd calibrate-baseline: {msg}");
             std::process::ExitCode::from(1)
@@ -106,559 +113,358 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
     }
 }
 
-fn execute(args: &[String]) -> Result<Option<CalibrationReport>, String> {
-    let mut records: Vec<PathBuf> = Vec::new();
-    let mut track: Option<String> = None;
-    let mut pin: Option<String> = None;
-    let mut json_out: Option<PathBuf> = None;
+fn value<'a>(args: &'a [String], i: usize, name: &str) -> Result<&'a str, String> {
+    args.get(i + 1)
+        .map(|s| s.as_str())
+        .ok_or_else(|| format!("flag {name} requires a value"))
+}
+
+fn parse(args: &[String]) -> Result<Option<Args>, String> {
+    let mut workspace_flag: Option<PathBuf> = None;
+    let mut engine: Option<String> = None;
+    let mut weights: Option<PathBuf> = None;
+    let mut golden: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut passes: u32 = 4;
+    let mut box_flag: Option<String> = None;
+    let mut track_flag: Option<String> = None;
+    let mut prompt_flag: Option<String> = None;
+    let mut reference_commit_flag: Option<String> = None;
+    let mut benchd_commit_flag: Option<String> = None;
+    let mut engine_resources: Vec<crate::engine_resource::EngineResource> = Vec::new();
+    let mut cool_gate = true;
+
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "-h" | "--help" => return Ok(None),
-            "--record" => records.push(PathBuf::from(value(args, &mut i, "--record")?)),
-            "--track" => track = Some(value(args, &mut i, "--track")?),
-            "--pin" => pin = Some(value(args, &mut i, "--pin")?),
-            "--json-out" => json_out = Some(PathBuf::from(value(args, &mut i, "--json-out")?)),
-            other => return Err(format!("unknown argument {other:?}")),
+            "--baseline-workspace" => {
+                workspace_flag = Some(PathBuf::from(value(args, i, "--baseline-workspace")?));
+                i += 2;
+            }
+            "--engine" => {
+                engine = Some(value(args, i, "--engine")?.to_string());
+                i += 2;
+            }
+            "--weights" => {
+                weights = Some(PathBuf::from(value(args, i, "--weights")?));
+                i += 2;
+            }
+            "--golden" => {
+                golden = Some(PathBuf::from(value(args, i, "--golden")?));
+                i += 2;
+            }
+            "--out" => {
+                out = Some(PathBuf::from(value(args, i, "--out")?));
+                i += 2;
+            }
+            "--passes" => {
+                let v = value(args, i, "--passes")?;
+                passes = v
+                    .parse()
+                    .map_err(|_| format!("invalid u32 for --passes: {v:?}"))?;
+                i += 2;
+            }
+            "--box" => {
+                box_flag = Some(value(args, i, "--box")?.to_string());
+                i += 2;
+            }
+            "--track" => {
+                track_flag = Some(value(args, i, "--track")?.to_string());
+                i += 2;
+            }
+            "--prompt" => {
+                prompt_flag = Some(value(args, i, "--prompt")?.to_string());
+                i += 2;
+            }
+            "--reference-commit" => {
+                reference_commit_flag = Some(value(args, i, "--reference-commit")?.to_string());
+                i += 2;
+            }
+            "--benchd-source-commit" => {
+                benchd_commit_flag = Some(value(args, i, "--benchd-source-commit")?.to_string());
+                i += 2;
+            }
+            crate::engine_resource::ENGINE_RESOURCE_FLAG => {
+                crate::engine_resource::push_engine_resource(
+                    &mut engine_resources,
+                    value(args, i, crate::engine_resource::ENGINE_RESOURCE_FLAG)?,
+                )?;
+                i += 2;
+            }
+            "--no-cool-gate" => {
+                cool_gate = false;
+                i += 1;
+            }
+            other => return Err(format!("unknown flag {other:?}")),
         }
-        i += 1;
     }
-    if records.is_empty() {
-        return Err(
-            "missing required --record: a calibration is read from the capture records \
-                    `iterate --capture-baseline` wrote, and there is nothing to gate without one"
-                .to_string(),
-        );
+
+    let baseline_workspace = baseline::resolve_workspace(
+        workspace_flag.as_deref(),
+        std::env::var(baseline::BASELINE_WORKSPACE_ENV)
+            .ok()
+            .as_deref(),
+    )?;
+    let engine = engine.ok_or(
+        "missing required --engine (the engine's path relative to the reference workspace root)",
+    )?;
+    // DEFAULT: the reference tree's OWN transform output. A control leg must never load a
+    // participant-editable transform's output, and the reference tree is the organizer's.
+    let weights = weights.unwrap_or_else(|| baseline_workspace.join(baseline::TREE_WEIGHTS_DIR));
+    if !weights.is_dir() {
+        return Err(format!(
+            "{}: the control leg's weights directory {} is not a directory; the default is the \
+             reference tree's own transform output",
+            baseline::BASELINE_WORKSPACE_NO_WEIGHTS,
+            weights.display()
+        ));
     }
-    let track_id = track
-        .or_else(|| std::env::var("MLXFAST_QWEN_MTP_TRACK_ID").ok())
+    let golden = golden.ok_or("missing required --golden")?;
+    let out = out.ok_or("missing required --out")?;
+    if passes < 2 {
+        return Err(format!(
+            "--passes is {passes}: the calibration records a coefficient of variation, which needs \
+             at least 2 legs"
+        ));
+    }
+    let box_name = baseline::resolve_box_name(
+        box_flag.as_deref(),
+        std::env::var(baseline::RUNNER_NAME_ENV).ok().as_deref(),
+    )?;
+    let track_id = track_flag
+        .or_else(crate::env_track_id)
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .ok_or(
-            "missing track: pass --track or set MLXFAST_QWEN_MTP_TRACK_ID. The track names the \
-             platform constant this calibration pins, and a pair pinned under the wrong track is \
-             a live scoring defect",
+            "no track_id: pass --track or set MLXFAST_QWEN_MTP_TRACK_ID to the track this box is \
+             calibrated for",
         )?;
-    let platform = Platform::from_track_id(&track_id)?;
-    refuse_track_without_a_platform_constant(&track_id, platform)?;
+    // The prompt NAME is documentation, not a key: the golden's own bytes are what both legs
+    // measure. The file stem is the name the operator already uses for it.
+    // ONE rule for the prompt name, shared with the ranked run's own check: the calibrator
+    // records the golden it measured, and the ranked run names the golden it is measuring, and the
+    // two must be the same name.
+    let prompt = match prompt_flag {
+        Some(p) => p,
+        None => baseline::golden_prompt_name(&golden)
+            .ok_or("--golden has no file name to take a prompt name from; pass --prompt")?,
+    };
+    let reference_commit = match reference_commit_flag {
+        Some(c) => c.trim().to_string(),
+        None => git_head(&baseline_workspace).ok_or_else(|| {
+            format!(
+                "the reference tree {} has no readable git HEAD; pass --reference-commit <SHA40>",
+                baseline_workspace.display()
+            )
+        })?,
+    };
+    let benchd_source_commit = benchd_commit_flag
+        .or_else(|| std::env::var(BENCHD_SOURCE_COMMIT_ENV).ok())
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .ok_or(
+            "no benchd source commit: a deployed benchd cannot resolve its own source, so pass \
+             --benchd-source-commit <SHA40> or set MLXFAST_BENCHD_SOURCE_COMMIT",
+        )?;
 
-    let verdicts = records
-        .iter()
-        .map(|p| verdict_for(p, &track_id))
-        .collect::<Result<Vec<_>, String>>()?;
-    let pinned = resolve_pin(&verdicts, pin.as_deref())?;
-    let report = CalibrationReport {
-        constants_patch: constants_patch(platform, &verdicts[pinned]),
-        golden_fields: verdicts.iter().map(golden_fields).collect(),
-        pinned_record: verdicts[pinned].name.clone(),
+    Ok(Some(Args {
+        baseline_workspace,
+        engine,
+        weights,
+        golden,
+        out,
+        passes,
+        box_name,
         track_id,
-        platform: platform.key().to_string(),
-        max_cv_percent: CALIBRATION_MAX_CV_PERCENT,
-        records: verdicts,
+        prompt,
+        reference_commit,
+        benchd_source_commit,
+        engine_resources,
+        cool_gate,
+    }))
+}
+
+/// `git -C <dir> rev-parse HEAD`, trimmed; `None` on any failure.
+fn git_head(dir: &Path) -> Option<String> {
+    let out = std::process::Command::new("/usr/bin/git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn execute(args: &[String]) -> Result<Option<()>, String> {
+    let args = match parse(args)? {
+        Some(a) => a,
+        None => return Ok(None),
     };
-    if let Some(path) = json_out.as_ref() {
-        let json = serde_json::to_string_pretty(&report)
-            .map_err(|e| format!("calibration report serialize failed: {e}"))?;
-        std::fs::write(path, format!("{json}\n"))
-            .map_err(|e| format!("calibration report write failed ({}): {e}", path.display()))?;
-    }
-    Ok(Some(report))
-}
+    let platform = bench_core::constants::Platform::from_track_id(&args.track_id)?;
+    let identity = bench_core::constants::model_identity(&args.track_id)?;
+    let golden = crate::load_golden_checked(
+        &args.golden,
+        None,
+        Mode::Official.golden_required_steps(),
+        None,
+        &args.track_id,
+        &identity,
+    )?;
+    // A calibration is measured on the SAME golden a ranked run measures, so the same refusal
+    // applies: a golden carrying a stored pair belongs to the retired design.
+    baseline::refuse_golden_with_stored_pair(&golden)?;
 
-fn value(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
-    *i += 1;
-    args.get(*i)
-        .cloned()
-        .ok_or_else(|| format!("{flag} requires a value"))
-}
-
-/// The patch this verb emits names the PLATFORM constant (`OFFICIAL_BASELINE_{MLX,CUDA}`), which
-/// is what the two Qwen 3.8 125B-A6B rows of `OFFICIAL_BASELINES_BY_TRACK` resolve through. A
-/// track whose row carries its OWN literal pair (the gemma row, say) would be mis-patched by that
-/// text — the platform constant is not where its number lives — so it refuses instead of printing
-/// a patch that edits the wrong constant. The test is the two accessors AGREEING: a track that
-/// resolves through the platform constant reads the same state through both keys.
-fn refuse_track_without_a_platform_constant(
-    track_id: &str,
-    platform: Platform,
-) -> Result<(), String> {
-    let through_track = bench_core::constants::official_baseline(track_id).ok();
-    if through_track == platform.official_baseline_declared() {
-        return Ok(());
-    }
-    Err(format!(
-        "track {track_id:?} does not resolve its official baseline through the platform constant \
-         OFFICIAL_BASELINE_{}: its OFFICIAL_BASELINES_BY_TRACK row carries its own pair, so the \
-         constants patch this verb prints would edit a constant that track never reads. Pin that \
-         row by hand",
-        platform.key().to_uppercase()
-    ))
-}
-
-/// Read one capture record, recompute its statistics from the LEGS, and apply the CV gate.
-fn verdict_for(path: &Path, track_id: &str) -> Result<RecordVerdict, String> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("capture record read failed ({}): {e}", path.display()))?;
-    let record: crate::capture::CaptureRecord = serde_json::from_slice(&bytes)
-        .map_err(|e| format!("capture record at {} did not parse: {e}", path.display()))?;
-    let name = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default()
-        .to_string();
-    if record.identity.track_id.trim() != track_id {
-        return Err(format!(
-            "capture record {} declares track {:?} but this calibration is for {track_id:?} — one \
-             calibration pins ONE track's pair, and mixing records would average two tracks into a \
-             number that describes neither",
-            path.display(),
-            record.identity.track_id
-        ));
-    }
-    let prefill: Vec<f64> = record
-        .runs
-        .iter()
-        .map(|r| r.prefill_seconds_per_token)
-        .collect();
-    let decode: Vec<f64> = record
-        .runs
-        .iter()
-        .map(|r| r.decode_seconds_per_token)
-        .collect();
-    // Recomputed from the legs, never read off the record: the record's own CV fields are a
-    // convenience the capture writer stamped, and a gate that trusts its input gates nothing.
-    let mut cvs = Vec::with_capacity(2);
-    for (axis, values) in [("prefill", &prefill), ("decode", &decode)] {
-        let cv = crate::capture::sample_cv_percent(values).ok_or_else(|| {
-            format!(
-                "capture record {} carries {} {axis} leg(s): the sample CV is undefined below two \
-                 legs, so there is no evidence the mean describes the box",
-                path.display(),
-                values.len()
-            )
-        })?;
-        if cv > CALIBRATION_MAX_CV_PERCENT {
-            return Err(format!(
-                "{CALIBRATION_CV_EXCEEDED}: capture record {} has {axis} sample CV {cv:.4}% over \
-                 {} leg(s), above the {CALIBRATION_MAX_CV_PERCENT}% maximum. The box was not quiet \
-                 enough for the mean to describe it; re-run the calibration rather than pinning a \
-                 pair the next run would not reproduce",
-                path.display(),
-                values.len()
-            ));
-        }
-        cvs.push(cv);
-    }
-    let mean = |values: &[f64], axis: &str| -> Result<f64, String> {
-        crate::capture::mean(values).ok_or_else(|| {
-            format!(
-                "capture record {} has no finite {axis} mean over its legs",
-                path.display()
-            )
-        })
+    // The engine lives INSIDE the reference tree, at the relative path the operator gave.
+    let engine =
+        baseline::reference_engine_path(&args.engine, Path::new(""), &args.baseline_workspace)?;
+    let engine_str = engine.to_string_lossy().to_string();
+    let weights_str = args.weights.to_string_lossy().to_string();
+    let sandbox = if cfg!(target_os = "macos") {
+        // The engine is the REFERENCE tree's own, resolved from --baseline-workspace, so the
+        // `MLXFAST_RUNTIME_WORKER_EXECUTABLE` override is deliberately not honoured here.
+        Some(crate::resolve_official_sandbox_from_env(
+            &engine_str,
+            &args.golden,
+            false,
+        )?)
+    } else {
+        None
     };
-    Ok(RecordVerdict {
-        name,
-        path: path.display().to_string(),
-        run_count: record.run_count,
-        prefill_seconds_per_token: mean(&prefill, "prefill")?,
-        decode_seconds_per_token: mean(&decode, "decode")?,
-        prefill_cv_percent: cvs[0],
-        decode_cv_percent: cvs[1],
-        golden_sha256: record.identity.golden_sha256,
-        engine_sha256: record.identity.engine_sha256,
-        weights_sha256: record.identity.weights_sha256,
-        benchd_sha256: record.identity.benchd_sha256,
-        decode_steps: record.identity.decode_steps,
-        mode: record.identity.mode,
-    })
-}
-
-/// WHICH record's pair becomes the platform constant. One record needs no choice; more than one
-/// does, and guessing (the first, the fastest) would pin a denominator nobody chose.
-fn resolve_pin(verdicts: &[RecordVerdict], pin: Option<&str>) -> Result<usize, String> {
-    match (pin, verdicts.len()) {
-        (None, 1) => Ok(0),
-        (None, n) => Err(format!(
-            "--pin is required with {n} records: the platform constant is ONE pair (the track's \
-             required default), and this calibration measured {n} goldens. Name the record whose \
-             pair it takes: {:?}",
-            verdicts.iter().map(|v| &v.name).collect::<Vec<_>>()
-        )),
-        (Some(stem), _) => verdicts.iter().position(|v| v.name == stem).ok_or_else(|| {
-            format!(
-                "--pin {stem:?} names no record in this calibration: {:?}",
-                verdicts.iter().map(|v| &v.name).collect::<Vec<_>>()
-            )
-        }),
+    // The calibration passes run the RANKED leg-1 shape exactly, including its per-leg engine
+    // lifecycle: on a platform whose worker is an adapter over a resident engine, each pass boots
+    // the reference tree's own resident and tears it down again.
+    let leg_serve = crate::legserve::leg_serve_required(platform);
+    if leg_serve {
+        crate::legserve::refuse_inherited_socket(
+            std::env::var(crate::legserve::DS4_RESIDENT_SOCKET_ENV)
+                .ok()
+                .as_deref(),
+            std::env::var(crate::legserve::BENCH_WORKER_RESIDENT_SOCKET_ENV)
+                .ok()
+                .as_deref(),
+        )?;
     }
-}
-
-/// The exact `bench-core` constants patch: the platform constant `OFFICIAL_BASELINES_BY_TRACK`
-/// resolves the track through, at full f64 precision (`{:?}` is the shortest text that round-trips
-/// to the same bits, so the pinned value IS the measured mean).
-pub fn constants_patch(platform: Platform, pinned: &RecordVerdict) -> String {
-    format!(
-        "pub const OFFICIAL_BASELINE_{}: Option<OfficialBaseline> = Some(OfficialBaseline {{\n    \
-         prefill_seconds_per_token: {:?},\n    decode_seconds_per_token: {:?},\n    bands: \
-         MTP_SINGLE_LEG_BANDS,\n}});\n",
-        platform.key().to_uppercase(),
-        pinned.prefill_seconds_per_token,
-        pinned.decode_seconds_per_token,
-    )
-}
-
-/// The two fields the golden recorder writes as `null` (`record-correctness-golden.rs`,
-/// `BenchmarkGolden::baseline_*_seconds_per_token`) and the official run REQUIRES
-/// (`resolve_paired_baselines`): each timed-pool golden carries its OWN measured pair.
-pub fn golden_fields(v: &RecordVerdict) -> String {
-    format!(
-        "{}.golden.json  (\"benchmark\" block)\n    \"baseline_prefill_seconds_per_token\": \
-         {:?},\n    \"baseline_decode_seconds_per_token\": {:?}\n",
-        v.name, v.prefill_seconds_per_token, v.decode_seconds_per_token
-    )
-}
-
-pub fn render(report: &CalibrationReport) -> String {
-    let mut out = format!(
-        "benchd calibrate-baseline — track {} (platform {})\n\nCV GATE: sample CV <= {}% on \
-         BOTH axes, {} record(s) — PASS\n\n",
-        report.track_id,
-        report.platform,
-        report.max_cv_percent,
-        report.records.len()
+    let residency = crate::worker_residency(
+        platform,
+        leg_serve || std::env::var_os(crate::legserve::DS4_RESIDENT_SOCKET_ENV).is_some(),
     );
-    for v in &report.records {
-        out.push_str(&format!(
-            "{}  legs={}  mode={}  decode_steps={}\n  prefill {:?} s/tok  (CV {:.4}%)\n  decode  \
-             {:?} s/tok  (CV {:.4}%)\n  golden {}  engine {}\n  weights {}  benchd {}\n",
-            v.name,
-            v.run_count,
-            v.mode,
-            v.decode_steps,
-            v.prefill_seconds_per_token,
-            v.prefill_cv_percent,
-            v.decode_seconds_per_token,
-            v.decode_cv_percent,
-            v.golden_sha256,
-            v.engine_sha256,
-            v.weights_sha256,
-            v.benchd_sha256,
-        ));
+
+    let cool_gate_on = args.cool_gate;
+    let mut cool_gate = move |phase: &str| -> Result<(), RunnerError> {
+        if !cool_gate_on {
+            return Ok(());
+        }
+        crate::coolgate::cool_gate(phase, platform)
+    };
+
+    let mut prefill_legs: Vec<f64> = Vec::with_capacity(args.passes as usize);
+    let mut decode_legs: Vec<f64> = Vec::with_capacity(args.passes as usize);
+    for pass in 1..=args.passes {
+        // ALWAYS SERIAL: a control leg is the serial denominator, so the resident boots serial.
+        let serve = if leg_serve {
+            Some(crate::legserve::boot_leg(
+                &args.baseline_workspace,
+                None,
+                "serial-control",
+            )?)
+        } else {
+            None
+        };
+        let leg_env = serve.as_ref().map(|s| s.spawn_env()).unwrap_or_default();
+        let spawn = || -> bench_runner::Result<Session<ChildStdioTransport>> {
+            let transport = crate::spawn_official_worker(
+                sandbox.as_ref(),
+                &engine_str,
+                &weights_str,
+                &args.engine_resources,
+                &leg_env,
+            )?;
+            let (session, _hello) = Session::connect(transport)?;
+            Ok(session)
+        };
+        let measured = crate::official::run_serial_control_leg(
+            &golden,
+            residency,
+            platform,
+            spawn,
+            &mut cool_gate,
+        );
+        // The pass's resident goes down before the next pass's comes up, on success and failure
+        // alike — one resident at a time, exactly as the ranked run holds one leg at a time.
+        drop(serve);
+        let leg = measured.map_err(|e| format!("pass {pass}/{}: {e}", args.passes))?;
+        eprintln!(
+            "benchd calibrate-baseline: pass {pass}/{} measured prefill {} s/tok, decode {} s/tok",
+            args.passes, leg.prefill_seconds_per_token, leg.decode_seconds_per_token
+        );
+        prefill_legs.push(leg.prefill_seconds_per_token);
+        decode_legs.push(leg.decode_seconds_per_token);
     }
-    out.push_str(&format!(
-        "\n--- crates/bench-core/src/constants.rs (pinned from record {:?}) ---\n{}",
-        report.pinned_record, report.constants_patch
-    ));
-    out.push_str("\n--- correctness_prompts/<track>/*.golden.json ---\n");
-    for fields in &report.golden_fields {
-        out.push_str(fields);
-    }
-    out.push_str("\nAPPLIED NOTHING: pinning a scored denominator is a reviewed PR, not a tool.\n");
-    out
+
+    let captured_at = crate::iterate::iso8601_now();
+    let calibration = baseline::calibration_from_passes(
+        &baseline::CalibrationIdentity {
+            track_id: &args.track_id,
+            box_name: &args.box_name,
+            reference_commit: &args.reference_commit,
+            prompt: &args.prompt,
+            benchd_source_commit: &args.benchd_source_commit,
+            captured_at: &captured_at,
+        },
+        &prefill_legs,
+        &decode_legs,
+    )?;
+    let sha256 = baseline::write_calibration(&args.out, &calibration)?;
+    eprintln!(
+        "benchd calibrate-baseline: wrote {} (sha256 {sha256}) — box {:?}, track {:?}, {} passes, \
+         prefill mean {} s/tok (CV {:.4}%), decode mean {} s/tok (CV {:.4}%); no score was written",
+        args.out.display(),
+        calibration.box_name,
+        calibration.track_id,
+        calibration.passes,
+        calibration.prefill_seconds_per_token_mean,
+        calibration.prefill_cv * 100.0,
+        calibration.decode_seconds_per_token_mean,
+        calibration.decode_cv * 100.0,
+    );
+    Ok(Some(()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::{CaptureIdentity, CaptureRecord, CaptureRun};
 
-    const CUDA_TRACK: &str = "qwen3.8-125b-a6b-cuda-v1";
+    #[test]
+    fn help_and_unknown_flags_are_answered_at_parse() {
+        assert!(parse(&["-h".to_string()]).unwrap().is_none());
+        assert!(parse(&["--help".to_string()]).unwrap().is_none());
+        let err = parse(&["--nope".to_string()]).unwrap_err();
+        assert!(err.contains("--nope"), "{err}");
+        let err = parse(&["--passes".to_string()]).unwrap_err();
+        assert!(err.contains("--passes"), "{err}");
+    }
 
-    fn record(track: &str, runs: &[(f64, f64)]) -> CaptureRecord {
-        let mut acc: Option<CaptureRecord> = None;
-        for (p, d) in runs {
-            acc = Some(
-                crate::capture::merge(
-                    acc,
-                    CaptureIdentity {
-                        track_id: track.to_string(),
-                        mode: "local-iterate".to_string(),
-                        decode_steps: 128,
-                        engine_sha256: "e".repeat(64),
-                        weights_sha256: "w".repeat(64),
-                        golden_sha256: "g".repeat(64),
-                        benchd_sha256: "b".repeat(64),
-                    },
-                    CaptureRun {
-                        prefill_seconds_per_token: *p,
-                        decode_seconds_per_token: *d,
-                    },
-                )
-                .unwrap(),
-            );
+    /// The usage text states every refusal the verb can raise BY NAME, so an operator can grep the
+    /// help for the message their run stopped on.
+    #[test]
+    fn the_usage_names_every_refusal() {
+        for name in [
+            baseline::BASELINE_WORKSPACE_MISSING,
+            baseline::BASELINE_WORKSPACE_NO_ENGINE,
+            baseline::BASELINE_BOX_UNRESOLVED,
+            crate::official::SERIAL_CONTROL_LEG_FAILED,
+            bench_core::constants::CALIBRATION_CV_EXCEEDED,
+        ] {
+            assert!(USAGE.contains(name), "the usage must name {name}");
         }
-        acc.unwrap()
-    }
-
-    fn write(dir: &Path, name: &str, record: &CaptureRecord) -> PathBuf {
-        let path = dir.join(name);
-        std::fs::write(&path, serde_json::to_string_pretty(record).unwrap()).unwrap();
-        path
-    }
-
-    fn tmpdir(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("benchd-calibrate-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn argv(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(|s| s.to_string()).collect()
-    }
-
-    /// The HAPPY path end to end: four quiet legs pass the gate, the pair is their MEAN at full
-    /// precision, and the emitted patch is the exact `OFFICIAL_BASELINE_CUDA` text a reviewer
-    /// applies. The golden-field block carries the same pair, which is what the golden recorder
-    /// left as `null`.
-    #[test]
-    fn quiet_legs_pin_their_mean_and_print_both_patches() {
-        let dir = tmpdir("happy");
-        let rec = record(
-            CUDA_TRACK,
-            &[
-                (0.000488, 0.06450),
-                (0.000488, 0.06452),
-                (0.000488, 0.06451),
-                (0.000488, 0.06453),
-            ],
-        );
-        let path = write(&dir, "botany.json", &rec);
-        let report = execute(&argv(&[
-            "--track",
-            CUDA_TRACK,
-            "--record",
-            path.to_str().unwrap(),
-        ]))
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(report.records.len(), 1);
-        let v = &report.records[0];
-        assert_eq!(v.name, "botany");
-        assert_eq!(v.run_count, 4);
-        assert_eq!(v.prefill_seconds_per_token, 0.000488);
-        assert_eq!(
-            v.decode_seconds_per_token,
-            (0.06450 + 0.06452 + 0.06451 + 0.06453) / 4.0
-        );
-        assert_eq!(report.pinned_record, "botany");
-
-        // The patch is the CONSTANT the armed single-leg path resolves through, with the mean
-        // round-tripped at full precision.
-        assert!(
-            report
-                .constants_patch
-                .contains("pub const OFFICIAL_BASELINE_CUDA: Option<OfficialBaseline>"),
-            "{}",
-            report.constants_patch
-        );
-        assert!(report
-            .constants_patch
-            .contains("bands: MTP_SINGLE_LEG_BANDS"));
-        assert!(
-            report
-                .constants_patch
-                .contains(&format!("{:?}", v.decode_seconds_per_token)),
-            "{}",
-            report.constants_patch
-        );
-        // The golden's two null fields, named exactly as the golden schema spells them.
-        let fields = &report.golden_fields[0];
-        assert!(
-            fields.contains("\"baseline_prefill_seconds_per_token\""),
-            "{fields}"
-        );
-        assert!(
-            fields.contains("\"baseline_decode_seconds_per_token\""),
-            "{fields}"
-        );
-        // The rendered report states the gate it passed and that it changed nothing.
-        let text = render(&report);
-        assert!(text.contains("CV GATE"), "{text}");
-        assert!(text.contains("APPLIED NOTHING"), "{text}");
-    }
-
-    /// The CV REFUSAL, by name, with its NEGATIVE CONTROL: the same record shape with a spread
-    /// just inside the maximum is accepted, so the gate discriminates rather than always firing.
-    #[test]
-    fn noisy_legs_refuse_by_name_and_quiet_ones_do_not() {
-        let dir = tmpdir("cv");
-        // ~7% decode spread — far outside the 1% maximum.
-        let noisy = write(
-            &dir,
-            "noisy.json",
-            &record(CUDA_TRACK, &[(0.000488, 0.060), (0.000488, 0.070)]),
-        );
-        let err = execute(&argv(&[
-            "--track",
-            CUDA_TRACK,
-            "--record",
-            noisy.to_str().unwrap(),
-        ]))
-        .unwrap_err();
-        assert!(err.contains(CALIBRATION_CV_EXCEEDED), "{err}");
-        assert!(err.contains("decode sample CV"), "{err}");
-
-        // NEGATIVE CONTROL: a quiet pair of legs passes the same gate.
-        let quiet = write(
-            &dir,
-            "quiet.json",
-            &record(CUDA_TRACK, &[(0.000488, 0.06450), (0.000488, 0.06452)]),
-        );
-        assert!(execute(&argv(&[
-            "--track",
-            CUDA_TRACK,
-            "--record",
-            quiet.to_str().unwrap()
-        ]))
-        .is_ok());
-    }
-
-    /// A single leg has no sample CV, so there is no evidence at all — refused rather than
-    /// silently pinned as "perfectly stable".
-    #[test]
-    fn one_leg_is_not_a_calibration() {
-        let dir = tmpdir("single");
-        let path = write(&dir, "one.json", &record(CUDA_TRACK, &[(0.000488, 0.0645)]));
-        let err = execute(&argv(&[
-            "--track",
-            CUDA_TRACK,
-            "--record",
-            path.to_str().unwrap(),
-        ]))
-        .unwrap_err();
-        assert!(err.contains("undefined below two legs"), "{err}");
-    }
-
-    /// A record from another track can never average into this track's pair.
-    #[test]
-    fn a_foreign_track_record_refuses() {
-        let dir = tmpdir("foreign");
-        let path = write(
-            &dir,
-            "other.json",
-            &record(
-                "qwen3.8-125b-a6b-mlx-v1",
-                &[(0.000488, 0.0645), (0.000488, 0.0646)],
-            ),
-        );
-        let err = execute(&argv(&[
-            "--track",
-            CUDA_TRACK,
-            "--record",
-            path.to_str().unwrap(),
-        ]))
-        .unwrap_err();
-        assert!(err.contains("one calibration pins ONE track"), "{err}");
-    }
-
-    /// More than one record and no `--pin`: the platform constant is ONE pair, so the verb refuses
-    /// to guess which golden it comes from. With `--pin` it takes exactly that record's pair, and
-    /// every record still gets its own golden-field block.
-    #[test]
-    fn the_pinned_record_is_named_never_guessed() {
-        let dir = tmpdir("pin");
-        let a = write(
-            &dir,
-            "botany.json",
-            &record(CUDA_TRACK, &[(0.000488, 0.0645), (0.000488, 0.0646)]),
-        );
-        let b = write(
-            &dir,
-            "chess.json",
-            &record(CUDA_TRACK, &[(0.000500, 0.0700), (0.000500, 0.0701)]),
-        );
-        let both = argv(&[
-            "--track",
-            CUDA_TRACK,
-            "--record",
-            a.to_str().unwrap(),
-            "--record",
-            b.to_str().unwrap(),
-        ]);
-        let err = execute(&both).unwrap_err();
-        assert!(err.contains("--pin is required with 2 records"), "{err}");
-
-        let mut with_pin = both.clone();
-        with_pin.extend(argv(&["--pin", "chess"]));
-        let report = execute(&with_pin).unwrap().unwrap();
-        assert_eq!(report.pinned_record, "chess");
-        assert!(
-            report.constants_patch.contains(&format!("{:?}", 0.07005)),
-            "{}",
-            report.constants_patch
-        );
-        assert_eq!(report.golden_fields.len(), 2);
-
-        let mut bad_pin = both;
-        bad_pin.extend(argv(&["--pin", "nope"]));
-        assert!(execute(&bad_pin).unwrap_err().contains("names no record"));
-    }
-
-    /// The patch text names the PLATFORM constant, so a track whose row carries its own literal
-    /// pair must not be handed it. `gemma4-26b-a4b-mlx-v1` resolves to `Platform::Mlx` but reads
-    /// its own row — it refuses. NEGATIVE CONTROL: the CUDA track, which DOES resolve through the
-    /// platform constant, passes the same check.
-    #[test]
-    fn a_track_with_its_own_row_refuses_the_platform_patch() {
-        assert!(refuse_track_without_a_platform_constant(CUDA_TRACK, Platform::Cuda).is_ok());
-        let err = refuse_track_without_a_platform_constant("gemma4-26b-a4b-mlx-v1", Platform::Mlx)
-            .unwrap_err();
-        assert!(err.contains("OFFICIAL_BASELINE_MLX"), "{err}");
-    }
-
-    /// `--json-out` writes the whole report so a driver never parses the human text.
-    #[test]
-    fn json_out_writes_the_report() {
-        let dir = tmpdir("json");
-        let path = write(
-            &dir,
-            "botany.json",
-            &record(CUDA_TRACK, &[(0.000488, 0.0645), (0.000488, 0.0646)]),
-        );
-        let out = dir.join("calibration.json");
-        execute(&argv(&[
-            "--track",
-            CUDA_TRACK,
-            "--record",
-            path.to_str().unwrap(),
-            "--json-out",
-            out.to_str().unwrap(),
-        ]))
-        .unwrap();
-        let written: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
-        assert_eq!(written["track_id"], CUDA_TRACK);
-        assert_eq!(written["platform"], "cuda");
-        assert_eq!(written["pinned_record"], "botany");
-        assert!(written["constants_patch"]
-            .as_str()
-            .unwrap()
-            .contains("OFFICIAL_BASELINE_CUDA"));
-    }
-
-    /// No records at all, and a track that names no platform, both refuse before anything is read.
-    #[test]
-    fn missing_inputs_refuse() {
-        assert!(execute(&argv(&["--track", CUDA_TRACK]))
-            .unwrap_err()
-            .contains("missing required --record"));
-        let dir = tmpdir("noplatform");
-        let path = write(
-            &dir,
-            "x.json",
-            &record(CUDA_TRACK, &[(0.000488, 0.0645), (0.000488, 0.0646)]),
-        );
-        let err = execute(&argv(&[
-            "--track",
-            "qwen3.8-27b-mtp-v1",
-            "--record",
-            path.to_str().unwrap(),
-        ]))
-        .unwrap_err();
-        assert!(err.contains("is not one of"), "{err}");
     }
 }

@@ -8,6 +8,7 @@
 //! write a sealed `score.json` (+ `.sha256` sidecar). `transform`/`submit`/`official`
 //! are stubs.
 
+mod baseline;
 mod byte_budget;
 mod calibrate;
 mod capture;
@@ -17,6 +18,7 @@ mod correctness;
 mod editable_divergence;
 mod engine_resource;
 mod iterate;
+mod legserve;
 mod measure_job;
 mod official;
 mod overlay;
@@ -137,17 +139,20 @@ fn spawn_official_worker(
     engine: &str,
     weights_path: &str,
     declared: &[engine_resource::EngineResource],
+    leg_env: &[(String, String)],
 ) -> std::io::Result<ChildStdioTransport> {
     match plan {
         Some(plan) => ChildStdioTransport::spawn_official_sandboxed(
             plan,
             weights_path,
             &free_run_spawn_args(declared),
+            leg_env,
         ),
         None => ChildStdioTransport::spawn_unsandboxed_official(
             engine,
             weights_path,
             &free_run_spawn_args(declared),
+            leg_env,
         ),
     }
 }
@@ -164,11 +169,29 @@ REQUIRED:
     --golden <PATH>              GoldenDocument JSON (loaded + validated by bench-core)
 
 OPTIONS:
-    --baseline-prefill-spt <F>   OFFICIAL ONLY. Prefill baseline seconds/token (trusted override;
-    --baseline-decode-spt <F>    both required together; else the golden's paired baselines).
-                                 IGNORED on local-iterate/local-submit: those legs score against
-                                 the official-runner CONSTANTS, as the reference's localIterate
-                                 does — the golden's declared pair is inert there too (#127).
+    --baseline-prefill-spt <F>   STORED-PAIR TRACKS ONLY, on --mode official. Prefill baseline
+    --baseline-decode-spt <F>    seconds/token (trusted override; both required together; else the
+                                 golden's declared pair). IGNORED on local-iterate/local-submit:
+                                 those legs score against the track's CONSTANTS (#127). REFUSED BY
+                                 NAME on the ranked paired path, which measures its denominator.
+    --baseline-workspace <DIR>   PAIRED PATH (env MLXFAST_BASELINE_WORKSPACE). The
+                                 organizer-staged, built REFERENCE tree on this box. Leg 1 — the
+                                 serial-control leg — runs the same root-relative engine AND
+                                 weights paths inside this tree that leg 2 runs inside the
+                                 submission tree, so the control leg never loads the candidate's
+                                 participant-editable transform output.
+    --baseline-calibration <F>   PAIRED PATH (env MLXFAST_BASELINE_CALIBRATION). This box's
+                                 calibration file (`benchd calibrate-baseline` writes it). It is
+                                 the HEALTH BAND for leg 1 and never a denominator: a leg outside
+                                 the band refuses by name and seals no score.
+                                 REQUIRED on --mode official for a track that scores against a
+                                 live control leg; both refuse by name when absent. On
+                                 local-iterate/local-submit they are OPTIONAL: give BOTH to run
+                                 the full paired path locally, or neither to run the CANDIDATE LEG
+                                 ONLY and seal no score (real timings, real correctness,
+                                 score=null, baseline_source=\"none (local mode: unscored)\").
+    --box <RUNNER>               PAIRED PATH. The runner name this box answers to, for the
+                                 calibration file's `box` check. RUNNER_NAME wins when set.
     --mode <local-iterate|local-submit|official>
                                  Decode window: 128 (local-iterate, default), 1023 (local-submit), 128 (official)
     --score-path <OUT>           Output score path (default: score.local-iterate.json for
@@ -286,7 +309,7 @@ SUBCOMMANDS:
     overlay-timing  Option-A seam 3 (LOCAL): merge gates-score.json + results.json → LOCAL/parity score.json (organizer owns the ranked seal)
     harness-hash    Print the 9-root harness identity of the PROCESS CWD (read-only; the seal's own resolution)
     weights-digest  Print the weights-tree digest as <sha256>:<bytes>:<files> (the window's once-per-run digest)
-    calibrate-baseline  Gate a track's --capture-baseline records (CV) and print the baseline pin
+    calibrate-baseline  Measure this box's serial-control health band and write its calibration
     transform       (not implemented in this wave)
     submit          (not implemented in this wave)
     official        run the official benchmark (alias: `iterate --mode official`)
@@ -2325,8 +2348,12 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
     measure_job::enforce_dflash_head_present(&args.candidate_spec.mode, dflash_head_dirs.as_ref())
         .map_err(MeasureJobFailure::die8)?;
 
-    let serial_plan = resolve_official_sandbox_from_env(&baseline_exec, golden_path)?;
-    let candidate_plan = resolve_official_sandbox_from_env(&candidate_exec, golden_path)?;
+    // The paired measure-job already resolves its two executables itself, so neither leg takes
+    // the `MLXFAST_RUNTIME_WORKER_EXECUTABLE` override: honouring it would point both legs at one
+    // binary. (The override was already inert here in practice — both calls passed their own
+    // executable — so this states the existing intent rather than changing it.)
+    let serial_plan = resolve_official_sandbox_from_env(&baseline_exec, golden_path, false)?;
+    let candidate_plan = resolve_official_sandbox_from_env(&candidate_exec, golden_path, false)?;
     let serial_weights = args.weights.to_string_lossy().to_string();
     let candidate_weights = args.weights.to_string_lossy().to_string();
     // R15 — per-side heads passed to the ONE spawned worker per leg: the serial control loads the
@@ -2496,7 +2523,7 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
         let wire_head_provenance = std::cell::RefCell::new(None);
         let mut spawn = || -> bench_runner::Result<Session<ChildStdioTransport>> {
             let transport =
-                ChildStdioTransport::spawn_official_sandboxed(plan, weights, &extra_args)?;
+                ChildStdioTransport::spawn_official_sandboxed(plan, weights, &extra_args, &[])?;
             let (session, hello) = Session::connect(transport)?;
             *wire_head_provenance.borrow_mut() = hello.head_provenance.clone();
             Ok(session)
@@ -2659,7 +2686,7 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
         let wire_head_provenance = std::cell::RefCell::new(None);
         let mut spawn = || -> bench_runner::Result<Session<ChildStdioTransport>> {
             let transport =
-                ChildStdioTransport::spawn_official_sandboxed(plan, weights, &extra_args)?;
+                ChildStdioTransport::spawn_official_sandboxed(plan, weights, &extra_args, &[])?;
             let (session, hello) = Session::connect(transport)?;
             *wire_head_provenance.borrow_mut() = hello.head_provenance.clone();
             Ok(session)
@@ -3293,6 +3320,21 @@ struct IterateArgs {
     /// out with no `spec`, the engine resolves its default (serial by protocol), and nothing is
     /// echo-checked. `Some` arms spec-never-ignored on every timed leg that carries it.
     spec: Option<bench_protocol::SpecConfig>,
+    /// `--baseline-workspace <DIR>` — THE REFERENCE TREE (David 2026-09-08). REQUIRED on the
+    /// ranked paired path (`--mode official` on a
+    /// [`bench_core::constants::LIVE_CONTROL_LEG_TRACKS`] track): the organizer-staged, built
+    /// reference tree this box runs the SERIAL-CONTROL leg on. Falls back to the
+    /// [`baseline::BASELINE_WORKSPACE_ENV`] runner variable; absent from both, the run refuses by
+    /// name. Ignored on every other path, which measures no control leg.
+    baseline_workspace: Option<PathBuf>,
+    /// `--baseline-calibration <FILE>` — THIS BOX's calibration file. REQUIRED on the ranked
+    /// paired path, falling back to [`baseline::BASELINE_CALIBRATION_ENV`]. It is a HEALTH BAND
+    /// for the control leg and NEVER a denominator: no number in it reaches the score.
+    baseline_calibration: Option<PathBuf>,
+    /// `--box <RUNNER>` — the box this run is on, for the calibration file's `box` check. The
+    /// job's own `RUNNER_NAME` wins when it is set (Actions sets it); this flag is how an operator
+    /// names the box off Actions. A run that can name neither refuses by name.
+    box_name: Option<String>,
     /// `--engine-resource NAME=PATH` (repeatable) — the out-of-checkpoint inputs the runner needs
     /// to LOAD the model (Darkbloom runner contract §8.1/§13b). Each becomes `--resource NAME=PATH`
     /// on EVERY engine spawn this run makes. THE VALUE COMES FROM THIS COMMAND LINE, as the engine
@@ -3601,6 +3643,37 @@ fn run_capture_passes(
 }
 
 
+/// Tokens per second from seconds per token, for a HUMAN-FACING line (David: every human-facing
+/// surface shows tok/s; seconds-per-token stays the internal representation). A non-positive or
+/// non-finite reading has no rate, and prints as `0.0` rather than an infinity.
+fn tokens_per_second(seconds_per_token: f64) -> f64 {
+    if seconds_per_token.is_finite() && seconds_per_token > 0.0 {
+        1.0 / seconds_per_token
+    } else {
+        0.0
+    }
+}
+
+/// Whether BOTH runner inputs of the paired path are present — from the flags, else from the
+/// runner environment. It is the switch a LOCAL mode takes to run the full paired path instead of
+/// a candidate-only unscored run; the ranked path requires them either way and refuses by name.
+fn paired_inputs_present(args: &IterateArgs) -> bool {
+    let from_env = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty())
+    };
+    (args.baseline_workspace.is_some() || from_env(baseline::BASELINE_WORKSPACE_ENV))
+        && (args.baseline_calibration.is_some() || from_env(baseline::BASELINE_CALIBRATION_ENV))
+}
+
+/// Whether a resident engine socket is already named in THIS process's environment (the
+/// single-leg shape, where the measure script wraps benchd in `tools/serve-up.sh`). The paired
+/// path boots its own per leg and REFUSES an inherited one; every other path still honours it.
+fn ds4_resident_socket_present() -> bool {
+    std::env::var_os(legserve::DS4_RESIDENT_SOCKET_ENV).is_some()
+}
+
 /// Which worker lifecycle a window runs. A platform whose worker holds the model (MLX) and a CUDA
 /// window served by the one-connection `ds4-resident` both drive every phase over ONE attached
 /// worker; only a stateless adapter over a multi-connection serve keeps the fresh-per-phase
@@ -3699,7 +3772,11 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
     // (including the `MLXFAST_NO_SANDBOX` refusal, which only reaches the resolver on macOS).
     let official_sandbox: Option<OfficialSandboxPlan> =
         if args.mode == Mode::Official && cfg!(target_os = "macos") {
-            Some(resolve_official_sandbox_from_env(&args.engine, &args.golden)?)
+            Some(resolve_official_sandbox_from_env(
+                &args.engine,
+                &args.golden,
+                true,
+            )?)
         } else {
             None
         };
@@ -3776,7 +3853,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
     // is dropped by the resident's 1800 s idle ceiling (measured 2026-09-04: every CUDA calibration
     // on the box stalled 30 min per verb). That topology is the persistent window: ONE attached
     // worker drives every phase, the resident holds the weights, nothing is loaded per phase.
-    let residency = worker_residency(platform, std::env::var_os("DS4_RESIDENT_SOCKET").is_some());
+    let residency = worker_residency(platform, ds4_resident_socket_present());
 
     // ARM GATE (David 2026-08-26) — the SOLE scored path inherits the gate the retired measure-job
     // used to carry: an OFFICIAL (scoring) run REFUSES, pre-GPU and BEFORE any score is sealed,
@@ -3789,16 +3866,46 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
     if args.mode == Mode::Official {
         enforce_official_arm_gate(args.contract.as_deref(), track_id_env.as_deref())?;
     }
+    // THE RANKED PAIRED PATH's fences, PRE-GPU (David 2026-09-08). A live-control-leg track
+    // measures its own denominator, so every STORED-pair door is closed before anything spawns:
+    // the trusted env override, the `--baseline-*` flags, and a golden that still declares a pair.
+    // Each refuses BY NAME. They are checked for the whole of `--mode official` — including the
+    // gates-only seam, which seals no denominator of its own — so an operator who wires one of
+    // them is told once, at the door, rather than after a GPU window.
+    // THE PAIRED PATH is taken by a live-control-leg track when it CAN measure two legs: always
+    // on the ranked path (`--mode official`, where the two runner inputs are REQUIRED and each
+    // refuses by name when absent), and on a LOCAL mode when the box supplies both of them. A
+    // participant on a laptop has no reference tree, so the local modes fall through to the
+    // CANDIDATE-ONLY, UNSCORED run below (David: the local benchmark must keep working).
+    let live_control_leg_track = bench_core::constants::scores_against_live_control_leg(&track_id);
+    let paired_inputs_present = paired_inputs_present(args);
+    let paired_track =
+        live_control_leg_track && (args.mode == Mode::Official || paired_inputs_present);
+    if live_control_leg_track && args.mode == Mode::Official {
+        baseline::refuse_stored_baseline_override(
+            std::env::var("MLXFAST_PAIRED_BASELINE_PREFILL_SECONDS_PER_TOKEN")
+                .ok()
+                .as_deref(),
+            std::env::var("MLXFAST_PAIRED_BASELINE_DECODE_SECONDS_PER_TOKEN")
+                .ok()
+                .as_deref(),
+            args.baseline_prefill_spt.is_some() || args.baseline_decode_spt.is_some(),
+        )?;
+        baseline::refuse_golden_with_stored_pair(&golden)?;
+    }
     // --capture-baseline (David round-4, the capture-circularity fix): author the official
     // baseline's CAPTURE RECORD from a normal checked-timing run WITHOUT resolving the official
     // baseline — the pending state must not block the capture that ends it, and a CAPTURED state
     // refuses the mode by name (capture::refuse_unless_pending). This branch returns BEFORE the
     // score/integrity writers below: a capture run produces no artifact a scored run would.
     if let Some(capture_path) = args.capture_baseline.as_ref() {
+        // A live-control-leg track stores no pair, so there is nothing to capture; every other
+        // track arms the mode exactly while its own table row is absent.
+        capture::refuse_live_control_leg_track(&track_id)?;
         capture::refuse_unless_pending(
-            platform.key(),
-            platform.official_baseline_declared().is_some(),
-            platform.official_baseline_pending(),
+            &track_id,
+            bench_core::constants::official_baseline(&track_id).is_ok(),
+            bench_core::constants::OFFICIAL_BASELINE_PENDING,
         )?;
         capture::refuse_unresolved_engine(
             &runner_engine,
@@ -3874,6 +3981,14 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
         );
         return Ok(true);
     }
+    // WHERE THIS RUN'S PAIR COMES FROM, decided once. `RunBaselines` is `Copy`, so the arms
+    // below read it without re-deciding — and without the decision drifting between them.
+    let baseline_decision = run_baselines(
+        args.mode,
+        &golden,
+        args.baseline_prefill_spt.zip(args.baseline_decode_spt),
+        track_id_env.as_deref(),
+    )?;
     let payload = if args.mode == Mode::Official && official_gates_only_from_env() {
         // macOS resolves a Seatbelt plan; a non-macOS official run has none and spawns unsandboxed
         // (a8 ruling b, `spawn_official_worker`).
@@ -3884,8 +3999,13 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
         // One official worker spawn shape (carries `--speculative-protocol v1.1`): identical to the
         // full-run timed/correctness spawns below, so the gated worker is spawned the same way here.
         let spawn_correctness = || -> bench_runner::Result<Session<ChildStdioTransport>> {
-            let transport =
-                spawn_official_worker(plan, &args.engine, &weights_str, &args.engine_resources)?;
+            let transport = spawn_official_worker(
+                plan,
+                &args.engine,
+                &weights_str,
+                &args.engine_resources,
+                &[],
+            )?;
             let (session, _hello) = Session::connect(transport)?;
             Ok(session)
         };
@@ -3902,12 +4022,8 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                 .as_deref(),
         )?
         .or(flag_override);
-        let (baseline_prefill, baseline_decode) = gates_only_baselines(
-            track_id_env.as_deref(),
-            effective_override,
-            &golden,
-            platform,
-        )?;
+        let (baseline_prefill, baseline_decode) =
+            gates_only_baselines(track_id_env.as_deref(), effective_override, &golden)?;
         official::official_gates_only(
             &golden,
             (baseline_prefill, baseline_decode),
@@ -3915,17 +4031,242 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
             &commit,
             spawn_correctness,
         )?
+    } else if paired_track {
+        // THE RANKED PAIRED PATH (David 2026-09-08). This track stores no baseline pair anywhere,
+        // so the denominator is MEASURED here: a SERIAL-CONTROL leg on the organizer-staged
+        // reference tree, on this box, in this job, immediately before the candidate leg. The
+        // per-box calibration file is a HEALTH BAND for that control leg and never a denominator.
+        //
+        // The two runner inputs are REQUIRED and each refuses BY NAME when it is absent or does
+        // not match this track and this box (`baseline.rs`). The stored-pair doors — the
+        // `MLXFAST_PAIRED_BASELINE_*` env, the `--baseline-*` flags, and a golden carrying
+        // `benchmark.baseline_*_seconds_per_token` — were already refused pre-GPU above.
+        let workspace = baseline::resolve_workspace(
+            args.baseline_workspace.as_deref(),
+            std::env::var(baseline::BASELINE_WORKSPACE_ENV)
+                .ok()
+                .as_deref(),
+        )?;
+        let calibration = baseline::load_calibration(
+            args.baseline_calibration.as_deref(),
+            std::env::var(baseline::BASELINE_CALIBRATION_ENV)
+                .ok()
+                .as_deref(),
+        )?;
+        let box_name = baseline::resolve_box_name(
+            args.box_name.as_deref(),
+            std::env::var(baseline::RUNNER_NAME_ENV).ok().as_deref(),
+        )?;
+        // The prompt the run MEASURES, named from the golden it was given — the same name the
+        // calibrator recorded from the golden it measured.
+        let prompt = baseline::golden_prompt_name(&args.golden).ok_or_else(|| {
+            format!(
+                "{}: --golden {} has no file name to take a prompt name from, so the calibration's \
+                 own prompt cannot be checked against it",
+                baseline::BASELINE_CALIBRATION_PROMPT_MISMATCH,
+                args.golden.display()
+            )
+        })?;
+        calibration
+            .calibration
+            .check_identity(&track_id, &box_name, &prompt)?;
+
+        // THE TWO ROOTS. The reference leg runs the SAME root-relative engine path inside the
+        // organizer's tree that the candidate leg runs inside the submission tree, so the two legs
+        // differ by their tree and by nothing else. The re-rooting starts from the RESOLVED
+        // candidate executable, which is what the candidate leg will actually spawn.
+        let workspace_root = std::env::current_dir()
+            .map_err(|e| format!("the run's workspace root could not be resolved: {e}"))?;
+        let reference_engine =
+            baseline::reference_engine_path(&runner_engine, &workspace_root, &workspace)?;
+        let reference_engine_str = reference_engine.to_string_lossy().to_string();
+        // …and the same for the WEIGHTS. The transform that produces them is
+        // PARTICIPANT-EDITABLE, so the control leg loads the REFERENCE tree's own transform
+        // output, never the candidate's (`baseline::reference_weights_path` carries the three
+        // rules and the one case where both legs legitimately share an organizer-staged tree).
+        let reference_weights =
+            baseline::reference_weights_path(&args.weights, &workspace_root, &workspace)?;
+        let reference_weights_str = reference_weights.path().to_string_lossy().to_string();
+        // The two legs are wrapped IDENTICALLY: the reference leg resolves a Seatbelt plan
+        // exactly when the candidate leg has one. A run that sandboxed one leg and not the other
+        // would compare two differently-wrapped processes — and a LOCAL paired run, which resolves
+        // no official sandbox at all, would otherwise sandbox only the control leg.
+        let reference_sandbox = match official_sandbox.as_ref() {
+            Some(_) => Some(resolve_official_sandbox_from_env(
+                &reference_engine_str,
+                &args.golden,
+                false,
+            )?),
+            None => None,
+        };
+
+        let plan = official_sandbox.as_ref();
+        let weights_str = args.weights.to_string_lossy().to_string();
+        let commit_env = std::env::var("MLXFAST_COMMIT_SHA").ok();
+        let commit = official::commit_identifier(commit_env.as_deref());
+
+        // PER-LEG RESIDENT ENGINES. On a platform whose worker HOLDS the model (MLX) benchd's own
+        // worker spawn is the residency and nothing boots here. On a platform whose worker is an
+        // ADAPTER over a resident engine (CUDA/ds4) benchd boots that leg's resident from that
+        // leg's OWN tree, one at a time, through the fixed `tools/serve-up.sh --boot/--stop`
+        // convention (`legserve.rs`). The socket each boot reports is put into THAT leg's worker
+        // spawns only; benchd's own environment is never mutated, so the two legs cannot bleed
+        // into each other.
+        let leg_serve = legserve::leg_serve_required(platform);
+        if leg_serve {
+            legserve::refuse_inherited_socket(
+                std::env::var(legserve::DS4_RESIDENT_SOCKET_ENV)
+                    .ok()
+                    .as_deref(),
+                std::env::var(legserve::BENCH_WORKER_RESIDENT_SOCKET_ENV)
+                    .ok()
+                    .as_deref(),
+            )?;
+        }
+        let leg_env: std::cell::RefCell<Vec<(String, String)>> =
+            std::cell::RefCell::new(Vec::new());
+        let candidate_spec = args.spec.clone();
+        let open_baseline_leg = || -> Result<Option<legserve::LegServe>, String> {
+            if !leg_serve {
+                return Ok(None);
+            }
+            // ALWAYS SERIAL, whatever the submission declares: this is the control.
+            let serve = legserve::boot_leg(&workspace, None, "serial-control")?;
+            *leg_env.borrow_mut() = serve.spawn_env();
+            Ok(Some(serve))
+        };
+        let open_candidate_leg = || -> Result<Option<legserve::LegServe>, String> {
+            if !leg_serve {
+                return Ok(None);
+            }
+            let serve = legserve::boot_leg(&workspace_root, candidate_spec.as_ref(), "candidate")?;
+            *leg_env.borrow_mut() = serve.spawn_env();
+            Ok(Some(serve))
+        };
+
+        eprintln!(
+            "benchd iterate: the serial-control leg loads {} ({}); the candidate leg loads {}",
+            reference_weights_str,
+            match reference_weights {
+                baseline::ReferenceWeights::ReferenceTree(_) => "the reference tree's own weights",
+                baseline::ReferenceWeights::SharedOutOfTree(_) =>
+                    "an organizer-staged tree outside every checkout, shared by both legs",
+            },
+            weights_str,
+        );
+
+        // Leg 1's worker, rooted at the REFERENCE tree. Its hello is retained SEPARATELY from the
+        // candidate's: the two legs are two different engine builds, so one shared retention slot
+        // would refuse the run as a mid-window resident change. The identity the score seals is
+        // the CANDIDATE's — the leg that is scored.
+        let baseline_hello = std::cell::RefCell::new(None);
+        let spawn_baseline = || -> bench_runner::Result<Session<ChildStdioTransport>> {
+            let transport = spawn_official_worker(
+                reference_sandbox.as_ref(),
+                &reference_engine_str,
+                &reference_weights_str,
+                &args.engine_resources,
+                &leg_env.borrow(),
+            )?;
+            let (session, hello) = Session::connect(transport)?;
+            official::retain_timed_hello(&mut baseline_hello.borrow_mut(), hello)
+                .map_err(|e| bench_runner::RunnerError::Protocol(e.to_string()))?;
+            Ok(session)
+        };
+        // Leg 2's workers, rooted at the SUBMISSION tree — byte-for-byte the single-leg path's.
+        let timed_hello = std::cell::RefCell::new(None);
+        let spawn_timed = || -> bench_runner::Result<Session<ChildStdioTransport>> {
+            let transport = spawn_official_worker(
+                plan,
+                &args.engine,
+                &weights_str,
+                &args.engine_resources,
+                &leg_env.borrow(),
+            )?;
+            let (session, hello) = Session::connect(transport)?;
+            official::retain_timed_hello(&mut timed_hello.borrow_mut(), hello)
+                .map_err(|e| bench_runner::RunnerError::Protocol(e.to_string()))?;
+            Ok(session)
+        };
+        let spawn_correctness = || -> bench_runner::Result<Session<ChildStdioTransport>> {
+            let transport = spawn_official_worker(
+                plan,
+                &args.engine,
+                &weights_str,
+                &args.engine_resources,
+                &leg_env.borrow(),
+            )?;
+            let (session, _hello) = Session::connect(transport)?;
+            Ok(session)
+        };
+        let official_gate_enabled = args
+            .cool_gate
+            .unwrap_or_else(|| args.mode.cool_gate_on_by_default());
+        let official_cool_gate = move |phase: &str| -> bench_runner::Result<()> {
+            if !official_gate_enabled {
+                return Ok(());
+            }
+            match coolgate::cool_gate_report(phase, cool_gate_platform_from_env())? {
+                coolgate::GateState::SkippedNoReader => {
+                    Err(bench_runner::RunnerError::GateRejected {
+                        phase: phase.to_string(),
+                        reason: "official mode requires a GPU temperature reader for the cool gate (install macmon or set MLXFAST_MACMON_BIN)".to_string(),
+                    })
+                }
+                _ => Ok(()),
+            }
+        };
+        eprintln!(
+            "benchd iterate: paired official run on box {box_name:?} — leg 1 is the serial-control \
+             leg on the reference tree {}, leg 2 the candidate; the score is the live ratio of the \
+             two (calibration {} is the band on leg 1, never a denominator)",
+            workspace.display(),
+            calibration.path.display(),
+        );
+        let mut payload = official::official_core_paired(
+            &golden,
+            &calibration.calibration,
+            official::PairedBaselineSeal {
+                box_name: &box_name,
+                calibration_sha256: &calibration.sha256,
+                reference_commit: &calibration.calibration.reference_commit,
+                // Both are filled in by the paired core from what it measured; the caller states
+                // nothing about a leg that has not run.
+                band_passed: false,
+                leg: None,
+            },
+            digests,
+            &commit,
+            official::PairedLegs {
+                open_baseline_leg,
+                open_candidate_leg,
+                spawn_baseline,
+                spawn_timed,
+                spawn_correctness,
+            },
+            official::PairedWindow {
+                // The band SHAPE is the single-leg MTP regime's, unchanged: prefill +/-5%
+                // symmetric, decode +2% up with the down band disabled. What changed is the
+                // reference the shape is applied to — a live measurement instead of a stored pair.
+                bands: bench_core::constants::MTP_SINGLE_LEG_BANDS,
+                // A per-leg resident engine accepts ONE connection, so a leg that boots its own
+                // drives every phase over ONE attached worker — the same load-once window MLX runs.
+                residency: worker_residency(platform, leg_serve || ds4_resident_socket_present()),
+                spec: args.spec.clone(),
+                platform,
+                cool_gate: official_cool_gate,
+            },
+        );
+        if let Some(hello) = timed_hello.borrow().as_ref() {
+            official::seal_engine_identity(&mut payload.metrics, hello);
+        }
+        payload
     } else if let RunBaselines::Decided {
         prefill,
         decode,
         flags_ignored,
-    } = run_baselines(
-        args.mode,
-        &golden,
-        args.baseline_prefill_spt.zip(args.baseline_decode_spt),
-        track_id_env.as_deref(),
-        platform,
-    )? {
+    } = baseline_decision
+    {
         eprintln!(
             "benchd iterate: {} baseline prefill_seconds_per_token={prefill} \
              decode_seconds_per_token={decode} (official-runner constants; local \
@@ -3942,6 +4283,37 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
         }
         // The non-capture local path is never timed-only: it always runs the correctness gate.
         run_local_iterate(args, &golden, digests, prefill, decode, false, residency)?
+    } else if baseline_decision == RunBaselines::Unscored {
+        // THE UNSCORED LOCAL RUN (David 2026-09-08). This track measures its denominator on the
+        // ranked box against the organizer's reference tree, and this box has no reference tree,
+        // so there is nothing to divide by. The run is the CANDIDATE LEG, in full: the real timed
+        // prefill and decode, the real correctness gate, the real sealed timing surface — and NO
+        // score. A participant iterating on a laptop gets a working benchmark; nobody gets a
+        // number that looks like a rank.
+        //
+        // The `(0.0, 0.0)` pair IS the "no denominator" statement, and `seal_local_unscored`
+        // finishes it: `score` stays null, `baseline_source` says why, and the placeholder
+        // "score is not finite" text is cleared for a run whose correctness passed.
+        let mut payload = run_local_iterate(args, &golden, digests, 0.0, 0.0, false, residency)?;
+        iterate::seal_local_unscored(&mut payload);
+        let m = &payload.metrics;
+        eprintln!(
+            "benchd iterate: {} UNSCORED on track {track_id} — it scores against a serial-control \
+             leg on the organizer's reference tree, and none is named here (set \
+             {} and {} to run the paired path locally). Candidate leg: prefill {:.1} tok/s, \
+             decode {:.1} tok/s; correctness {}. No score was written.",
+            args.mode.mode_name(),
+            baseline::BASELINE_WORKSPACE_ENV,
+            baseline::BASELINE_CALIBRATION_ENV,
+            tokens_per_second(m.prefill_seconds_per_token),
+            tokens_per_second(m.decode_seconds_per_token),
+            if m.passed_correctness {
+                "passed"
+            } else {
+                "FAILED"
+            },
+        );
+        payload
     } else {
         // §F2 (OFFICIAL only): resolve the REQUIRED paired baselines. Explicit --baseline flags
         // override; else the golden's benchmark must carry both. Missing → a preflight-failed
@@ -3964,9 +4336,11 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                 .as_deref(),
         )?
         .or(flag_override);
-        // OFFICIAL always needs the captured official baseline: its acceptance BANDS gate the
-        // timed run, and the #74 early-refuse record carries its pair. Pending ⇒ refuse by name.
-        let official = platform.official_baseline()?;
+        // A STORED-PAIR track's official run needs its captured pair: the acceptance BANDS gate
+        // the timed run, and the #74 early-refuse record carries the pair. A track with no row
+        // refuses by name. (A live-control-leg track never reaches here — it took the paired arm
+        // above, which measures its own denominator and reads no table.)
+        let official = bench_core::constants::official_baseline(&track_id)?;
         match resolve_paired_baselines(effective_override, &golden) {
             None => iterate::preflight_failed_payload(
                 args.mode,
@@ -4010,6 +4384,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                         &args.engine,
                         &weights_str,
                         &args.engine_resources,
+                        &[],
                     )?;
                     let (session, hello) = Session::connect(transport)?;
                     // Every timed phase of one window must report the SAME resident identity; a
@@ -4025,6 +4400,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                         &args.engine,
                         &weights_str,
                         &args.engine_resources,
+                        &[],
                     )?;
                     let (session, _hello) = Session::connect(transport)?;
                     Ok(session)
@@ -4145,6 +4521,11 @@ enum RunBaselines {
         /// The caller passed `--baseline-*` and they are being ignored — worth saying out loud.
         flags_ignored: bool,
     },
+    /// A LOCAL leg of a LIVE-CONTROL-LEG track with no reference tree in reach: there is no
+    /// denominator, by design, so the run measures the CANDIDATE LEG ONLY and seals NO score.
+    /// David requires the local benchmark to keep working for a participant on a laptop, and a
+    /// score with no denominator is not a score — so the run is UNSCORED rather than refused.
+    Unscored,
     /// OFFICIAL: golden-authoritative, resolved downstream from the trusted env/flag override
     /// ahead of the golden's own declaration.
     ResolveFromOverrideOrGolden,
@@ -4281,9 +4662,8 @@ fn enforce_official_arm_gate(
 /// Keying on the regime is the narrower and correct question, and it is the one the arm's own
 /// fence asks.
 ///
-/// Every other track — the single-leg ones included — resolves through its PLATFORM, which is
-/// what the box is armed under. Neither arm falls back to another track's numbers: both refuse
-/// by name when they cannot answer.
+/// Every other track resolves through the table's own guarded accessor. Neither arm falls back to
+/// another track's numbers: both refuse by name when they cannot answer.
 fn resolves_through_the_track_table(track_id: &str) -> bool {
     bench_core::constants::scored_regime(track_id).is_ok()
 }
@@ -4293,12 +4673,34 @@ fn run_baselines(
     golden: &GoldenFixture,
     flag_override: Option<(f64, f64)>,
     track_id: Option<&str>,
-    platform: bench_core::constants::Platform,
 ) -> Result<RunBaselines, String> {
-    // TWO KEYS, ONE TABLE. See `resolves_through_the_track_table` for which arm a track takes.
-    let official = match track_id.map(str::trim).filter(|t| !t.is_empty()) {
+    // ONE TABLE. A declared-regime track resolves through `local_mode_baselines` (which fences
+    // on the regime); every other track resolves through the table's own guarded accessor. A
+    // LIVE-CONTROL-LEG track has no row, so it refuses BY NAME — and the refusal names the path
+    // that does have a denominator for it, because the local modes never measure a control leg.
+    // The refusal rides on the `official` VALUE rather than on an early return, because
+    // `run_baselines_with` consumes it only on the LOCAL arm: official must keep deferring
+    // (`ResolveFromOverrideOrGolden`) so `execute_iterate`'s paired arm can measure its own.
+    let trimmed = track_id.map(str::trim).filter(|t| !t.is_empty());
+    // A LIVE-CONTROL-LEG track has no stored pair to decide from. On a LOCAL leg that is not a
+    // refusal: it is the UNSCORED run (`RunBaselines::Unscored`) — the candidate leg, its real
+    // timings and its real correctness gate, and no score. On OFFICIAL the paired arm in
+    // `execute_iterate` has already taken the run, and this function keeps deferring.
+    if trimmed.is_some_and(bench_core::constants::scores_against_live_control_leg) {
+        return Ok(if mode.is_local_checked_timing() {
+            RunBaselines::Unscored
+        } else {
+            RunBaselines::ResolveFromOverrideOrGolden
+        });
+    }
+    let official = match trimmed {
         Some(t) if resolves_through_the_track_table(t) => iterate::local_mode_baselines(t),
-        _ => platform.official_baseline(),
+        Some(t) => bench_core::constants::official_baseline(t),
+        None => Err(
+            "no track_id: the local baseline pair is keyed by the track this run scores under \
+             (set MLXFAST_QWEN_MTP_TRACK_ID)"
+                .to_string(),
+        ),
     };
     run_baselines_with(mode, golden, flag_override, official)
 }
@@ -4310,29 +4712,31 @@ fn run_baselines(
 /// A DECLARED-REGIME track resolves in the reference's own order through
 /// `official::official_resolved_baselines` (env override, else the golden's declared pair, else
 /// the track's captured pair), because this is the seam-1 producer for the paired overlay and must
-/// resolve the way the overlay that completes it does. Every other track takes the trusted
-/// override, else the golden's declared pair, else its PLATFORM's captured pair.
+/// resolve the way the overlay that completes it does.
+///
+/// A LIVE-CONTROL-LEG track resolves NOTHING: a gates-only run measures no leg, and that track's
+/// only denominator is a leg. It seals the zero placeholders the timing fields already carry on
+/// this path, rather than a number no run produced. (David 2026-09-08 — this is where
+/// `Platform::official_baseline` used to hand a stored pair to these tracks.)
+///
+/// Every other track takes the trusted override, else the golden's declared pair.
 fn gates_only_baselines(
     track_id: Option<&str>,
     effective_override: Option<(f64, f64)>,
     golden: &GoldenFixture,
-    platform: bench_core::constants::Platform,
 ) -> Result<(f64, f64), String> {
-    match track_id
-        .map(str::trim)
-        .filter(|t| resolves_through_the_track_table(t))
-    {
+    let trimmed = track_id.map(str::trim).filter(|t| !t.is_empty());
+    if trimmed.is_some_and(bench_core::constants::scores_against_live_control_leg) {
+        return Ok((0.0, 0.0));
+    }
+    match trimmed.filter(|t| resolves_through_the_track_table(t)) {
         Some(track_id) => official::official_resolved_baselines(golden, track_id),
-        None => match resolve_paired_baselines(effective_override, golden) {
-            Some(pair) => Ok(pair),
-            None => {
-                let official = platform.official_baseline()?;
-                Ok((
-                    official.prefill_seconds_per_token,
-                    official.decode_seconds_per_token,
-                ))
-            }
-        },
+        None => resolve_paired_baselines(effective_override, golden).ok_or_else(|| {
+            "no baseline pair for the gates-only official run: neither \
+             MLXFAST_PAIRED_BASELINE_{PREFILL,DECODE}_SECONDS_PER_TOKEN, nor the --baseline-* \
+             flags, nor the golden's declared pair supplied one"
+                .to_string()
+        }),
     }
 }
 
@@ -4420,10 +4824,17 @@ fn official_gates_only_from_env() -> bool {
 fn resolve_official_sandbox_from_env(
     engine: &str,
     golden: &Path,
+    honor_executable_override: bool,
 ) -> Result<OfficialSandboxPlan, String> {
     let use_rw = std::env::var("MLXFAST_USE_RUNTIME_WORKER").ok();
     let no_sb = std::env::var("MLXFAST_NO_SANDBOX").ok();
-    let exec_ov = std::env::var("MLXFAST_RUNTIME_WORKER_EXECUTABLE").ok();
+    // `honor_executable_override` is FALSE for the REFERENCE leg of a paired run: that leg's
+    // executable is derived by re-rooting the resolved candidate into the reference workspace, and
+    // an env override that pointed both legs at ONE binary would silently collapse the two roots
+    // into one and price the candidate against itself.
+    let exec_ov = honor_executable_override
+        .then(|| std::env::var("MLXFAST_RUNTIME_WORKER_EXECUTABLE").ok())
+        .flatten();
     let prof_ov = std::env::var("MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE").ok();
     let priv_dir = std::env::var("MLXFAST_PRIVATE_DIR").ok();
     // The resident bench-worker socket. This is read from OUR env deliberately: the engine
@@ -5395,6 +5806,9 @@ fn parse_iterate_args(args: &[String]) -> Result<Option<IterateArgs>, String> {
     let mut mtp_depth: Option<u32> = None;
     let mut candidate_spec_json: Option<String> = None;
     let mut engine_resources: Vec<engine_resource::EngineResource> = Vec::new();
+    let mut baseline_workspace: Option<PathBuf> = None;
+    let mut baseline_calibration: Option<PathBuf> = None;
+    let mut box_name: Option<String> = None;
 
     // A flag that needs a value reads args[i+1] and advances the index by 2.
     fn value<'a>(args: &'a [String], i: usize, name: &str) -> Result<&'a str, String> {
@@ -5492,6 +5906,21 @@ fn parse_iterate_args(args: &[String]) -> Result<Option<IterateArgs>, String> {
             }
             "--contract" => {
                 contract = Some(PathBuf::from(value(args, i, "--contract")?));
+                i += 2;
+            }
+            // THE RANKED PAIRED PATH's two runner inputs (David 2026-09-08). Both are also read
+            // from the runner environment; the flags are how an operator drives the path by hand.
+            "--baseline-workspace" => {
+                baseline_workspace = Some(PathBuf::from(value(args, i, "--baseline-workspace")?));
+                i += 2;
+            }
+            "--baseline-calibration" => {
+                baseline_calibration =
+                    Some(PathBuf::from(value(args, i, "--baseline-calibration")?));
+                i += 2;
+            }
+            "--box" => {
+                box_name = Some(value(args, i, "--box")?.to_string());
                 i += 2;
             }
             // Repeatable resource passthrough. The value is taken from THIS command line and is
@@ -5705,6 +6134,9 @@ fn parse_iterate_args(args: &[String]) -> Result<Option<IterateArgs>, String> {
         weights_digest,
         contract,
         spec,
+        baseline_workspace,
+        baseline_calibration,
+        box_name,
         engine_resources,
     }))
 }
@@ -6149,217 +6581,332 @@ mod tests {
         assert!(parse_iterate_args(&mk(&[])).unwrap().is_some());
     }
 
-    /// #132/F2 — the #127 ruling AT ITS DECISION SEAM.
+    /// THE LIVE-CONTROL-LEG TRACKS, on every path that is NOT the paired one (David 2026-09-08).
     ///
-    /// The merged #127 test injected baselines into `iterate_core` directly, which proves what a
-    /// run does with a pair, not where the pair came from — reverting the routing in
-    /// `execute_iterate` left the suite green. This one calls the SAME function the runner
-    /// calls, with a golden that declares the retired fork's pair AND an explicit flag override,
-    /// and asserts neither reaches the local legs. Route local back through the golden and it
-    /// fails.
-    /// #127 (local legs score ONLY against the official constants) under the PENDING state: the
-    /// local legs refuse BY NAME before anything runs, and neither the golden's declared pair nor a
-    /// `--baseline` flag can stand in for the missing capture. Official stays golden-authoritative
-    /// for its pair (its bands still need the capture; see `execute_iterate`).
-    /// REGRESSION (reconverge merge 85244ab): the SINGLE-LEG tracks must keep the PLATFORM
-    /// baseline arm on every non-timed path.
+    /// These two tracks store no pair anywhere, so every path that would have read one now answers
+    /// for itself, and each answer is asserted BY VALUE or BY NAME:
     ///
-    /// The merge added the two Qwen 3.8 125B-A6B rows to `OFFICIAL_BASELINES_BY_TRACK`, and the
-    /// arm predicate was `official_baseline(t).is_ok()` — true for those rows — so both tracks
-    /// started taking the TABLE arm, whose `scored_regime` fence refuses them
-    /// (`SCORED_REGIMES_BY_TRACK` holds only `qwen3.8-27b-mtp-v1`; declaring a 125B regime is a
-    /// David ruling, not a merge resolution). `--mode local-iterate`, `--mode local-submit` and
-    /// gates-only official all refused where the release branch worked.
+    /// * the LOCAL legs resolve to `Unscored` — they measure the candidate leg and seal no score,
+    ///   so a participant on a laptop keeps a working benchmark and nobody gets a number that
+    ///   looks like a rank;
+    /// * the GATES-ONLY official seam resolves to the ZERO placeholders, because it measures no
+    ///   leg and there is no stored pair to fill in;
+    /// * `--capture-baseline` refuses BY NAME: there is no pair to capture, and the verb that
+    ///   replaced it is `calibrate-baseline`.
     ///
-    /// Both arms are asserted by VALUE, not by "no error": the platform pair and the 27B table
-    /// pair are different numbers, so a run that took the wrong arm fails here even if that arm
-    /// happened to resolve.
+    /// NEGATIVE CONTROLS: the STORED-PAIR tracks are untouched on all three.
     #[test]
-    fn the_single_leg_tracks_resolve_through_the_platform_arm() {
+    fn the_live_control_leg_tracks_store_no_pair_on_any_other_path() {
         use crate::iterate::Mode;
-        use bench_core::constants::Platform;
 
-        // A golden that declares NO pair: it cannot mask which arm answered.
-        // `TestGolden::new()` carries the oracle but declares NO baseline pair.
+        // A golden that declares NO pair: it cannot mask which source answered.
         let golden = crate::testgolden::TestGolden::new().fixture();
         assert_eq!(
             resolve_paired_baselines(None, &golden),
             None,
-            "precondition: the golden declares no pair, so the arm's last source is what answers"
+            "precondition: the golden declares no pair"
         );
 
-        for (track, platform) in [
-            ("qwen3.8-125b-a6b-mlx-v1", Platform::Mlx),
-            ("qwen3.8-125b-a6b-cuda-v1", Platform::Cuda),
-        ] {
-            // PRECONDITION — this is exactly the shape the defect turned on: the track has its
-            // own baseline row and NO declared regime.
-            assert!(bench_core::constants::scored_regime(track).is_err(), "{track}");
-            assert!(!resolves_through_the_track_table(track), "{track}");
-
-            // WHICH ARM ANSWERED is what this test discriminates, and the two arms answer
-            // differently in BOTH states. Captured (MLX): the platform arm hands back the
-            // platform's pair, which the table arm could not produce. Pending (CUDA, re-pending
-            // for the ds4 engine capture): the platform arm refuses naming the PLATFORM sentinel,
-            // where the table arm would refuse naming `OFFICIAL_BASELINE_PENDING` instead. Either
-            // way a run that took the wrong arm fails here.
-            match platform.official_baseline() {
-                Ok(want) => {
-                    // LOCAL legs: resolved, not refused, and to the PLATFORM's pair.
-                    for mode in [Mode::LocalIterate, Mode::LocalSubmit] {
-                        match run_baselines(mode, &golden, None, Some(track), platform)
-                            .unwrap_or_else(|e| {
-                                panic!(
-                                    "{track}/{}: must resolve, got refusal: {e}",
-                                    mode.mode_name()
-                                )
-                            }) {
-                            RunBaselines::Decided {
-                                prefill, decode, ..
-                            } => {
-                                assert_eq!(prefill, want.prefill_seconds_per_token, "{track}");
-                                assert_eq!(decode, want.decode_seconds_per_token, "{track}");
-                            }
-                            other => {
-                                panic!("{track}: a local leg must decide its pair, got {other:?}")
-                            }
-                        }
-                    }
-
-                    // GATES-ONLY official: same arm, same pair, no refusal.
-                    let pair = gates_only_baselines(Some(track), None, &golden, platform)
-                        .unwrap_or_else(|e| {
-                            panic!("{track}: gates-only must resolve, got refusal: {e}")
-                        });
-                    assert_eq!(
-                        pair,
-                        (
-                            want.prefill_seconds_per_token,
-                            want.decode_seconds_per_token
-                        ),
-                        "{track}: gates-only must take the platform arm"
-                    );
-                }
-                Err(_) => {
-                    let sentinel = platform.official_baseline_pending();
-                    for mode in [Mode::LocalIterate, Mode::LocalSubmit] {
-                        let err = run_baselines(mode, &golden, None, Some(track), platform)
-                            .expect_err("a pending pair must refuse before anything runs");
-                        assert!(
-                            err.contains(sentinel),
-                            "{track}/{}: the PLATFORM arm must answer: {err}",
-                            mode.mode_name()
-                        );
-                        assert!(
-                            !err.contains(bench_core::constants::OFFICIAL_BASELINE_PENDING),
-                            "{track}/{}: the TABLE arm answered: {err}",
-                            mode.mode_name()
-                        );
-                    }
-                    let err = gates_only_baselines(Some(track), None, &golden, platform)
-                        .expect_err("a pending pair must refuse before anything runs");
-                    assert!(err.contains(sentinel), "{track}: gates-only: {err}");
-                }
-            }
-        }
-    }
-
-    /// The ds4 RE-PENDING (David 2026-09-03: ds4 replaces vLLM on the CUDA track). Setting
-    /// `OFFICIAL_BASELINE_CUDA` back to the pending sentinel swaps the two doors on that track,
-    /// and this build is the capture instrument on the far side of that swap:
-    ///
-    /// * `iterate --mode official` REFUSES BY NAME — `execute_iterate` resolves
-    ///   `platform.official_baseline()?` itself, unconditionally, before the timed leg (the
-    ///   acceptance bands come from the captured pair); the gates-only official seam
-    ///   (`gates_only_baselines`) and both local legs stop at the same refusal;
-    /// * `--capture-baseline` is ACCEPTED — `capture::refuse_unless_pending` arms exactly while
-    ///   the pair is pending, which is the whole reason the capture can end its own pending state.
-    ///
-    /// NEGATIVE CONTROL: MLX is untouched and still captured, so its doors stay the other way
-    /// round — official resolves and the capture mode refuses. A change that pended BOTH tracks,
-    /// or that armed the capture mode unconditionally, fails here.
-    #[test]
-    fn the_cuda_track_refuses_official_scoring_and_arms_the_capture_mode() {
-        use crate::iterate::Mode;
-        use bench_core::constants::Platform;
-        const CUDA_TRACK: &str = "qwen3.8-125b-a6b-cuda-v1";
-
-        // The platform comes from the declared track id and nowhere else — this is the value
-        // `MLXFAST_QWEN_MTP_TRACK_ID=qwen3.8-125b-a6b-cuda-v1` resolves to.
-        let platform = iterate_platform(Some(CUDA_TRACK)).unwrap();
-        assert_eq!(platform, Platform::Cuda);
-
-        // OFFICIAL: refused, by name, naming the sentinel and the platform.
-        let err = platform.official_baseline().unwrap_err();
-        assert!(
-            err.contains(platform.official_baseline_pending()),
-            "the refusal must name the sentinel: {err}"
-        );
-        assert!(err.contains(platform.key()), "{err}");
-        let golden = crate::testgolden::TestGolden::new().fixture();
-        for mode in [Mode::LocalIterate, Mode::LocalSubmit] {
+        for track in bench_core::constants::LIVE_CONTROL_LEG_TRACKS {
             assert!(
-                run_baselines(mode, &golden, None, Some(CUDA_TRACK), platform)
-                    .unwrap_err()
-                    .contains(platform.official_baseline_pending()),
-                "{}",
-                mode.mode_name()
+                bench_core::constants::official_baseline(track).is_err(),
+                "precondition: {track} stores no pair"
+            );
+            for mode in [Mode::LocalIterate, Mode::LocalSubmit] {
+                assert_eq!(
+                    run_baselines(mode, &golden, None, Some(track)).unwrap(),
+                    RunBaselines::Unscored,
+                    "{track}/{}: a local leg measures the candidate and seals no score",
+                    mode.mode_name()
+                );
+                // Not even a `--baseline-*` flag turns it into a scored run: the flags are a
+                // STORED pair, and this track has no source for one.
+                assert_eq!(
+                    run_baselines(mode, &golden, Some((0.5, 0.6)), Some(track)).unwrap(),
+                    RunBaselines::Unscored,
+                    "{track}/{}: a stored pair must not score this track",
+                    mode.mode_name()
+                );
+            }
+            assert_eq!(
+                gates_only_baselines(Some(track), None, &golden).unwrap(),
+                (0.0, 0.0),
+                "{track}: a gates-only run measured no leg, so it seals no pair"
+            );
+            // Even a trusted override does not put a denominator on this track's gates-only seam:
+            // the timed path refuses that override outright, so honouring it here would be the one
+            // place a stored pair still reached these tracks.
+            assert_eq!(
+                gates_only_baselines(Some(track), Some((0.5, 0.6)), &golden).unwrap(),
+                (0.0, 0.0),
+                "{track}: gates-only must not absorb a stored override"
+            );
+            let err = capture::refuse_live_control_leg_track(track)
+                .expect_err("there is no pair to capture on a live-control-leg track");
+            assert!(
+                err.contains(capture::CAPTURE_RETIRED_FOR_LIVE_CONTROL_LEG),
+                "{track}: {err}"
+            );
+            assert!(err.contains("calibrate-baseline"), "{track}: {err}");
+            // OFFICIAL still DEFERS in `run_baselines` — the paired arm in `execute_iterate` is
+            // what answers, and it answers by measuring.
+            assert_eq!(
+                run_baselines(Mode::Official, &golden, None, Some(track)).unwrap(),
+                RunBaselines::ResolveFromOverrideOrGolden
             );
         }
-        // The OFFICIAL seam that DOES answer here is the gates-only one, which takes the platform
-        // arm for this track (it declares no regime) and passes the accessor's refusal through.
+
+        // NEGATIVE CONTROLS — a stored-pair track is untouched on all three.
+        const STORED: &str = bench_core::constants::TRACK_ID;
+        assert!(!bench_core::constants::scores_against_live_control_leg(
+            STORED
+        ));
+        assert!(capture::refuse_live_control_leg_track(STORED).is_ok());
+        assert!(run_baselines(Mode::LocalIterate, &golden, None, Some(STORED)).is_ok());
+        assert_ne!(
+            gates_only_baselines(Some(STORED), None, &golden).unwrap(),
+            (0.0, 0.0)
+        );
+    }
+
+    /// THE TWO LOCAL BRANCHES of a live-control-leg track, at the switch that chooses between
+    /// them.
+    ///
+    /// With NO reference tree in reach a local run is UNSCORED: it measures the candidate leg and
+    /// seals no score. With BOTH runner inputs present it takes the full PAIRED path — the same
+    /// two-leg measurement the ranked path runs. The switch is `paired_inputs_present`, and it
+    /// reads the flags first and the runner environment second; HALF the inputs is not the paired
+    /// path, because one leg cannot be checked against a band that is not there.
+    #[test]
+    fn a_local_run_pairs_only_when_both_runner_inputs_are_present() {
+        fn args_with(workspace: Option<&str>, calibration: Option<&str>) -> IterateArgs {
+            let mut argv: Vec<String> = ["--engine", "e", "--weights", "w", "--golden", "g"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            if let Some(w) = workspace {
+                argv.push("--baseline-workspace".to_string());
+                argv.push(w.to_string());
+            }
+            if let Some(c) = calibration {
+                argv.push("--baseline-calibration".to_string());
+                argv.push(c.to_string());
+            }
+            parse_iterate_args(&argv).unwrap().unwrap()
+        }
+
+        // The FLAGS decide, and both are needed.
+        assert!(paired_inputs_present(&args_with(
+            Some("/ref/tree"),
+            Some("/ref/cal.json")
+        )));
+        assert!(!paired_inputs_present(&args_with(Some("/ref/tree"), None)));
+        assert!(!paired_inputs_present(&args_with(
+            None,
+            Some("/ref/cal.json")
+        )));
+        assert!(!paired_inputs_present(&args_with(None, None)));
+    }
+
+    /// THE UNSCORED SEAL. A local run of a live-control-leg track carries the real timing surface
+    /// and the real correctness verdict, states WHY it has no denominator, and seals `score:
+    /// null` — and a REAL failure keeps its own error rather than being tidied away by the
+    /// unscored conversion.
+    #[test]
+    fn an_unscored_local_run_seals_its_timings_and_no_score() {
+        let golden = crate::testgolden::TestGolden::new().fixture();
+        // The shape `local_iterate_score` produces with the `(0.0, 0.0)` no-denominator pair:
+        // real timings, correctness passed, no score, and the placeholder text.
+        let timing = bench_runner::TimingResult {
+            prefill_seconds_per_token: 0.0004,
+            decode_seconds_per_token: 0.02,
+            decode_steps: 128,
+            prefill_prompt_tokens: 512,
+            prefill_elapsed_seconds: 0.2048,
+            decode_elapsed_seconds: 2.56,
+            peak_ram_gb: 20.0,
+            effective_spec: None,
+            free_run_audit: None,
+        };
+        let mut payload = iterate::local_iterate_score(
+            Mode::LocalIterate,
+            &timing,
+            0.0,
+            0.0,
+            &golden,
+            iterate::RunDigests::for_test(&DirDigest::empty()),
+        );
         assert!(
-            gates_only_baselines(Some(CUDA_TRACK), None, &golden, platform)
-                .unwrap_err()
-                .contains(platform.official_baseline_pending())
+            !payload.passed,
+            "precondition: the zero pair reports no score"
         );
-
-        // WHERE the timed official refusal lives, stated as an assertion rather than a comment:
-        // NOT in `run_baselines`, which defers on official (`ResolveFromOverrideOrGolden`) so the
-        // golden-authoritative resolution can run. `execute_iterate` therefore resolves
-        // `platform.official_baseline()?` ITSELF, unconditionally, before `resolve_paired_baselines`
-        // — the acceptance bands come from the captured pair, so there is nothing to score with.
         assert_eq!(
-            run_baselines(Mode::Official, &golden, None, Some(CUDA_TRACK), platform).unwrap(),
-            RunBaselines::ResolveFromOverrideOrGolden,
-            "run_baselines must keep deferring on official; the refusal is execute_iterate's own"
+            payload.metrics.error,
+            iterate::INVALID_LOCAL_SCORE_ERROR,
+            "precondition: the placeholder text is what the zero pair leaves"
         );
 
-        // …and that refusal is not merely "no other number was available". A golden that declares
-        // a pair and an explicit `--baseline` override are both things the official path consumes,
-        // and neither is consulted before the pending pair refuses: a pending pair is a REFUSAL,
-        // never a fall-through to the nearest available number.
+        iterate::seal_local_unscored(&mut payload);
+        assert!(payload.score.is_none(), "an unscored run seals no score");
+        assert!(payload.passed, "a healthy unscored run is not a failure");
+        assert_eq!(payload.metrics.error, "", "the placeholder text is cleared");
+        assert_eq!(
+            payload.metrics.baseline_source.as_deref(),
+            Some(iterate::BASELINE_SOURCE_LOCAL_UNSCORED)
+        );
+        assert_eq!(
+            payload.metrics.baseline_source.as_deref(),
+            Some("none (local mode: unscored)")
+        );
+        // The RAW timings are sealed, and they are the ones measured.
+        assert_eq!(payload.metrics.prefill_seconds_per_token, 0.0004);
+        assert_eq!(payload.metrics.decode_seconds_per_token, 0.02);
+        assert!(payload.metrics.passed_correctness);
+        // No denominator was invented for it.
+        assert_eq!(payload.metrics.baseline_prefill_seconds_per_token, 0.0);
+        assert_eq!(payload.metrics.baseline_decode_seconds_per_token, 0.0);
+        // The human-facing rate, from the same numbers.
+        assert!((tokens_per_second(0.02) - 50.0).abs() < 1e-9);
+        assert_eq!(tokens_per_second(0.0), 0.0);
+        assert_eq!(tokens_per_second(f64::NAN), 0.0);
+        // …and it reaches the sealed JSON as a marker, not as a number.
+        let sealed: serde_json::Value =
+            serde_json::from_str(&payload.to_sealed_json().unwrap()).unwrap();
+        assert!(sealed["score"].is_null());
+        assert_eq!(
+            sealed["metrics"]["baseline_source"].as_str(),
+            Some("none (local mode: unscored)")
+        );
+
+        // A REAL failure is NOT converted: its error and its verdict survive.
+        let mut failed = iterate::local_iterate_score(
+            Mode::LocalIterate,
+            &timing,
+            0.0,
+            0.0,
+            &golden,
+            iterate::RunDigests::for_test(&DirDigest::empty()),
+        );
+        failed.metrics.passed_correctness = false;
+        failed.metrics.error = "correctness failed: case-a step 3".to_string();
+        iterate::seal_local_unscored(&mut failed);
+        assert!(!failed.passed, "a correctness failure stays a failure");
+        assert_eq!(failed.metrics.error, "correctness failed: case-a step 3");
+        assert!(failed.score.is_none());
+        assert_eq!(
+            failed.metrics.baseline_source.as_deref(),
+            Some(iterate::BASELINE_SOURCE_LOCAL_UNSCORED),
+            "an unscored run says so even when it failed"
+        );
+    }
+
+    /// THE STORED-PAIR DOORS ARE SHUT on the ranked paired path, each BY NAME. This is the fence
+    /// `execute_iterate` applies pre-GPU: a golden that still declares a pair, the trusted
+    /// `MLXFAST_PAIRED_BASELINE_*` env, and the `--baseline-*` flags. Each is a denominator, and
+    /// the paired path has exactly one denominator: the leg it measures.
+    #[test]
+    fn the_paired_path_refuses_every_stored_denominator() {
         let declaring = crate::testgolden::TestGolden::new()
             .baselines(0.000123456, 0.00987654)
             .fixture();
-        assert_eq!(
-            resolve_paired_baselines(Some((0.5, 0.6)), &declaring),
-            Some((0.5, 0.6)),
-            "precondition: the official path really did have a pair to fall through to"
-        );
+        let err = baseline::refuse_golden_with_stored_pair(&declaring).unwrap_err();
         assert!(
-            platform.official_baseline().is_err(),
-            "the pending pair must refuse with a fall-through value in reach"
+            err.contains(baseline::GOLDEN_CARRIES_STORED_BASELINE),
+            "{err}"
         );
+        // A golden with no declared pair passes the same gate.
+        let clean = crate::testgolden::TestGolden::new().fixture();
+        assert!(baseline::refuse_golden_with_stored_pair(&clean).is_ok());
 
-        // CAPTURE: armed, with the exact arguments `execute_iterate` passes to the gate.
-        capture::refuse_unless_pending(
-            platform.key(),
-            platform.official_baseline_declared().is_some(),
-            platform.official_baseline_pending(),
+        // The flags are still PARSED (the stored-pair tracks use them); they are refused at the
+        // paired path's door, not at the door of every run.
+        let args: Vec<String> = [
+            "--engine",
+            "e",
+            "--weights",
+            "w",
+            "--golden",
+            "g",
+            "--mode",
+            "official",
+            "--contract",
+            "c.json",
+            "--baseline-prefill-spt",
+            "0.0006",
+            "--baseline-decode-spt",
+            "0.03",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let parsed = parse_iterate_args(&args).unwrap().unwrap();
+        assert_eq!(parsed.baseline_prefill_spt, Some(0.0006));
+        let err = baseline::refuse_stored_baseline_override(
+            None,
+            None,
+            parsed.baseline_prefill_spt.is_some() || parsed.baseline_decode_spt.is_some(),
         )
-        .expect("--capture-baseline must be armed while the CUDA pair is pending");
-
-        // NEGATIVE CONTROL — MLX keeps the captured state, so both doors are the other way round.
-        assert!(Platform::Mlx.official_baseline().is_ok());
+        .unwrap_err();
         assert!(
-            capture::refuse_unless_pending(
-                Platform::Mlx.key(),
-                Platform::Mlx.official_baseline_declared().is_some(),
-                Platform::Mlx.official_baseline_pending(),
-            )
-            .is_err(),
-            "the capture mode must stay closed on the CAPTURED MLX track"
+            err.contains(baseline::STORED_BASELINE_OVERRIDE_REFUSED),
+            "{err}"
+        );
+    }
+
+    /// THE PAIRED PATH's two runner inputs are FLAGS as well as environment variables, and both
+    /// resolve the same way: the flag when it is given, else the runner variable.
+    #[test]
+    fn the_paired_runner_inputs_parse_as_flags() {
+        let args: Vec<String> = [
+            "--engine",
+            "e",
+            "--weights",
+            "w",
+            "--golden",
+            "g",
+            "--mode",
+            "official",
+            "--contract",
+            "c.json",
+            "--baseline-workspace",
+            "/ref/tree",
+            "--baseline-calibration",
+            "/ref/calibration.json",
+            "--box",
+            "m5-max-128gb-4-qwen38-125b-a6b-mlx",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let parsed = parse_iterate_args(&args).unwrap().unwrap();
+        assert_eq!(
+            parsed.baseline_workspace.as_deref(),
+            Some(Path::new("/ref/tree"))
+        );
+        assert_eq!(
+            parsed.baseline_calibration.as_deref(),
+            Some(Path::new("/ref/calibration.json"))
+        );
+        assert_eq!(
+            parsed.box_name.as_deref(),
+            Some("m5-max-128gb-4-qwen38-125b-a6b-mlx")
+        );
+        // Absent from the command line, the flags are absent — the environment answers instead,
+        // and a run with neither refuses by name (`baseline::resolve_workspace`).
+        let bare: Vec<String> = ["--engine", "e", "--weights", "w", "--golden", "g"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parsed = parse_iterate_args(&bare).unwrap().unwrap();
+        assert!(parsed.baseline_workspace.is_none());
+        assert!(parsed.baseline_calibration.is_none());
+        assert!(parsed.box_name.is_none());
+        let err = baseline::resolve_workspace(None, None).unwrap_err();
+        assert!(err.contains(baseline::BASELINE_WORKSPACE_MISSING), "{err}");
+        let err = baseline::load_calibration(None, None).unwrap_err();
+        assert!(
+            err.contains(baseline::BASELINE_CALIBRATION_MISSING),
+            "{err}"
         );
     }
 
@@ -6368,24 +6915,19 @@ mod tests {
     #[test]
     fn the_declared_regime_track_still_resolves_through_the_table_arm() {
         use crate::iterate::Mode;
-        use bench_core::constants::{Platform, TRACK_ID};
+        use bench_core::constants::TRACK_ID;
 
         // `TestGolden::new()` carries the oracle but declares NO baseline pair.
         let golden = crate::testgolden::TestGolden::new().fixture();
         assert!(resolves_through_the_track_table(TRACK_ID));
         let want = bench_core::constants::official_baseline(TRACK_ID).unwrap();
-        // The two arms answer DIFFERENTLY, which is what makes the assertions below discriminate.
-        assert_ne!(
-            want.prefill_seconds_per_token,
-            Platform::Mlx
-                .official_baseline()
-                .unwrap()
-                .prefill_seconds_per_token
-        );
+        // The DISCRIMINATOR: this track is not a live-control-leg track, so the table answers for
+        // it where the paired arm answers for those.
+        assert!(!bench_core::constants::scores_against_live_control_leg(
+            TRACK_ID
+        ));
 
-        match run_baselines(Mode::LocalIterate, &golden, None, Some(TRACK_ID), Platform::Mlx)
-            .unwrap()
-        {
+        match run_baselines(Mode::LocalIterate, &golden, None, Some(TRACK_ID)).unwrap() {
             RunBaselines::Decided {
                 prefill, decode, ..
             } => {
@@ -6395,7 +6937,7 @@ mod tests {
             other => panic!("the declared-regime track must decide its pair, got {other:?}"),
         }
         assert_eq!(
-            gates_only_baselines(Some(TRACK_ID), None, &golden, Platform::Mlx).unwrap(),
+            gates_only_baselines(Some(TRACK_ID), None, &golden).unwrap(),
             (
                 want.prefill_seconds_per_token,
                 want.decode_seconds_per_token
@@ -6415,26 +6957,33 @@ mod tests {
             Some((0.000123456, 0.00987654)),
             "precondition: the OFFICIAL resolver really would have taken the golden's pair"
         );
-        for platform in Platform::ALL {
-            if platform.official_baseline_declared().is_some() {
-                continue;
+        // NO TRACK ID at all: the local legs have nothing to key a pair by, so they refuse
+        // before anything runs — the golden's declared pair and a `--baseline` flag are both in
+        // reach and neither stands in for it.
+        for mode in [Mode::LocalIterate, Mode::LocalSubmit] {
+            for flags in [None, Some((0.5_f64, 0.6_f64))] {
+                let err = run_baselines(mode, &golden, flags, None)
+                    .expect_err("a local leg must not score without a track to key the pair by");
+                assert!(
+                    err.contains("MLXFAST_QWEN_MTP_TRACK_ID"),
+                    "{}: the refusal must name the declaration it needs: {err}",
+                    mode.mode_name()
+                );
             }
-            for mode in [Mode::LocalIterate, Mode::LocalSubmit] {
-                for flags in [None, Some((0.5_f64, 0.6_f64))] {
-                    let err = run_baselines(mode, &golden, flags, None, platform)
-                        .expect_err("a local leg must not score while the baseline is pending");
-                    assert!(
-                        err.contains(platform.official_baseline_pending()),
-                        "{}/{}: the refusal must name the sentinel: {err}",
-                        platform.key(),
-                        mode.mode_name()
-                    );
-                }
-            }
-            assert_eq!(
-                run_baselines(Mode::Official, &golden, None, None, platform).unwrap(),
-                RunBaselines::ResolveFromOverrideOrGolden,
-                "official must stay golden-authoritative (#127 scoped itself to the local leg)"
+        }
+        assert_eq!(
+            run_baselines(Mode::Official, &golden, None, None).unwrap(),
+            RunBaselines::ResolveFromOverrideOrGolden,
+            "official must stay golden-authoritative (#127 scoped itself to the local leg)"
+        );
+        // A track with no row in the table refuses BY NAME through the table's own accessor.
+        for mode in [Mode::LocalIterate, Mode::LocalSubmit] {
+            let err = run_baselines(mode, &golden, None, Some("qwen3.9-27b-mlx-v1"))
+                .expect_err("an uncaptured track must refuse before anything runs");
+            assert!(
+                err.contains(bench_core::constants::OFFICIAL_BASELINE_PENDING),
+                "{}: {err}",
+                mode.mode_name()
             );
         }
         // The platform comes from the declared track id and nowhere else.

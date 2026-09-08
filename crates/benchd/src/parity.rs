@@ -568,13 +568,24 @@ mod tests {
     }
 
     /// The ALLOWLIST of `metrics.*` keys that are deliberately UNROSTERED: `per_prompt`, the
-    /// speculative-decode seal, and the engine identity (backend/device/protocol version, the
-    /// loaded-head digest, the runner identity, and the resident-process identity). All are benchd-only additions the SWIFT
+    /// speculative-decode seal, the engine identity (backend/device/protocol version, the
+    /// loaded-head digest, the runner identity, and the resident-process identity), and the
+    /// PAIRED-BASELINE seal (which box, which calibration bytes, which reference commit, and the
+    /// two legs' measured pairs). All are benchd-only additions the SWIFT
     /// reference never emits, and all are omitted-when-unset — rostering a key that is absent on
     /// BOTH sides would hard-fail every pair as SCHEMA-DRIFT-MISSING, which is why they are
     /// unrostered rather than bucketed.
     const UNROSTERED_ADDITIVE_METRICS: &[&str] = &[
         "acceptance_lengths",
+        "baseline_band_passed",
+        "baseline_box",
+        "baseline_calibration_sha256",
+        "baseline_leg_decode_seconds_per_token",
+        "baseline_leg_prefill_seconds_per_token",
+        "baseline_reference_commit",
+        "baseline_source",
+        "candidate_leg_decode_seconds_per_token",
+        "candidate_leg_prefill_seconds_per_token",
         "effective_spec_depth",
         "effective_spec_mode",
         "engine_backend",
@@ -627,6 +638,15 @@ mod tests {
             runner_build: Some("c4089870".to_string()),
             resident_pid: Some(4242),
             resident_load_epoch: Some(1_756_944_000),
+            baseline_source: Some("serial-control-leg".to_string()),
+            baseline_box: Some("m5-max-128gb-4-qwen38-125b-a6b-mlx".to_string()),
+            baseline_calibration_sha256: Some("c".repeat(64)),
+            baseline_reference_commit: Some("d".repeat(40)),
+            baseline_band_passed: Some(true),
+            baseline_leg_prefill_seconds_per_token: Some(0.0006),
+            baseline_leg_decode_seconds_per_token: Some(0.032),
+            candidate_leg_prefill_seconds_per_token: Some(0.0006),
+            candidate_leg_decode_seconds_per_token: Some(0.016),
             ..Default::default()
         };
         let v = serde_json::to_value(&populated).unwrap();

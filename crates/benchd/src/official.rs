@@ -421,6 +421,143 @@ pub fn official_timed_params(
     .with_prefill_warmup_runs(platform.official_prefill_warmup_runs())
 }
 
+/// The MEASUREMENT-INTEGRITY WARMUP leg's parameters (coordinator ruling 2026-08-31): ONE
+/// unmeasured, DISCARDED pass over the SAME benchmark prompt, decode seed and oracle the timed
+/// legs use, at the SAME decode depth and with the SAME spec.
+///
+/// WHY IT EXISTS. On a FRESH resident serve the FIRST forward pays cold first-prefill JIT /
+/// CUDA-graph-capture / flashinfer-JIT cost: a sealed CUDA null-control (serial-vs-serial, expected
+/// score ~1.000) FLOOR-REFUSED at prefill_speedup 0.261 (532 vs 2041 tok/s) purely from that cold
+/// first prefill. Both legs of a paired run are warmed identically, so the comparison is
+/// warm-against-warm on both sides.
+///
+/// WHY IT CANNOT LEAK INTO THE MEASURED NUMBERS. It runs `VerifyMode::TimeOnly`, so a token
+/// divergence does not abort it (catching an oracle mismatch stays the REAL timed legs' job), and
+/// its `TimingResult` is DISCARDED on the spot — it never reaches any baseline, speedup, floor,
+/// band or score. The depth matches the timed window (`Mode::Official.decode_steps()`) because a
+/// shorter warmup left the timed decode measurably colder. The SPEC matches the timed leg's,
+/// because a speculating window JITs different shapes than a serial one.
+///
+/// `None` for a golden too short to warm, so the real timed leg surfaces the canonical
+/// precondition error rather than a warmup-labelled one. That guard is no stricter than the timed
+/// path's own.
+fn official_warmup_params(
+    benchmark: &bench_core::golden::BenchmarkGolden,
+    spec: Option<SpecConfig>,
+) -> Option<TimingParams> {
+    let warmup_decode_steps = Mode::Official.decode_steps();
+    let runnable = benchmark.expected_decode_tokens.len() >= warmup_decode_steps
+        && !benchmark.prefill_prompt_tokens.is_empty()
+        && !benchmark.decode_seed_tokens.is_empty();
+    runnable.then(|| {
+        TimingParams::new(
+            benchmark.prefill_prompt_tokens.clone(),
+            benchmark.expected_prefill_token,
+            benchmark.decode_seed_tokens.clone(),
+            benchmark.expected_decode_seed_token,
+            benchmark.expected_decode_tokens.clone(),
+            warmup_decode_steps,
+        )
+        .with_spec(spec)
+    })
+}
+
+/// WHICH stage of a timed window failed. The three classes carry different sealed error strings
+/// and different failure payloads, so they stay distinct all the way out of [`run_timed_window`]
+/// rather than being flattened into one message the caller has to re-parse.
+enum TimedWindowFailure {
+    /// The transient warmup worker could not be spawned (FreshPerPhase only).
+    WarmupSpawn(RunnerError),
+    /// The unmeasured warmup leg itself faulted.
+    Warmup(RunnerError),
+    /// The measured prefill/decode legs faulted — including the oracle-mismatch class.
+    Timed(RunnerError),
+}
+
+/// ONE window's WARMUP leg and TIMED prefill+decode legs, keyed by [`WorkerResidency`]. This is
+/// the shared measurement body: the ranked candidate leg ([`official_core_windowed`]), the
+/// SERIAL-CONTROL leg of a paired run and every `calibrate-baseline` pass all run through it, so
+/// the three cannot drift apart.
+///
+/// * [`WorkerResidency::FreshPerPhase`] (CUDA): a TRANSIENT warmup worker warms the resident serve
+///   and is REAPED, then the prefill worker and the decode worker each spawn and are reaped in
+///   turn. Nothing is held, so `None` comes back as the session.
+/// * [`WorkerResidency::PersistentWindow`] (MLX, and the one-connection ds4 resident): ONE
+///   model-holding worker is opened, warmed and driven through both timed phases, and is RETURNED
+///   still open so a caller that needs another phase over the same residency (official's
+///   correctness gate) never loads the model twice.
+///
+/// The MEASURED number is computed identically in both arms; only where the worker lives across
+/// phase boundaries differs. The unmeasured warmup leg is deliberately UNGATED — it is what heats
+/// the GPU — and the cool gate then holds each TIMED phase to the per-phase contract.
+fn run_timed_window<T, FT, G>(
+    params: &TimingParams,
+    warmup_params: Option<&TimingParams>,
+    residency: WorkerResidency,
+    spawn_timed: &mut FT,
+    cool_gate: &mut G,
+) -> (Result<TimingResult, TimedWindowFailure>, Option<Session<T>>)
+where
+    T: LineTransport,
+    FT: FnMut() -> bench_runner::Result<Session<T>>,
+    G: FnMut(&str) -> bench_runner::Result<()>,
+{
+    let mut no_cool_gate = |_phase: &str| -> bench_runner::Result<()> { Ok(()) };
+    match residency {
+        WorkerResidency::FreshPerPhase => {
+            if let Some(wp) = warmup_params {
+                match spawn_timed() {
+                    Ok(mut warmup_session) => {
+                        if let Err(e) = run_timed_benchmark_persistent_on_session(
+                            &mut warmup_session,
+                            &mut no_cool_gate,
+                            wp,
+                            VerifyMode::TimeOnly,
+                        ) {
+                            return (Err(TimedWindowFailure::Warmup(e)), None);
+                        }
+                        // Reap the transient warmup worker (drop = kill+wait) before the timed
+                        // prefill worker spawns, so two residencies are never live at once.
+                        drop(warmup_session);
+                    }
+                    Err(e) => return (Err(TimedWindowFailure::WarmupSpawn(e)), None),
+                }
+            }
+            (
+                run_timed_benchmark_fresh_per_phase(spawn_timed, cool_gate, params)
+                    .map_err(TimedWindowFailure::Timed),
+                None,
+            )
+        }
+        WorkerResidency::PersistentWindow => {
+            let mut session = match spawn_timed() {
+                Ok(s) => s,
+                Err(e) => return (Err(TimedWindowFailure::Timed(e)), None),
+            };
+            if let Some(wp) = warmup_params {
+                if let Err(e) = run_timed_benchmark_persistent_on_session(
+                    &mut session,
+                    &mut no_cool_gate,
+                    wp,
+                    VerifyMode::TimeOnly,
+                ) {
+                    // A warmup fault discards the session, so fail closed here rather than let the
+                    // measured leg report a bare SessionDiscarded.
+                    return (Err(TimedWindowFailure::Warmup(e)), None);
+                }
+            }
+            let measured = run_timed_benchmark_persistent_on_session(
+                &mut session,
+                cool_gate,
+                params,
+                VerifyMode::Verify,
+            )
+            .map_err(TimedWindowFailure::Timed);
+            (measured, Some(session))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn official_core_windowed<T, FT, FC, G>(
     golden: &GoldenFixture,
@@ -470,176 +607,51 @@ where
     // enforced in `bench_runner`). `None` is byte-for-byte the historical bare request.
     let params = official_timed_params(benchmark, spec.clone(), platform);
 
-    // MEASUREMENT-INTEGRITY WARMUP (coordinator ruling 2026-08-31) — ONE unmeasured, DISCARDED
-    // warmup leg runs BEFORE the timed legs so the official path is a fair WARM-vs-WARM comparison
-    // against the PINNED baseline. Built below (`warmup_params`), run at the head of each residency
-    // arm; its timing is thrown away.
-    //
-    // WHY THIS IS NOT A PARITY REGRESSION. The module header (point 1) documents that "the measured
-    // path is never warmed by the gates" — byte-parity with Swift `QwenRuntimeBenchmark`. That
-    // property is about the CORRECTNESS GATE not warming the TIMED phases (the timed-first ordering,
-    // preserved untouched below) and about the benchd worker-SESSION lifecycle (fresh-per-phase /
-    // per-phase reset). It is NOT about the resident vLLM/MLX SERVE's warmth, which is a
-    // PROCESS-level, SHARED, accumulating state the worker session lives on top of. On a FRESH
-    // resident serve the FIRST forward pays cold first-prefill JIT / CUDA-graph-capture /
-    // flashinfer-JIT cost: a sealed CUDA null-control (serial-vs-serial, expected score ≈1.000)
-    // FLOOR-REFUSED at prefill_speedup 0.261 (532 vs 2041 tok/s) purely from that cold first prefill,
-    // while decode_speedup 0.924 was ≈warm (decode was the serve's 2nd request). The PINNED baseline
-    // was captured WARM — the calibration driver runs an unmeasured [WW] warmup pass before its
-    // measured A/B passes (`iterate::run_capture_passes_over_session`) — so the official path must
-    // ALSO warm the serve before timing, or it prices a COLD candidate against a WARM baseline. This
-    // leg is the deliberate, sanctioned reconciliation of the two serve-warmth states; it is not the
-    // correctness gate warming timing, and it changes NEITHER the timed-first gating order nor the
-    // per-phase worker isolation below.
-    //
-    // WHY IT CANNOT LEAK INTO THE MEASURED NUMBERS. The leg reuses the SAME benchmark prefill prompt
-    // + decode seed + oracle as the timed legs (so it JITs/captures the exact shapes the timed
-    // prefill/decode will hit), and runs a FULL timed-window decode (warmup_decode_steps ==
-    // Mode::Official.decode_steps()): the PINNED baseline was calibrated AFTER a full-length warmup
-    // pass, so a short 8-step warmup left the timed decode measurably COLDER than the baseline (the
-    // ~7% serial-vs-serial null-control decode floor-fail); matching the warmup depth to the timed
-    // window removes that gap. It runs `VerifyMode::TimeOnly`, so
-    // a token divergence does NOT abort it: catching an oracle mismatch stays the REAL timed legs'
-    // job (preserving their gating order and error classes). Its `TimingResult` is DISCARDED on the
-    // spot and never reaches any baseline, speedup, floor, band, or score. It is SKIPPED for a golden
-    // too short to even warm, so the real timed leg surfaces the canonical precondition error rather
-    // than a warmup-labelled one.
-    // warmup_steps = decode_steps (a8/David ruling 2026-08-31): warm decode to the SAME depth the
-    // PINNED baseline was calibrated at (a full timed-window decode pass). The timed leg already
-    // requires expected_decode_tokens.len() >= decode_steps, so this guard is no stricter than the
-    // measured path -- a golden too short to warm is exactly one too short to time.
-    let warmup_decode_steps = Mode::Official.decode_steps();
-    let warmup_runnable = benchmark.expected_decode_tokens.len() >= warmup_decode_steps
-        && !benchmark.prefill_prompt_tokens.is_empty()
-        && !benchmark.decode_seed_tokens.is_empty();
-    let warmup_params = warmup_runnable.then(|| {
-        TimingParams::new(
-            benchmark.prefill_prompt_tokens.clone(),
-            benchmark.expected_prefill_token,
-            benchmark.decode_seed_tokens.clone(),
-            benchmark.expected_decode_seed_token,
-            benchmark.expected_decode_tokens.clone(),
-            warmup_decode_steps,
-        )
-        // The warmup leg MUST request the SAME spec as the timed leg: its whole job is to JIT /
-        // graph-capture the exact shapes the timed window will hit, and a speculating window hits
-        // different ones (drafter forwards, multi-token verify) than a serial window. Warming
-        // serial and then timing MTP would leave the scored leg paying cold drafter cost.
-        .with_spec(spec.clone())
-    });
-
-    // 1. TIMED phases FIRST — prefill then decode, every token VERIFIED against the oracle.
-    //    Every TIMED phase passes the caller's cool gate first (David 2026-09-06: the 40 C
-    //    per-phase contract the paired measure-job holds applies to the single-leg path too;
-    //    the conversion had threaded a no-op here). The UNMEASURED warmup leg stays ungated:
-    //    it is what heats the GPU, and the gate then holds the timed phases to the contract.
-    //    The worker lifecycle is keyed by `residency`:
-    //    - FreshPerPhase (CUDA): prefill worker then decode worker, each fresh and reaped before
-    //      the next (2 transient workers), via `run_timed_benchmark_fresh_per_phase`.
-    //    - PersistentWindow (MLX): ONE resident worker opened here (spawn_timed called ONCE) and
-    //      held in `held_session`; prefill+decode run over it via
-    //      `run_timed_benchmark_persistent_on_session`, and it is reused for correctness below so
-    //      the model loads ONCE. The MEASURED number is computed identically either way.
-    // Warmup legs only; the timed legs take `cool_gate`.
-    let mut no_cool_gate = |_phase: &str| -> bench_runner::Result<()> { Ok(()) };
-    let mut held_session: Option<Session<T>> = None;
-    let measured_result = match residency {
-        WorkerResidency::FreshPerPhase => {
-            // WARMUP (unmeasured): a TRANSIENT warmup worker warms the resident SERVE (the JIT /
-            // graph capture persists serve-side), then is REAPED, before the timed prefill worker
-            // spawns. On CUDA a "worker" is a cheap adapter over the resident vLLM serve, so this
-            // warms exactly the serve the fresh timed workers will reconnect to. Fail-closed on a
-            // warmup fault — no trustworthy run is possible if the engine cannot even warm.
-            if let Some(wp) = &warmup_params {
-                match spawn_timed() {
-                    Ok(mut warmup_session) => {
-                        if let Err(e) = run_timed_benchmark_persistent_on_session(
-                            &mut warmup_session,
-                            &mut no_cool_gate,
-                            wp,
-                            VerifyMode::TimeOnly,
-                        ) {
-                            return official_failed(
-                                golden,
-                                digests,
-                                commit,
-                                format!("official warmup leg failed: {e}"),
-                                false,
-                                None,
-                                None,
-                                None,
-                                None,
-                                (baseline_prefill_spt, baseline_decode_spt),
-                            );
-                        }
-                        // Reap the transient warmup worker (drop = kill+wait) before the timed
-                        // prefill worker spawns, so two residencies are never live at once.
-                        drop(warmup_session);
-                    }
-                    Err(e) => {
-                        return official_failed(
-                            golden,
-                            digests,
-                            commit,
-                            format!("official warmup worker spawn failed: {e}"),
-                            false,
-                            None,
-                            None,
-                            None,
-                            None,
-                            (baseline_prefill_spt, baseline_decode_spt),
-                        );
-                    }
-                }
-            }
-            run_timed_benchmark_fresh_per_phase(&mut spawn_timed, &mut cool_gate, &params)
-        }
-        WorkerResidency::PersistentWindow => match spawn_timed() {
-            Ok(mut session) => {
-                // WARMUP (unmeasured) on the SAME resident worker, BEFORE the measured legs: an
-                // unmeasured seed+short-decode over the held session warms it (the MLX calibration's
-                // [WW] pass is the reference for what a warmup pass does), then the measured legs run
-                // on that SAME session so the model still loads ONCE. A warmup fault discards the
-                // session, so fail closed here rather than let the measured leg report a bare
-                // SessionDiscarded.
-                if let Some(wp) = &warmup_params {
-                    if let Err(e) = run_timed_benchmark_persistent_on_session(
-                        &mut session,
-                        &mut no_cool_gate,
-                        wp,
-                        VerifyMode::TimeOnly,
-                    ) {
-                        return official_failed(
-                            golden,
-                            digests,
-                            commit,
-                            format!("official warmup leg failed: {e}"),
-                            false,
-                            None,
-                            None,
-                            None,
-                            None,
-                            (baseline_prefill_spt, baseline_decode_spt),
-                        );
-                    }
-                }
-                held_session = Some(session);
-                run_timed_benchmark_persistent_on_session(
-                    held_session
-                        .as_mut()
-                        .expect("held_session was just set to Some"),
-                    &mut cool_gate,
-                    &params,
-                    VerifyMode::Verify,
-                )
-            }
-            Err(e) => Err(e),
-        },
-    };
+    // MEASUREMENT-INTEGRITY WARMUP + the TIMED legs, in the window shape this platform runs
+    // ([`run_timed_window`], which carries the whole rationale). The warmup leg is unmeasured and
+    // discarded; the timed legs pass the caller's cool gate; the held session (PersistentWindow
+    // only) comes back so the correctness phase below can reuse the ONE model residency.
+    let warmup_params = official_warmup_params(benchmark, spec.clone());
+    let (measured_result, held) = run_timed_window(
+        &params,
+        warmup_params.as_ref(),
+        residency,
+        &mut spawn_timed,
+        &mut cool_gate,
+    );
+    let held_session: Option<Session<T>> = held;
     let measured =
         match measured_result {
             Ok(t) => t,
-            Err(RunnerError::TokenMismatch { label, step, .. }) => {
+            Err(TimedWindowFailure::WarmupSpawn(e)) => {
+                return official_failed(
+                    golden,
+                    digests,
+                    commit,
+                    format!("official warmup worker spawn failed: {e}"),
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    (baseline_prefill_spt, baseline_decode_spt),
+                );
+            }
+            Err(TimedWindowFailure::Warmup(e)) => {
+                return official_failed(
+                    golden,
+                    digests,
+                    commit,
+                    format!("official warmup leg failed: {e}"),
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    (baseline_prefill_spt, baseline_decode_spt),
+                );
+            }
+            Err(TimedWindowFailure::Timed(RunnerError::TokenMismatch { label, step, .. })) => {
                 // The benchmark-ORACLE failure class the local path cannot test: a corrupted
                 // oracle (or a fast-garbage engine) diverges and FAILS official. Byte-match Swift
                 // `makeFailedScore` for a `BenchmarkTokenMismatchError`
@@ -686,7 +698,7 @@ where
                     baseline_decode_spt,
                 );
             }
-            Err(e) => {
+            Err(TimedWindowFailure::Timed(e)) => {
                 // A non-oracle timed failure (protocol / completed-work barrier / spawn): fail
                 // closed with the runner's message. No trustworthy timing to retain.
                 return official_failed(
@@ -748,6 +760,273 @@ where
             )
         }
     }
+}
+
+/// The EXACT-MATCH name of the refusal "the serial-control leg did not complete".
+pub const SERIAL_CONTROL_LEG_FAILED: &str = "SERIAL-CONTROL-LEG-FAILED";
+
+/// LEG 1 of a paired ranked run: the SERIAL-CONTROL leg on the organizer-staged REFERENCE tree.
+///
+/// It is the same window the candidate leg runs — same golden, same benchmark oracle, same
+/// 128-token decode depth, same per-platform prefill warm-up count, same unmeasured warmup leg,
+/// same per-phase cool gate — with ONE difference: **no spec**. The control is serial by
+/// construction, because the score is a speculative leg divided by a serial one.
+///
+/// It is also the WHOLE of what `benchd calibrate-baseline` measures: the calibrator calls this
+/// function, once per pass, so a box's band and a box's ranked denominator can never be measured
+/// two different ways. The session is opened and reaped inside this call — leg 1 holds no residency
+/// while leg 2 runs, which is the sequential residency the ruling requires.
+///
+/// Every failure refuses BY NAME ([`SERIAL_CONTROL_LEG_FAILED`]): the reference tree is the
+/// organizer's, so a fault here is never the candidate's fault and must not be reported as one.
+pub fn run_serial_control_leg<T, FB, G>(
+    golden: &GoldenFixture,
+    residency: WorkerResidency,
+    platform: Platform,
+    mut spawn_baseline: FB,
+    mut cool_gate: G,
+) -> Result<TimingResult, String>
+where
+    T: LineTransport,
+    FB: FnMut() -> bench_runner::Result<Session<T>>,
+    G: FnMut(&str) -> bench_runner::Result<()>,
+{
+    let benchmark = golden.benchmark.as_ref().ok_or_else(|| {
+        format!(
+            "{SERIAL_CONTROL_LEG_FAILED}: the golden carries no benchmark oracle, so there is no \
+             prompt for the control leg to measure"
+        )
+    })?;
+    // NO SPEC: the control leg is serial, and `None` is what puts nothing on the wire.
+    let params = official_timed_params(benchmark, None, platform);
+    let warmup_params = official_warmup_params(benchmark, None);
+    let (measured, session) = run_timed_window(
+        &params,
+        warmup_params.as_ref(),
+        residency,
+        &mut spawn_baseline,
+        &mut cool_gate,
+    );
+    // Reap leg 1's residency before returning: leg 2 loads next, and two model residencies must
+    // never be live at once.
+    drop(session);
+    measured.map_err(|e| match e {
+        TimedWindowFailure::WarmupSpawn(e) => {
+            format!("{SERIAL_CONTROL_LEG_FAILED}: reference warmup worker spawn failed: {e}")
+        }
+        TimedWindowFailure::Warmup(e) => {
+            format!("{SERIAL_CONTROL_LEG_FAILED}: reference warmup leg failed: {e}")
+        }
+        TimedWindowFailure::Timed(e) => format!("{SERIAL_CONTROL_LEG_FAILED}: {e}"),
+    })
+}
+
+/// What a paired run seals about its baseline beyond the numbers themselves: which box, which
+/// calibration bytes, which reference commit, and whether the band gate ran.
+#[derive(Debug, Clone, Copy)]
+pub struct PairedBaselineSeal<'a> {
+    pub box_name: &'a str,
+    pub calibration_sha256: &'a str,
+    pub reference_commit: &'a str,
+    /// `true` once the control leg passed this box's band. A run whose leg failed the band seals
+    /// no score, so this is `true` wherever it is sealed.
+    pub band_passed: bool,
+    /// The control leg's measured `(prefill, decode)` seconds-per-token, or `None` when the leg
+    /// never produced a timing (its own failure payload).
+    pub leg: Option<(f64, f64)>,
+}
+
+/// Seal the paired-baseline facts onto a payload's metrics.
+///
+/// The CANDIDATE leg's numbers are READ BACK from the enforced fields
+/// (`prefill_seconds_per_token` / `decode_seconds_per_token`) rather than passed in again, so the
+/// named copies cannot drift from the numbers that were scored — the same discipline
+/// `per_prompt.mtp_seconds_per_token_mean` follows. A payload with no candidate timing (a
+/// preflight or control-leg refusal) seals no candidate keys: absent is "no leg ran", which is a
+/// different claim from zero.
+///
+/// The historical `baseline_{prefill,decode}_seconds_per_token` fields are NOT written here. They
+/// already carry the control leg's values, because the control leg's values are what the scoring
+/// call was given — that is the point of the design, and the board keeps reading them.
+pub fn seal_paired_baseline(metrics: &mut ScoreMetrics, seal: &PairedBaselineSeal<'_>) {
+    metrics.baseline_source = Some(crate::baseline::BASELINE_SOURCE_SERIAL_CONTROL_LEG.to_string());
+    metrics.baseline_box = Some(seal.box_name.to_string());
+    metrics.baseline_calibration_sha256 = Some(seal.calibration_sha256.to_string());
+    metrics.baseline_reference_commit = Some(seal.reference_commit.to_string());
+    metrics.baseline_band_passed = Some(seal.band_passed);
+    if let Some((prefill, decode)) = seal.leg {
+        metrics.baseline_leg_prefill_seconds_per_token = Some(prefill);
+        metrics.baseline_leg_decode_seconds_per_token = Some(decode);
+    }
+    metrics.candidate_leg_prefill_seconds_per_token =
+        finite_positive(metrics.prefill_seconds_per_token);
+    metrics.candidate_leg_decode_seconds_per_token =
+        finite_positive(metrics.decode_seconds_per_token);
+}
+
+/// `Some(v)` for a finite, strictly-positive measurement; `None` for the zero placeholder a
+/// payload carries when no leg ran.
+fn finite_positive(v: f64) -> Option<f64> {
+    (v.is_finite() && v > 0.0).then_some(v)
+}
+
+/// A paired REFUSAL: a failed payload carrying the paired seal, so a reader of a refused run
+/// still learns which box, which calibration bytes and which reference commit it ran under. `leg`
+/// is the control leg's measured pair when one was measured, and `None` when no leg completed —
+/// absent is "no leg ran", never zero.
+fn paired_refusal(
+    golden: &GoldenFixture,
+    digests: RunDigests<'_>,
+    commit: &str,
+    error: String,
+    seal: PairedBaselineSeal<'_>,
+    leg: Option<(f64, f64)>,
+) -> ScorePayload {
+    let mut payload = official_failed(
+        golden,
+        digests,
+        commit,
+        error,
+        false,
+        None,
+        None,
+        None,
+        None,
+        // NO denominator was established, and none is invented: the pair a paired run seals is the
+        // pair it measured.
+        (0.0, 0.0),
+    );
+    let mut seal = seal;
+    seal.band_passed = false;
+    seal.leg = leg;
+    seal_paired_baseline(&mut payload.metrics, &seal);
+    payload
+}
+
+/// The ENGINE and WORKER lifecycles of a paired run's two legs, in one value so the paired entry
+/// point states its inputs as two groups — WHO runs the legs, and WHAT window they run.
+///
+/// `open_*_leg` is a leg's per-platform ENGINE lifecycle: it returns a GUARD that is dropped the
+/// moment its leg ends. `spawn_*` opens that leg's WORKER, rooted at that leg's tree.
+pub struct PairedLegs<LB, LC, FB, FT, FC> {
+    pub open_baseline_leg: LB,
+    pub open_candidate_leg: LC,
+    pub spawn_baseline: FB,
+    pub spawn_timed: FT,
+    pub spawn_correctness: FC,
+}
+
+/// WHAT window a paired run measures: the acceptance bands, the worker residency, the candidate
+/// leg's requested spec, the platform, and the per-phase cool gate both legs pass.
+pub struct PairedWindow<G> {
+    pub bands: AcceptanceBands,
+    pub residency: WorkerResidency,
+    pub spec: Option<SpecConfig>,
+    pub platform: Platform,
+    pub cool_gate: G,
+}
+
+/// THE RANKED PAIRED PATH (David ruling 2026-09-08): two legs on one box in one job.
+///
+/// 1. **Serial-control leg** on the REFERENCE tree (`spawn_baseline`), no speculation
+///    ([`run_serial_control_leg`]).
+/// 2. **Band check** of that leg against THIS BOX's calibration file. The band is a health gate on
+///    leg 1; no number in the file is ever a denominator. Outside the band, the run dies by name
+///    and seals no score.
+/// 3. **Candidate leg** on the submission tree (`spawn_timed`) at its declared depth, followed by
+///    the full correctness set — [`official_core_windowed`], unchanged, with the LIVE measurement
+///    from step 1 as its baseline pair. The score is therefore
+///    `(ref_prefill/cand_prefill)^0.25 * (ref_decode/cand_decode)^0.75`, with the floors and the
+///    band shape untouched.
+///
+/// RESIDENCY is sequential, and it brackets each leg on BOTH levels. `open_baseline_leg` /
+/// `open_candidate_leg` are the platform's per-leg ENGINE lifecycle: on a platform whose worker
+/// holds the model they do nothing, and on a platform whose worker is an adapter over a resident
+/// engine they boot that leg's resident from that leg's own tree (see [`crate::legserve`]). Each
+/// returns a GUARD that is dropped the moment its leg ends — before the next leg opens — so two
+/// residents never hold GPU memory at once. Inside a leg, the worker itself is reaped the same
+/// way: one model is loaded at a time, and each leg loads exactly once.
+///
+/// The paired seal rides on EVERY payload this returns, including the refusals, because "which box
+/// and which calibration" is exactly what a reader of a refused run needs.
+pub fn official_core_paired<T, L, LB, LC, FB, FT, FC, G>(
+    golden: &GoldenFixture,
+    calibration: &crate::baseline::BaselineCalibration,
+    seal: PairedBaselineSeal<'_>,
+    digests: RunDigests<'_>,
+    commit: &str,
+    legs: PairedLegs<LB, LC, FB, FT, FC>,
+    window: PairedWindow<G>,
+) -> ScorePayload
+where
+    T: LineTransport,
+    LB: FnOnce() -> Result<L, String>,
+    LC: FnOnce() -> Result<L, String>,
+    FB: FnMut() -> bench_runner::Result<Session<T>>,
+    FT: FnMut() -> bench_runner::Result<Session<T>>,
+    FC: FnMut() -> bench_runner::Result<Session<T>>,
+    G: FnMut(&str) -> bench_runner::Result<()>,
+{
+    let PairedLegs {
+        open_baseline_leg,
+        open_candidate_leg,
+        spawn_baseline,
+        spawn_timed,
+        spawn_correctness,
+    } = legs;
+    let PairedWindow {
+        bands,
+        residency,
+        spec,
+        platform,
+        mut cool_gate,
+    } = window;
+    // A leg's ENGINE comes up before its worker and goes down before the next leg's comes up.
+    let baseline_leg = match open_baseline_leg() {
+        Ok(guard) => guard,
+        Err(e) => return paired_refusal(golden, digests, commit, e, seal, None),
+    };
+    let control_result =
+        run_serial_control_leg(golden, residency, platform, spawn_baseline, &mut cool_gate);
+    drop(baseline_leg);
+    let control = match control_result {
+        Ok(t) => t,
+        Err(e) => return paired_refusal(golden, digests, commit, e, seal, None),
+    };
+    let measured_leg = Some((
+        control.prefill_seconds_per_token,
+        control.decode_seconds_per_token,
+    ));
+    if let Err(e) = calibration.check_band(
+        control.prefill_seconds_per_token,
+        control.decode_seconds_per_token,
+    ) {
+        return paired_refusal(golden, digests, commit, e, seal, measured_leg);
+    }
+    let candidate_leg = match open_candidate_leg() {
+        Ok(guard) => guard,
+        Err(e) => return paired_refusal(golden, digests, commit, e, seal, measured_leg),
+    };
+    let mut payload = official_core_windowed(
+        golden,
+        control.prefill_seconds_per_token,
+        control.decode_seconds_per_token,
+        bands,
+        digests,
+        commit,
+        spawn_timed,
+        spawn_correctness,
+        residency,
+        spec,
+        platform,
+        cool_gate,
+    );
+    drop(candidate_leg);
+    let mut seal = seal;
+    seal.band_passed = true;
+    seal.leg = measured_leg;
+    seal_paired_baseline(&mut payload.metrics, &seal);
+    payload
 }
 
 /// Steps 2-4 of the official flow, given the already-measured `timing`: official GATING
@@ -3699,5 +3978,483 @@ mod tests {
             v["metrics"].get("per_prompt").is_none(),
             "an empty array is omitted, so a no-timing payload's bytes are unchanged"
         );
+    }
+
+    // ---- THE RANKED PAIRED PATH (David 2026-09-08) --------------------------------------
+
+    /// A calibration whose band is deliberately WIDE. The mock engine's wall clock is ~0, so its
+    /// measured seconds-per-token is a real but tiny positive number that no realistic band could
+    /// contain; a wide band lets the orchestration under test run to its end instead of stopping
+    /// at the health gate. The NARROW band is exercised on its own, against real numbers, in
+    /// `baseline.rs` (`the_band_check_holds_on_both_axes_and_in_both_directions`).
+    fn wide_calibration() -> crate::baseline::BaselineCalibration {
+        crate::baseline::BaselineCalibration {
+            version: crate::baseline::CALIBRATION_VERSION,
+            track_id: "qwen3.8-125b-a6b-mlx-v1".to_string(),
+            box_name: "m5-max-128gb-4-qwen38-125b-a6b-mlx".to_string(),
+            reference_commit: "a".repeat(40),
+            prompt: "botany".to_string(),
+            passes: 4,
+            prefill_seconds_per_token_mean: 1e-6,
+            decode_seconds_per_token_mean: 1e-6,
+            prefill_cv: 0.0,
+            decode_cv: 0.0,
+            prefill_band_low: 1e-6,
+            prefill_band_high: 1e6,
+            decode_band_low: 1e-6,
+            decode_band_high: 1e6,
+            captured_at: "2026-09-08T00:00:00Z".to_string(),
+            benchd_source_commit: "b".repeat(40),
+        }
+    }
+
+    /// A calibration the mock's measurement can never satisfy: a mean of one second per token with
+    /// the shipped band literals.
+    fn narrow_calibration() -> crate::baseline::BaselineCalibration {
+        crate::baseline::BaselineCalibration {
+            prefill_seconds_per_token_mean: 1.0,
+            decode_seconds_per_token_mean: 1.0,
+            prefill_band_low: crate::baseline::DEFAULT_PREFILL_BAND_LOW,
+            prefill_band_high: crate::baseline::DEFAULT_PREFILL_BAND_HIGH,
+            decode_band_low: crate::baseline::DEFAULT_DECODE_BAND_LOW,
+            decode_band_high: crate::baseline::DEFAULT_DECODE_BAND_HIGH,
+            ..wide_calibration()
+        }
+    }
+
+    fn paired_seal_for_test<'a>(
+        calibration: &'a crate::baseline::BaselineCalibration,
+    ) -> PairedBaselineSeal<'a> {
+        PairedBaselineSeal {
+            box_name: &calibration.box_name,
+            calibration_sha256: "c0ffee",
+            reference_commit: &calibration.reference_commit,
+            band_passed: false,
+            leg: None,
+        }
+    }
+
+    /// The paired WINDOW every paired test drives: the test bands, the load-once residency, no
+    /// spec, MLX, and the caller's cool gate.
+    fn paired_window_for_test<G>(cool_gate: G) -> PairedWindow<G>
+    where
+        G: FnMut(&str) -> bench_runner::Result<()>,
+    {
+        PairedWindow {
+            bands: TEST_BASELINE.bands,
+            residency: WorkerResidency::PersistentWindow,
+            spec: None,
+            platform: Platform::Mlx,
+            cool_gate,
+        }
+    }
+
+    /// TWO ROOTS, ONE BOX, IN ORDER. The paired run spawns leg 1's worker from the REFERENCE root
+    /// and leg 2's from the CANDIDATE root, and the score's denominator is the number leg 1
+    /// MEASURED — not any number in the calibration file.
+    ///
+    /// The mock's ~0 wall clock cannot sit inside the ACCEPTANCE band, so this lands on the
+    /// band-failure payload; that payload retains the real timing surface and the paired seal,
+    /// which is exactly the surface under test. The per-leg ENGINE lifecycle is asserted too: leg
+    /// 1's guard is opened and dropped before leg 2's is opened.
+    #[test]
+    fn the_paired_run_measures_two_roots_in_order_and_scores_against_leg_one() {
+        use std::rc::Rc;
+        let golden = official_golden(None);
+        let calibration = wide_calibration();
+        let baseline_spawns = Cell::new(0usize);
+        let candidate_spawns = Cell::new(0usize);
+        // The lifecycle log: each entry is what happened, in the order it happened.
+        let events: Rc<std::cell::RefCell<Vec<&'static str>>> =
+            Rc::new(std::cell::RefCell::new(Vec::new()));
+
+        /// A leg guard that records its own teardown, so the ordering claim is behavioural.
+        struct LegGuard {
+            events: Rc<std::cell::RefCell<Vec<&'static str>>>,
+            label: &'static str,
+        }
+        impl Drop for LegGuard {
+            fn drop(&mut self) {
+                self.events.borrow_mut().push(self.label);
+            }
+        }
+
+        let payload = official_core_paired(
+            &golden,
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: || {
+                    events.borrow_mut().push("baseline-engine-up");
+                    Ok(LegGuard {
+                        events: Rc::clone(&events),
+                        label: "baseline-engine-down",
+                    })
+                },
+                open_candidate_leg: || {
+                    events.borrow_mut().push("candidate-engine-up");
+                    Ok(LegGuard {
+                        events: Rc::clone(&events),
+                        label: "candidate-engine-down",
+                    })
+                },
+                spawn_baseline: || {
+                    baseline_spawns.set(baseline_spawns.get() + 1);
+                    Session::connect(conformant_engine()).map(|(s, _)| s)
+                },
+                spawn_timed: || {
+                    candidate_spawns.set(candidate_spawns.get() + 1);
+                    Session::connect(conformant_engine()).map(|(s, _)| s)
+                },
+                spawn_correctness: || Session::connect(conformant_engine()).map(|(s, _)| s),
+            },
+            paired_window_for_test(|_phase: &str| Ok(())),
+        );
+
+        // ONE worker per leg on the load-once residency, from each root, and BOTH roots were used.
+        assert_eq!(
+            baseline_spawns.get(),
+            1,
+            "leg 1 opens exactly one worker, from the reference root"
+        );
+        assert_eq!(
+            candidate_spawns.get(),
+            1,
+            "leg 2 opens exactly one worker, from the candidate root"
+        );
+        // SEQUENTIAL: leg 1's engine is torn down before leg 2's comes up.
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                "baseline-engine-up",
+                "baseline-engine-down",
+                "candidate-engine-up",
+                "candidate-engine-down",
+            ]
+        );
+
+        // THE DENOMINATOR IS THE MEASURED LEG. It is a live measurement, so it is asserted by its
+        // PROPERTIES rather than a literal: finite, positive, equal on both of the names that
+        // carry it, and NOT the calibration file's mean (which no path may use as a denominator).
+        let m = &payload.metrics;
+        let leg_prefill = m.baseline_leg_prefill_seconds_per_token.unwrap();
+        let leg_decode = m.baseline_leg_decode_seconds_per_token.unwrap();
+        assert!(leg_prefill.is_finite() && leg_prefill > 0.0);
+        assert!(leg_decode.is_finite() && leg_decode > 0.0);
+        assert_eq!(m.baseline_prefill_seconds_per_token, leg_prefill);
+        assert_eq!(m.baseline_decode_seconds_per_token, leg_decode);
+        assert_ne!(
+            leg_prefill, calibration.prefill_seconds_per_token_mean,
+            "the calibration's mean must never be the denominator"
+        );
+        assert_eq!(m.baseline_source.as_deref(), Some("serial-control-leg"));
+        assert_eq!(
+            m.baseline_box.as_deref(),
+            Some(calibration.box_name.as_str())
+        );
+        assert_eq!(m.baseline_calibration_sha256.as_deref(), Some("c0ffee"));
+        assert_eq!(
+            m.baseline_reference_commit.as_deref(),
+            Some(calibration.reference_commit.as_str())
+        );
+        assert_eq!(m.baseline_band_passed, Some(true));
+        // The CANDIDATE leg's numbers are read back from the enforced fields.
+        assert_eq!(
+            m.candidate_leg_prefill_seconds_per_token,
+            Some(m.prefill_seconds_per_token)
+        );
+        assert_eq!(
+            m.candidate_leg_decode_seconds_per_token,
+            Some(m.decode_seconds_per_token)
+        );
+    }
+
+    /// LEG 1 OUTSIDE THE BAND: the run dies BY NAME, seals no score, and leg 2 never opens — not
+    /// its engine and not its worker. The seal still states which box and which calibration, and
+    /// records the leg it measured.
+    #[test]
+    fn a_control_leg_outside_the_box_band_seals_no_score_and_never_opens_leg_two() {
+        let golden = official_golden(None);
+        let calibration = narrow_calibration();
+        let candidate_spawns = Cell::new(0usize);
+        let candidate_engine_ups = Cell::new(0usize);
+
+        let payload = official_core_paired(
+            &golden,
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: || Ok(()),
+                open_candidate_leg: || {
+                    candidate_engine_ups.set(candidate_engine_ups.get() + 1);
+                    Ok(())
+                },
+                spawn_baseline: || Session::connect(conformant_engine()).map(|(s, _)| s),
+                spawn_timed: || {
+                    candidate_spawns.set(candidate_spawns.get() + 1);
+                    Session::connect(conformant_engine()).map(|(s, _)| s)
+                },
+                spawn_correctness: || Session::connect(conformant_engine()).map(|(s, _)| s),
+            },
+            paired_window_for_test(|_phase: &str| Ok(())),
+        );
+
+        assert!(!payload.passed);
+        assert!(payload.score.is_none(), "a refused run seals no score");
+        assert!(
+            payload
+                .metrics
+                .error
+                .contains("serial-control leg outside this box's band"),
+            "{}",
+            payload.metrics.error
+        );
+        assert!(
+            payload
+                .metrics
+                .error
+                .contains(crate::baseline::SERIAL_CONTROL_LEG_OUTSIDE_BAND),
+            "{}",
+            payload.metrics.error
+        );
+        assert_eq!(
+            candidate_engine_ups.get(),
+            0,
+            "leg 2's engine must not boot"
+        );
+        assert_eq!(candidate_spawns.get(), 0, "leg 2's worker must not spawn");
+        assert_eq!(payload.metrics.baseline_band_passed, Some(false));
+        assert_eq!(
+            payload.metrics.baseline_source.as_deref(),
+            Some("serial-control-leg")
+        );
+        assert!(payload
+            .metrics
+            .baseline_leg_prefill_seconds_per_token
+            .is_some());
+        // No candidate leg ran, so no candidate number is invented.
+        assert_eq!(
+            payload.metrics.candidate_leg_prefill_seconds_per_token,
+            None
+        );
+        assert_eq!(payload.metrics.candidate_leg_decode_seconds_per_token, None);
+        // And NO denominator was established: the enforced fields stay at their placeholders.
+        assert_eq!(payload.metrics.baseline_prefill_seconds_per_token, 0.0);
+        assert_eq!(payload.metrics.baseline_decode_seconds_per_token, 0.0);
+    }
+
+    /// A LEG-1 ENGINE that will not come up stops the run before anything is measured, and the
+    /// refusal is the engine's own — never attributed to the candidate.
+    #[test]
+    fn a_control_leg_engine_that_cannot_boot_refuses_before_any_measurement() {
+        let golden = official_golden(None);
+        let calibration = wide_calibration();
+        let baseline_spawns = Cell::new(0usize);
+        let payload = official_core_paired(
+            &golden,
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: || {
+                    Err::<(), String>(
+                        "LEG-SERVE-BOOT-FAILED: the reference resident died".to_string(),
+                    )
+                },
+                open_candidate_leg: || Ok(()),
+                spawn_baseline: || {
+                    baseline_spawns.set(baseline_spawns.get() + 1);
+                    Session::connect(conformant_engine()).map(|(s, _)| s)
+                },
+                spawn_timed: || Session::connect(conformant_engine()).map(|(s, _)| s),
+                spawn_correctness: || Session::connect(conformant_engine()).map(|(s, _)| s),
+            },
+            paired_window_for_test(|_phase: &str| Ok(())),
+        );
+        assert!(!payload.passed);
+        assert!(
+            payload.metrics.error.contains("LEG-SERVE-BOOT-FAILED"),
+            "{}",
+            payload.metrics.error
+        );
+        assert_eq!(baseline_spawns.get(), 0, "no worker before its engine");
+        assert_eq!(payload.metrics.baseline_band_passed, Some(false));
+        assert_eq!(payload.metrics.baseline_leg_prefill_seconds_per_token, None);
+    }
+
+    /// THE SEALED FIELDS OF A PASSING PAIRED RUN. The control leg is MEASURED through the mock
+    /// engine from the reference root; the candidate leg is then driven at exactly that leg's
+    /// seconds-per-token, which is the only deterministic way to put a mock inside the acceptance
+    /// band (its ~0 wall clock is real, so a measured-against-measured ratio is not reproducible).
+    /// What is under test is the SEAL and the SCORE of a passing paired run: speedups 1.0, score
+    /// 1.0, both legs named, and the historical `baseline_*` fields carrying the leg-1 values so
+    /// the board keeps reading.
+    #[test]
+    fn a_passing_paired_run_seals_both_legs_and_scores_the_live_ratio() {
+        let golden = official_golden(None);
+        let control = run_serial_control_leg(
+            &golden,
+            WorkerResidency::PersistentWindow,
+            Platform::Mlx,
+            || Session::connect(conformant_engine()).map(|(s, _)| s),
+            |_phase: &str| Ok(()),
+        )
+        .expect("the reference root's control leg must measure");
+        assert!(control.prefill_seconds_per_token > 0.0);
+        assert!(control.decode_seconds_per_token > 0.0);
+
+        // The candidate leg, exactly on the control leg: speedups 1.0, in band, floors pass.
+        let mut candidate = in_band_timing();
+        candidate.prefill_seconds_per_token = control.prefill_seconds_per_token;
+        candidate.decode_seconds_per_token = control.decode_seconds_per_token;
+        let mut payload = finish_official(
+            &golden,
+            (
+                control.prefill_seconds_per_token,
+                control.decode_seconds_per_token,
+            ),
+            bench_core::constants::MTP_SINGLE_LEG_BANDS,
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            &candidate,
+            || Session::connect(conformant_engine()).map(|(s, _)| s),
+        );
+        let calibration = wide_calibration();
+        let mut seal = paired_seal_for_test(&calibration);
+        seal.band_passed = true;
+        seal.leg = Some((
+            control.prefill_seconds_per_token,
+            control.decode_seconds_per_token,
+        ));
+        seal_paired_baseline(&mut payload.metrics, &seal);
+
+        assert!(payload.passed, "{}", payload.metrics.error);
+        assert_eq!(payload.score, Some(1.0));
+        let m = &payload.metrics;
+        assert_eq!(m.prefill_speedup, 1.0);
+        assert_eq!(m.decode_speedup, 1.0);
+        // The historical names carry the LEG-1 values, so the board reads them unchanged.
+        assert_eq!(
+            m.baseline_prefill_seconds_per_token,
+            control.prefill_seconds_per_token
+        );
+        assert_eq!(
+            m.baseline_decode_seconds_per_token,
+            control.decode_seconds_per_token
+        );
+        assert_eq!(m.baseline_source.as_deref(), Some("serial-control-leg"));
+        assert_eq!(
+            m.baseline_box.as_deref(),
+            Some(calibration.box_name.as_str())
+        );
+        assert_eq!(m.baseline_calibration_sha256.as_deref(), Some("c0ffee"));
+        assert_eq!(
+            m.baseline_reference_commit.as_deref(),
+            Some(calibration.reference_commit.as_str())
+        );
+        assert_eq!(m.baseline_band_passed, Some(true));
+        assert_eq!(
+            m.baseline_leg_prefill_seconds_per_token,
+            Some(control.prefill_seconds_per_token)
+        );
+        assert_eq!(
+            m.baseline_leg_decode_seconds_per_token,
+            Some(control.decode_seconds_per_token)
+        );
+        assert_eq!(
+            m.candidate_leg_prefill_seconds_per_token,
+            Some(candidate.prefill_seconds_per_token)
+        );
+        assert_eq!(
+            m.candidate_leg_decode_seconds_per_token,
+            Some(candidate.decode_seconds_per_token)
+        );
+
+        // EVERY paired key reaches the sealed JSON, and none of them is null.
+        let sealed: serde_json::Value =
+            serde_json::from_str(&payload.to_sealed_json().unwrap()).unwrap();
+        for key in [
+            "baseline_source",
+            "baseline_box",
+            "baseline_calibration_sha256",
+            "baseline_reference_commit",
+            "baseline_band_passed",
+            "baseline_leg_prefill_seconds_per_token",
+            "baseline_leg_decode_seconds_per_token",
+            "candidate_leg_prefill_seconds_per_token",
+            "candidate_leg_decode_seconds_per_token",
+        ] {
+            assert!(
+                !sealed["metrics"][key].is_null(),
+                "{key} must reach the sealed score"
+            );
+        }
+        // …and a run that measured no control leg seals NONE of them: absent is not zero.
+        let single_leg = finish_with(&golden, conformant_engine);
+        let sealed: serde_json::Value =
+            serde_json::from_str(&single_leg.to_sealed_json().unwrap()).unwrap();
+        assert!(sealed["metrics"]["baseline_source"].is_null());
+        assert!(sealed["metrics"]["baseline_leg_prefill_seconds_per_token"].is_null());
+    }
+
+    /// The CONTROL LEG IS SERIAL BY CONSTRUCTION: it never puts a spec on the wire, whatever the
+    /// candidate declares. Proved through the engine's own `effective_spec` echo — a mock that
+    /// would refuse an mtp request answers this leg, and the leg reports no spec.
+    #[test]
+    fn the_control_leg_requests_no_spec() {
+        let golden = official_golden(None);
+        let control = run_serial_control_leg(
+            &golden,
+            WorkerResidency::PersistentWindow,
+            Platform::Mlx,
+            || Session::connect(conformant_engine().spec_modes(None)).map(|(s, _)| s),
+            |_phase: &str| Ok(()),
+        )
+        .expect("a serial control leg must run against an engine that advertises no spec modes");
+        assert!(
+            control.effective_spec.is_none(),
+            "the control leg carried a spec: {:?}",
+            control.effective_spec
+        );
+    }
+
+    /// A golden with no benchmark oracle has no prompt for a control leg, and the refusal names
+    /// the leg rather than the candidate.
+    #[test]
+    fn a_control_leg_without_an_oracle_refuses_by_name() {
+        let mut doc = serde_json::json!({
+            "version": 1,
+            "model_type": "qwen4_exp_text",
+            "cases": [
+                { "name": "case-a", "prompt_tokens": vec![1i64; CORRECTNESS_PROMPT_TOKENS], "expected_tokens": vec![2i64; 64] }
+            ]
+        });
+        doc["cases"][0]["name"] = serde_json::json!("case-a");
+        let bytes = serde_json::to_vec(&doc).unwrap();
+        let golden = load_golden_fixture(
+            &bytes,
+            64,
+            CORRECTNESS_PROMPT_TOKENS,
+            &crate::testgolden::identity_125b(),
+            Some("qwen4_exp_text"),
+            None,
+            None,
+        )
+        .unwrap();
+        let err = run_serial_control_leg(
+            &golden,
+            WorkerResidency::PersistentWindow,
+            Platform::Mlx,
+            || Session::connect(conformant_engine()).map(|(s, _)| s),
+            |_phase: &str| Ok(()),
+        )
+        .unwrap_err();
+        assert!(err.contains(SERIAL_CONTROL_LEG_FAILED), "{err}");
+        assert!(err.contains("benchmark oracle"), "{err}");
     }
 }

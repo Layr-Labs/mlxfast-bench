@@ -198,12 +198,17 @@ case "$sub" in
     if [ -n "${STUB_DIFF_FAIL_CLASS:-}" ]; then case "$*" in *"$STUB_DIFF_FAIL_CLASS"*) echo "PARITY: FAIL (undeclared divergence)"; exit 1;; esac; fi
     echo "PARITY: PASS (no deterministic/ranking mismatch)"; exit 0;;
   iterate)
-    golden=""; weights=""; sp=""
+    golden=""; weights=""; sp=""; bws=""; bcal=""
     while [ $# -gt 0 ]; do case "$1" in
       --golden) golden="$2"; shift 2;;
       --weights) weights="$2"; shift 2;;
       --score-path) sp="$2"; shift 2;;
       --engine|--mode|--golden-sha256|--golden-bytes) shift 2;;
+      # THE RANKED PAIRED PATH's two roots (David 2026-09-08): the stub records them so the leg
+      # below can assert they were forwarded, and consumes their values so a following flag is
+      # never mistaken for one.
+      --baseline-workspace) bws="$2"; shift 2;;
+      --baseline-calibration) bcal="$2"; shift 2;;
       *) shift;;
     esac; done
     passed=true
@@ -213,6 +218,8 @@ case "$sub" in
     # (unless STUB_BC_BAND_PASSES forces a both-PASS divergence for the negative control).
     err=""; case "$golden" in *band*) err="acceptance band failed: prefill below -5% of reference improvement too large for one submission (chunk it)";; esac
     [ "${STUB_BC_BAND_PASSES:-}" = 1 ] && case "$golden" in *band*) passed=true; err="";; esac
+    # The two-root receipt: what benchd was told leg 1's tree and this box's band are.
+    printf 'PAIRED-ROOTS: workspace=%s calibration=%s\n' "$bws" "$bcal" >&2
     gsha="$(shasum -a 256 "$golden" | awk '{print $1}')"
     sdir="$(dirname "$sp")"; mkdir -p "$sdir"
     printf '{"passed":%s,"score":2.88,"error":"%s","metrics":{"weights_hash":"stubw","weights_file_count":1,"weights_byte_count":1,"commit":"%s","runtime":"rust-official-stub"}}' "$passed" "$err" "${MLXFAST_COMMIT_SHA:-x}" > "$sp"
@@ -256,6 +263,36 @@ EOF
 chmod +x "$STUB_SW"
 
 mkdir -p "$WORK/wdir"
+
+# --- 1h. THE RANKED PAIRED PATH's two roots (David 2026-09-08) --------------------------
+# A live-control-leg track measures its own denominator: leg 1 on the organizer-staged REFERENCE
+# tree, leg 2 on the submission tree. `official_benchd_run` must FORWARD both runner inputs when
+# the box names them, and must pass NEITHER when the box names neither (benchd then reads the
+# environment itself, and refuses by name when that is empty too).
+echo "== 1h. paired two-root forwarding =="
+mkdir -p "$WORK/paired-ref" "$WORK/paired-out"
+printf '{}' > "$WORK/paired-ref/baseline-calibration.json"
+( BENCHD_BIN="$STUB_BC" ENGINE=/bin/echo WEIGHTS="$WORK/wdir" OFFICIAL_GOLDEN="$WORK/official.json" \
+  OFFICIAL_LIB="$HERE/official-lib.sh" \
+  MLXFAST_BASELINE_WORKSPACE="$WORK/paired-ref" \
+  MLXFAST_BASELINE_CALIBRATION="$WORK/paired-ref/baseline-calibration.json" \
+  official_benchd_run "$WORK/paired-out" ) >/dev/null 2>&1
+if grep -q "PAIRED-ROOTS: workspace=$WORK/paired-ref calibration=$WORK/paired-ref/baseline-calibration.json" "$WORK/paired-out/stderr"; then
+  ok "official_benchd_run forwards --baseline-workspace and --baseline-calibration"
+else
+  bad "official_benchd_run did not forward the two roots"; sed 's/^/        /' "$WORK/paired-out/stderr"
+fi
+mkdir -p "$WORK/paired-none"
+( BENCHD_BIN="$STUB_BC" ENGINE=/bin/echo WEIGHTS="$WORK/wdir" OFFICIAL_GOLDEN="$WORK/official.json" \
+  OFFICIAL_LIB="$HERE/official-lib.sh" \
+  MLXFAST_BASELINE_WORKSPACE= MLXFAST_BASELINE_CALIBRATION= \
+  official_benchd_run "$WORK/paired-none" ) >/dev/null 2>&1
+if grep -q 'PAIRED-ROOTS: workspace= calibration=$' "$WORK/paired-none/stderr"; then
+  ok "official_benchd_run passes no two-root flags when the box names neither"
+else
+  bad "official_benchd_run invented a two-root flag"; sed 's/^/        /' "$WORK/paired-none/stderr"
+fi
+echo ""
 
 if [ "$HAVE_JQ" = 1 ]; then
   echo "== 2. official-parity end-to-end (stubs) =="

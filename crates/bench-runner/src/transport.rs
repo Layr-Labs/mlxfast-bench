@@ -631,6 +631,7 @@ impl ChildStdioTransport {
         plan: &crate::sandbox::OfficialSandboxPlan,
         weights_path: &str,
         extra_args: &[String],
+        extra_env: &[(String, String)],
     ) -> std::io::Result<Self> {
         let profile_path = match &plan.profile {
             crate::sandbox::SandboxProfile::Override(p) => p.clone(),
@@ -651,10 +652,11 @@ impl ChildStdioTransport {
             weights_path,
             extra_args,
         );
-        Self::spawn_command(
+        Self::spawn_command_with_overrides(
             &program,
             &args,
             current_process_env(),
+            extra_env,
             plan.forward_worker_stderr,
         )
     }
@@ -695,12 +697,14 @@ impl ChildStdioTransport {
         executable: &str,
         weights_path: &str,
         extra_args: &[String],
+        extra_env: &[(String, String)],
     ) -> std::io::Result<Self> {
-        Self::spawn_with_parent_env_forwarding(
+        let args = Self::build_args(weights_path, extra_args);
+        Self::spawn_command_with_overrides(
             executable,
-            weights_path,
-            extra_args,
+            &args,
             current_process_env(),
+            extra_env,
             false,
         )
     }
@@ -747,7 +751,42 @@ impl ChildStdioTransport {
         K: Into<String>,
         V: Into<String>,
     {
-        let sanitized = sanitized_engine_env(parent_env);
+        Self::spawn_command_with_overrides(program, args, parent_env, &[], forward_worker_stderr)
+    }
+
+    /// [`spawn_command`](Self::spawn_command) with PER-SPAWN environment OVERRIDES applied on top
+    /// of the sanitized allowlist.
+    ///
+    /// WHY OVERRIDES EXIST. A paired ranked run measures two legs against two DIFFERENT resident
+    /// engines, booted one at a time from two different trees. The name a worker connects by
+    /// (`DS4_RESIDENT_SOCKET` / `BENCH_WORKER_RESIDENT_SOCKET`) is therefore a PER-LEG fact, and
+    /// the parent process has no one value for it. The override map is how the caller states that
+    /// fact for the ONE spawn it is making, without mutating this process's own environment.
+    ///
+    /// They are applied AFTER [`sanitized_engine_env`] and BEFORE the forced
+    /// [`ENGINE_ENV_FORCED_KEY`], so an override cannot smuggle in a name the allowlist would have
+    /// dropped for any other reason and cannot re-enable the recursive-worker guard: the forced key
+    /// is re-applied last.
+    fn spawn_command_with_overrides<I, K, V>(
+        program: &str,
+        args: &[String],
+        parent_env: I,
+        extra_env: &[(String, String)],
+        forward_worker_stderr: bool,
+    ) -> std::io::Result<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let mut sanitized = sanitized_engine_env(parent_env);
+        for (key, value) in extra_env {
+            sanitized.insert(key.clone(), value.clone());
+        }
+        sanitized.insert(
+            ENGINE_ENV_FORCED_KEY.to_string(),
+            ENGINE_ENV_FORCED_VALUE.to_string(),
+        );
         let mut child = Command::new(program)
             .args(args)
             // Build the child env FROM EMPTY, then apply only the allowlisted

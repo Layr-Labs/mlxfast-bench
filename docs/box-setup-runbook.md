@@ -18,30 +18,42 @@ checklist, is in its own runbook:
 | the GPU lock | `/tmp/mtplx-gpu-exclusive.lock`, a regular file taken with `flock` | every GPU user on the box takes it, including calibration and local runs; a box release never waives it |
 | the engine checkout | the ranked job checks it out fresh from the submission; an operator checkout is separate | never measure with an operator checkout that has local edits |
 | the runner | a self-hosted GitHub Actions runner whose labels include the track id | the label set is what the workflow's `runs-on` selects |
-| the official baseline pair | pinned in `crates/bench-core/src/constants.rs` (`OFFICIAL_BASELINES_BY_TRACK`) after one calibration on the box | see section 4 |
+| the box calibration | this box's `baseline-calibration.json`, written by one calibration on the box | see section 2 |
 
-## 2. Calibration: the official baseline pair
+## 2. Calibration: this box's health band
 
-Both tracks score a candidate against one pinned serial pair per track. A
-PENDING track refuses scored runs by name until the pair is pinned.
+Both Qwen 3.8 125B-A6B tracks measure their own denominator. A ranked run runs a
+SERIAL-CONTROL leg on the organizer-staged reference tree and a CANDIDATE leg on
+the submission tree, on this box, in the same job, and scores the live ratio.
+Nothing is pinned in the constants.
 
-- **Spark:** the engine's `tools/qwen4exp-calibrate.sh` takes the lock, boots
-  one serial resident, hashes the weights once, runs every pool golden as one
-  warm-up pass plus four timed legs on that one load, and gates each golden's
-  legs at a 1 percent coefficient of variation. It writes the report and the
-  constants patch and applies nothing. Apply the printed pair to
-  `OFFICIAL_BASELINE_CUDA` in `crates/bench-core/src/constants.rs`, write each
-  golden's pair into its `benchmark.baseline_*_seconds_per_token` fields, set
-  `official_scoring_enabled` in the fixture, and republish the dist for both
-  platforms at the pinning commit. Expect about 12 to 15 minutes on the box at
-  today's engine speeds; the weights digest is 100 seconds of that.
-- **Mac:** the converge `calibration-driver` unit's MLX profile runs one
-  `benchd` invocation per prompt with `--capture-passes W,A,A,B,B` over one
-  worker load (8 loads per window, not 40), gateless. The analyzer reports the
-  coefficient of variation and the A-versus-B split.
+What the box needs is its own HEALTH BAND for that control leg. Write it once
+per box with:
 
-See `docs/official-baseline-capture.md` for the capture procedure and
-`docs/qwen38-125b-a6b-baseline-capture.md` for the track's own history.
+```sh
+benchd calibrate-baseline \
+  --baseline-workspace "$REFERENCE_WORKSPACE" \
+  --engine .build/release/bench-worker \
+  --golden "$LIVE_GOLDEN" \
+  --passes 4 \
+  --out "$REFERENCE_WORKSPACE/baseline-calibration.json"
+```
+
+`--weights` defaults to the reference tree's own transform output
+(`$REFERENCE_WORKSPACE/weights`): the control leg must never load the
+candidate's, because the transform is participant-editable.
+
+The verb runs the ranked path's own control leg four times, under the full
+official methodology, and refuses by name (`CALIBRATION-CV-EXCEEDED`) when the
+box is too noisy for the mean to describe it. Repeat it whenever the organizer
+moves the reference tree.
+
+The ranked job then names both inputs: `MLXFAST_BASELINE_WORKSPACE` and
+`MLXFAST_BASELINE_CALIBRATION`.
+
+See [`qwen38-125b-a6b-baseline-capture.md`](qwen38-125b-a6b-baseline-capture.md)
+for the full procedure, and `docs/official-baseline-capture.md` for the
+stored-pair capture the legacy tracks still use.
 
 ## 3. Differences at a glance
 

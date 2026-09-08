@@ -1482,6 +1482,43 @@ pub fn local_iterate_score(
     }
 }
 
+/// The `metrics.baseline_source` an UNSCORED local run seals: it says, in one string, that this
+/// run had no denominator BY DESIGN and therefore has no score to argue with.
+pub const BASELINE_SOURCE_LOCAL_UNSCORED: &str = "none (local mode: unscored)";
+
+/// Turn a local run that had NO baseline into an UNSCORED one.
+///
+/// WHY THIS EXISTS. The Qwen 3.8 125B-A6B tracks store no baseline pair: a ranked run measures its
+/// own on the box, against the organizer-staged reference tree. A participant iterating on a
+/// laptop has no reference tree, and David requires the local benchmark to keep working. So the
+/// local modes on those tracks run the CANDIDATE LEG ONLY: real timings, the real correctness gate,
+/// and NO score — because a score with no denominator is not a score.
+///
+/// The run reaches here through `local_iterate_score` with `(0.0, 0.0)` baselines, which is
+/// already the "no pair" shape: it seals the real timing surface and the real correctness verdict,
+/// then reports `score = null` with [`INVALID_LOCAL_SCORE_ERROR`] because the estimate is not
+/// finite and positive. That text is right for a run that EXPECTED a pair and got a bad one, and
+/// wrong for a run that never had one. This converts exactly that case, and nothing else:
+///
+/// * `metrics.baseline_source` states the design (`"none (local mode: unscored)"`) and `score`
+///   stays `null` — ALWAYS, so an unscored run can never be read as a scored one;
+/// * the [`INVALID_LOCAL_SCORE_ERROR`] text is cleared and `passed` becomes `true` ONLY when the
+///   correctness gate passed. A REAL failure — a correctness miss, an oracle mismatch, a protocol
+///   fault — keeps its own error and its own `passed = false`, because none of those is about the
+///   missing baseline.
+///
+/// The speedup and floor fields keep the values the zero pair produced. With
+/// `baseline_* = 0`, `baseline_source = "none (local mode: unscored)"` and `score = null`, a
+/// reader has one consistent story: there was no baseline, so there is no speedup and no score.
+pub fn seal_local_unscored(payload: &mut ScorePayload) {
+    payload.score = None;
+    payload.metrics.baseline_source = Some(BASELINE_SOURCE_LOCAL_UNSCORED.to_string());
+    if payload.metrics.passed_correctness && payload.metrics.error == INVALID_LOCAL_SCORE_ERROR {
+        payload.metrics.error.clear();
+        payload.passed = true;
+    }
+}
+
 /// Why a run failed, in the shape the score's metrics report it.
 ///
 /// #65: these five values used to be threaded through every failure path as a positional
@@ -1878,6 +1915,17 @@ pub(crate) fn base_metrics(
         runner_build: None,
         resident_pid: None,
         resident_load_epoch: None,
+        // The PAIRED-BASELINE seal is written by `official::seal_paired_baseline` on the ranked
+        // paired path only; every other path seals no key here.
+        baseline_source: None,
+        baseline_box: None,
+        baseline_calibration_sha256: None,
+        baseline_reference_commit: None,
+        baseline_band_passed: None,
+        baseline_leg_prefill_seconds_per_token: None,
+        baseline_leg_decode_seconds_per_token: None,
+        candidate_leg_prefill_seconds_per_token: None,
+        candidate_leg_decode_seconds_per_token: None,
     }
 }
 
@@ -4491,9 +4539,11 @@ mod tests {
             expected["metrics"][*key] = live;
         }
         // The reference's record carries its officialBaseline* CONSTANTS in these two fields
-        // (#74). While a platform's capture is pending the capture holds that platform's exact
-        // sentinel there and the test feeds the stand-in pair it passed — the record SHAPE stays
-        // pinned byte-for-byte while no number exists to pin.
+        // (#74). A track that pins no pair has no number for the capture to hold, so the capture
+        // holds a PLACEHOLDER STRING there and the test feeds the stand-in pair it passed — the
+        // record SHAPE stays pinned byte-for-byte while no number exists to pin. Keying on "the
+        // captured value is a string, not a number" means the placeholder is not a second name
+        // this test has to be kept in step with.
         for (key, passed) in [
             (
                 "baseline_prefill_seconds_per_token",
@@ -4504,10 +4554,8 @@ mod tests {
                 TEST_BASELINE.decode_seconds_per_token,
             ),
         ] {
-            let is_sentinel = bench_core::constants::Platform::ALL
-                .iter()
-                .any(|p| expected["metrics"][key].as_str() == Some(p.official_baseline_pending()));
-            if is_sentinel {
+            let is_placeholder = expected["metrics"][key].is_string();
+            if is_placeholder {
                 expected["metrics"][key] = serde_json::json!(passed);
             }
         }
@@ -4727,105 +4775,6 @@ mod tests {
             payload.metrics.baseline_decode_seconds_per_token, stale_decode,
             "the golden's declared decode baseline reached the sealed score"
         );
-    }
-
-    /// The official-baseline MIRROR test (#127 "MIRROR REFERENCE"), per PLATFORM: the fixture
-    /// captured from each reference engine's `Constants.swift` and that platform's
-    /// `constants::OFFICIAL_BASELINE_*` must be in the SAME state. Pending: every fixture field is
-    /// the platform's exact sentinel and the constant is `None` — the sentinel is a name the
-    /// accessor refuses by, never a value. Captured: the constant is `Some` and every field is
-    /// bit-equal to the fixture. Replacing the sentinel with numbers on ONE side only goes red —
-    /// that is the replacement procedure's own guard (docs/qwen38-125b-a6b-baseline-capture.md §7).
-    #[test]
-    fn official_baseline_mirrors_the_reference_constants_capture_per_platform() {
-        use bench_core::constants::Platform;
-        const CAPTURE: &str =
-            include_str!("../tests/fixtures/swift-official-baseline-constants.json");
-        let capture: serde_json::Value = serde_json::from_str(CAPTURE).unwrap();
-        // The six CAPTURED f64 fields. `decodeBandDownEnabled` is mirrored too (below) but it is a
-        // BOOL band-shape capability (David's MTP-leg ruling: decode down-band disabled), not an
-        // f64 measurement, so it travels on its own comparison rather than this numeric zip.
-        let fields = [
-            "officialBaselinePrefillSecondsPerToken",
-            "officialBaselineDecodeSecondsPerToken",
-            "prefillBandUpTolerance",
-            "prefillBandDownTolerance",
-            "decodeBandUpTolerance",
-            "decodeBandDownTolerance",
-        ];
-        for platform in Platform::ALL {
-            let mirror = &capture[platform.key()];
-            assert!(
-                mirror.is_object(),
-                "no {} mirror in the fixture",
-                platform.key()
-            );
-            let want = &mirror["reference"];
-            let sentinel = platform.official_baseline_pending();
-            // Pending-consistency covers the numeric fields AND the bool capability: all-sentinel or
-            // all-captured, never half.
-            let pending: Vec<bool> = fields
-                .iter()
-                .chain(std::iter::once(&"decodeBandDownEnabled"))
-                .map(|f| want[*f].as_str() == Some(sentinel))
-                .collect();
-            assert!(
-                pending.iter().all(|p| *p) || pending.iter().all(|p| !*p),
-                "{}: the fixture mirror is half-captured: {pending:?}",
-                platform.key()
-            );
-            match platform.official_baseline_declared() {
-                None => {
-                    assert!(
-                        pending[0],
-                        "{}: constants are pending but the fixture mirror carries numbers",
-                        platform.key()
-                    );
-                    let err = platform.official_baseline().unwrap_err();
-                    assert!(
-                        err.contains(sentinel),
-                        "{}: the pending refusal must name the sentinel: {err}",
-                        platform.key()
-                    );
-                }
-                Some(b) => {
-                    assert!(
-                        !pending[0],
-                        "{}: constants are captured but the fixture mirror still carries the \
-                         sentinel",
-                        platform.key()
-                    );
-                    let got = [
-                        b.prefill_seconds_per_token,
-                        b.decode_seconds_per_token,
-                        b.bands.prefill_up_tolerance,
-                        b.bands.prefill_down_tolerance,
-                        b.bands.decode_up_tolerance,
-                        b.bands.decode_down_tolerance,
-                    ];
-                    for (f, g) in fields.iter().zip(got) {
-                        assert_eq!(
-                            g.to_bits(),
-                            want[*f].as_f64().unwrap().to_bits(),
-                            "{}: {f} diverged from {} @ {}",
-                            platform.key(),
-                            mirror["source_file"].as_str().unwrap(),
-                            mirror["source_commit"].as_str().unwrap(),
-                        );
-                    }
-                    // The bool band-shape capability (decode down-band enabled/disabled).
-                    assert_eq!(
-                        b.bands.decode_down_enabled,
-                        want["decodeBandDownEnabled"].as_bool().unwrap(),
-                        "{}: decodeBandDownEnabled diverged from {} @ {}",
-                        platform.key(),
-                        mirror["source_file"].as_str().unwrap(),
-                        mirror["source_commit"].as_str().unwrap(),
-                    );
-                    assert_eq!(platform.official_baseline().unwrap(), b);
-                }
-            }
-        }
     }
 
     // ---- #132(a): the baseline pair on EVERY local failure path -----------------------

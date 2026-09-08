@@ -117,46 +117,113 @@ lives in the engine repo as `docs/new-track-repo-procedure.md`.
 
 ## Official baseline
 
-Each track has ONE official baseline pair: the serial prefill and decode seconds-per-token that
-the track scores against. The pair belongs to the `track_id`. It does not belong to the branch,
-and it does not belong to the repo.
+A track scores against a baseline in ONE of two ways. The two never mix.
 
-The pairs are in a per-track table in `crates/bench-core/src/constants.rs`. The branch names its
-own track in `TRACK_ID` in the same file. A track is in the table only after you capture its pair
-on that track's own benchmark hardware. Before the capture, the track has no entry. That state is
+| kind | where the denominator comes from | tracks |
+|---|---|---|
+| **live control leg** | the run MEASURES it: a serial-control leg on the reference tree, on the ranked box, in the same job | `qwen3.8-125b-a6b-mlx-v1`, `qwen3.8-125b-a6b-cuda-v1` |
+| **stored pair** | a captured pair in the per-track table in `crates/bench-core/src/constants.rs` | `qwen3.8-27b-mtp-v1`, `gemma4-26b-a4b-mlx-v1` |
+
+### Live-control-leg tracks
+
+Ruled by David on 2026-09-08. Each ranked box has its own baseline, and the
+baseline is a MEASUREMENT, not a pin. A ranked run measures TWO legs on ONE box
+in ONE job, on the one fixed prompt the fixture's live golden carries:
+
+1. the SERIAL-CONTROL leg on the organizer-staged reference tree
+   (`MLXFAST_BASELINE_WORKSPACE`), with no speculation;
+2. the CANDIDATE leg on the submission tree, at its declared draft depth.
+
+Leg 1 runs the reference tree's OWN engine and the reference tree's OWN weights.
+Both are found by re-rooting the candidate's own root-relative path into the
+reference tree, so the two legs differ by their tree and by nothing else. The
+transform that produces the weights is participant-editable, so the control leg
+must never load the candidate's transform output.
+
+The score is `(ref_prefill / cand_prefill)^0.25 * (ref_decode / cand_decode)^0.75`.
+The floors and the band shape do not change.
+
+These tracks store NO pair. There is none in the constants, none in the fixture
+and none in a golden, and every door a stored pair could come through is shut BY
+NAME on this path:
+
+* a golden that declares `benchmark.baseline_{prefill,decode}_seconds_per_token`
+  is refused (`GOLDEN-CARRIES-STORED-BASELINE`);
+* the `MLXFAST_PAIRED_BASELINE_*` environment pair and the `--baseline-*` flags
+  are refused (`STORED-BASELINE-OVERRIDE-REFUSED`);
+* the LOCAL modes measure the CANDIDATE LEG ONLY and seal NO score. A
+  participant iterating on a laptop has no reference tree, and David requires
+  the local benchmark to keep working, so the run is UNSCORED, not refused: it
+  seals the real timings, the real correctness verdict, `score: null`, an empty
+  `metrics.error`, and `baseline_source: "none (local mode: unscored)"`. When
+  BOTH runner inputs are present locally, the local modes run the full paired
+  path instead, exactly as ranked.
+
+Read the list of these tracks with
+`bench_core::constants::scores_against_live_control_leg`. It is the only
+accessor.
+
+Each ranked box carries a CALIBRATION FILE
+(`MLXFAST_BASELINE_CALIBRATION`). It is a HEALTH BAND for leg 1 and never a
+denominator: benchd checks the measured control leg against the band and refuses
+the run when the leg falls outside it
+(`SERIAL-CONTROL-LEG-OUTSIDE-BAND`). `benchd calibrate-baseline` writes the
+file, once per box, on that box. The procedure is
+[`qwen38-125b-a6b-baseline-capture.md`](qwen38-125b-a6b-baseline-capture.md).
+
+### Stored-pair tracks
+
+A stored-pair track has ONE official baseline pair: the serial prefill and
+decode seconds-per-token that the track scores against, together with its
+acceptance bands. The pair belongs to the `track_id`. It does not belong to the
+branch, and it does not belong to the repo.
+
+The pairs are in a per-track table in `crates/bench-core/src/constants.rs`. A
+track is in the table only after you capture its pair on that track's own
+benchmark hardware. Before the capture, the track has no entry. That state is
 `OFFICIAL_BASELINE_PENDING`.
 
-Read the table with `official_baseline(track_id)`. It is the only accessor. It refuses a track
-that has no entry, and the refusal names the `track_id` and the sentinel. Do not read the table
-in any other way.
+Read the table with `official_baseline(track_id)`. It is the only accessor. It
+refuses a track that has no entry, and the refusal names the `track_id` and the
+sentinel. Do not read the table in any other way.
 
 ### Where each path gets its pair
 
-The paths do not agree, and that is deliberate. Read the row for the path you are on.
+The paths do not agree, and that is deliberate. Read the row for the path you
+are on.
 
 | path | sources, in order | if no source gives a pair |
 |---|---|---|
-| official, timed | the `MLXFAST_PAIRED_BASELINE_{PREFILL,DECODE}_SECONDS_PER_TOKEN` pair, else both `--baseline-*` flags, else the golden's `benchmark.baseline_{prefill,decode}_seconds_per_token` pair | the run PREFLIGHT-FAILS. The table is not a fallback here. |
-| official, gates-only (`MLXFAST_BENCHMARK_SKIP_TIMED=1`) | the `MLXFAST_PAIRED_BASELINE_*` pair, else the golden's pair, else the TRACK's captured pair | the track is pending: the run refuses and names the track, the sentinel, and the two sources it tried |
-| local (`--local-iterate`, `--local-submit`) | the TRACK's captured pair only. #127 makes these legs score against the constants and nothing else: no environment pair, no flag, no golden pair | the track is pending: the run refuses and names the track, the sentinel, and the table |
+| official, timed, LIVE-CONTROL-LEG track | the SERIAL-CONTROL LEG this run measures, and nothing else | the run refuses by name: the reference workspace, the calibration file, the box and the band each refuse for themselves |
+| official, timed, stored-pair track | the `MLXFAST_PAIRED_BASELINE_{PREFILL,DECODE}_SECONDS_PER_TOKEN` pair, else both `--baseline-*` flags, else the golden's `benchmark.baseline_{prefill,decode}_seconds_per_token` pair | the run PREFLIGHT-FAILS. The table is not a fallback here. |
+| official, gates-only (`MLXFAST_BENCHMARK_SKIP_TIMED=1`), LIVE-CONTROL-LEG track | none: a gates-only run measures no leg, so it seals the zero placeholders | not applicable |
+| official, gates-only, stored-pair track | the `MLXFAST_PAIRED_BASELINE_*` pair, else the golden's pair, else the TRACK's captured pair | the run refuses and names the track, the sentinel, and the sources it tried |
+| local (`--local-iterate`, `--local-submit`), LIVE-CONTROL-LEG track | the SERIAL-CONTROL LEG, when both runner inputs are present; otherwise NONE — the run is UNSCORED | not applicable: an unscored run seals no score and is not a failure |
+| local (`--local-iterate`, `--local-submit`), stored-pair track | the TRACK's captured pair only. #127 makes these legs score against the constants and nothing else: no environment pair, no flag, no golden pair | the track is pending: the run refuses and names the track, the sentinel, and the table |
 
-The official timed path still touches the table in one place. Its PREFLIGHT-FAILURE record carries
-a baseline pair, and that pair comes from the table. A pending track therefore stops the run
-before the record is written, instead of writing a record with another track's numbers in it.
+The official timed path of a STORED-PAIR track still touches the table in one
+place. Its PREFLIGHT-FAILURE record carries a baseline pair, and that pair comes
+from the table. A pending track therefore stops the run before the record is
+written, instead of writing a record with another track's numbers in it.
 
-Do not give a new track another track's numbers. A track that has no captured pair cannot be
-scored on any path.
+Do not give a new track another track's numbers. A track that has no captured
+pair, and does not measure its own, cannot be scored on any path.
 
 ### Ending the pending state
 
-A pending track cannot reach a timed phase on any scored path, so it cannot measure its own pair
-there. `benchd iterate --capture-baseline` is the one mode that can. It runs only while the
-track is pending, it resolves no official baseline, and it writes only its capture record. A
-captured track refuses it by name.
+This applies to STORED-PAIR tracks only. A live-control-leg track has no pending
+state, because it stores nothing; it refuses `--capture-baseline` by name
+(`CAPTURE-RETIRED-FOR-LIVE-CONTROL-LEG`) and calibrates its box instead.
 
-The procedure is [`official-baseline-capture.md`](official-baseline-capture.md). The record it
-writes is the input to a separate, reviewed pull request that adds the track's pair to the table
-above.
+A pending stored-pair track cannot reach a timed phase on any scored path, so it
+cannot measure its own pair there. `benchd iterate --capture-baseline` is the one
+mode that can. It runs only while the track is pending, it resolves no official
+baseline, and it writes only its capture record. A captured track refuses it by
+name.
+
+The procedure is [`official-baseline-capture.md`](official-baseline-capture.md).
+The record it writes is the input to a separate, reviewed pull request that adds
+the track's pair to the table above.
 
 ### The track_id fence
 

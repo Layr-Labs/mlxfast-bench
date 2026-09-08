@@ -5,27 +5,22 @@
 //! across the Swift codebase (MLXFastConstants, benchmark.yml, overlay-paired-timing.sh).
 //! Only the scoring + golden-validation subset is ported here (this crate's scope).
 //!
-//! NOTE: the baseline seconds-per-token pair and its acceptance bands are ONE captured unit
-//! ([`OfficialBaseline`]) and NEVER a global. There is exactly ONE table,
-//! [`OFFICIAL_BASELINES_BY_TRACK`], holding one entry per `track_id` across all three release
-//! lineages, read through [`official_baseline`], which refuses BY NAME for a track whose pair is
-//! not captured yet ([`OFFICIAL_BASELINE_PENDING`]). Values are carried at full precision to stay
-//! bit-identical with the source they were captured from; recapture is an operator step
-//! (`docs/track-release-branches.md` / `docs/qwen38-125b-a6b-baseline-capture.md`), not a code
-//! change here. Each entry carries its own calibration provenance.
+//! NOTE: a track scores against a baseline in ONE of two ways, and the two never mix.
 //!
-//! The two Qwen 3.8 125B-A6B rows name the platform constants the single-leg official path
-//! resolves through: [`OFFICIAL_BASELINE_MLX`], measured by the official ranked path on the
-//! Darkbloom runner's box after the PLE gate dtype fix (2026-09-06, run 34062880993, botany), and [`OFFICIAL_BASELINE_CUDA`], which is
-//! PENDING again — the vLLM-engine pair it carried is kept, unreachable, as
-//! [`OFFICIAL_BASELINE_CUDA_VLLM_RETIRED`] (David 2026-09-03: ds4 replaces vLLM on the CUDA
-//! track, so the pair is re-captured on ds4 before anything scores). That path keys on
-//! [`Platform`] rather than on the track string, so the table names the constants instead of
-//! restating their numbers — one set of numbers, two keys, pinned by a test. The pending
-//! sentinels ([`OFFICIAL_BASELINE_PENDING_MLX`] / [`OFFICIAL_BASELINE_PENDING_CUDA`]) are the
-//! fail-closed refusal names through [`Platform::official_baseline`] whenever a platform's
-//! constant is `None`. No number anywhere here is a placeholder: a pending track carries no
-//! bytes a score could consume.
+//! * A LIVE-CONTROL-LEG track ([`LIVE_CONTROL_LEG_TRACKS`], read through
+//!   [`scores_against_live_control_leg`]) stores NO pair at all. Its ranked run measures a
+//!   serial-control leg on the reference tree on the same box, in the same job, and that live
+//!   measurement is the denominator (David 2026-09-08, `docs/track-release-branches.md`). The two
+//!   Qwen 3.8 125B-A6B tracks are these tracks.
+//! * A STORED-PAIR track keeps its pair and its acceptance bands as ONE captured unit
+//!   ([`OfficialBaseline`]) in [`OFFICIAL_BASELINES_BY_TRACK`], read through
+//!   [`official_baseline`], which refuses BY NAME for a track that has no entry
+//!   ([`OFFICIAL_BASELINE_PENDING`]). Values are carried at full precision to stay bit-identical
+//!   with the source they were captured from. The legacy `qwen3.8-27b-mtp-v1` and
+//!   `gemma4-26b-a4b-mlx-v1` tracks are these tracks.
+//!
+//! No number anywhere here is a placeholder: a track with no pair carries no bytes a score could
+//! consume.
 
 // --- Scoring subset (MLXFastConstants.score*, *BandTolerance, officialBaseline*) ---
 
@@ -170,62 +165,22 @@ pub const MTP_SINGLE_LEG_BANDS: AcceptanceBands = AcceptanceBands {
     decode_down_enabled: false,
 };
 
-/// The exact-match sentinel for the UNCAPTURED state of the MLX track's official baseline. It
-/// is a NAME, never a value: the fixture mirror (`crates/benchd/tests/fixtures/
-/// swift-official-baseline-constants.json`) carries this string in place of every number while
-/// [`OFFICIAL_BASELINE_MLX`] is `None`, and the mirror test asserts the two states agree.
-pub const OFFICIAL_BASELINE_PENDING_MLX: &str = "QWEN38-125B-A6B-MLX-PENDING-ORGANIZER";
-/// The CUDA counterpart of [`OFFICIAL_BASELINE_PENDING_MLX`].
-pub const OFFICIAL_BASELINE_PENDING_CUDA: &str = "QWEN38-125B-A6B-CUDA-PENDING-ORGANIZER";
-
-/// The MLX track's official baseline, MEASURED BY THE OFFICIAL RANKED PATH on M5 #4 (2026-09-06,
-/// engine 8df7f06 / fork 310daa2, Yukon baseline validation run 34062880993, live golden botany).
-/// The pair is the LIVE golden's (botany) serial baseline — the same seconds-per-token values pinned
-/// in `correctness_prompts/qwen3.8-125b-a6b-mlx-v1/botany.golden.json`
-/// (`benchmark.baseline_{prefill,decode}_seconds_per_token`) in the engine repo; each timed-pool
-/// golden carries its OWN pair, and the scored ratio reads the golden's, while this constant is
-/// the required default and the source of the acceptance BANDS. Stored seconds-per-token (benchd
-/// internal representation); a human-facing display converts to tok/s (prefill 0.0006282488193359375 s/tok =
-/// 1591.7 tok/s, decode 0.0329116748046875 s/tok = 30.38 tok/s). Bands are the fixed literals from
-/// docs/qwen38-125b-a6b-baseline-capture.md §1 (identical to the CUDA track's bands).
-pub const OFFICIAL_BASELINE_MLX: Option<OfficialBaseline> = Some(OfficialBaseline {
-    prefill_seconds_per_token: 0.0006282488193359375,
-    decode_seconds_per_token: 0.0329116748046875,
-    bands: MTP_SINGLE_LEG_BANDS,
-});
-/// The CUDA counterpart of [`OFFICIAL_BASELINE_MLX`], PENDING: re-pending for the ds4 engine
-/// capture (David 2026-09-03: ds4 replaces vLLM on the CUDA track). The pair this constant used
-/// to carry was measured against the vLLM serve the track no longer runs, so it describes an
-/// engine that is gone; it is kept, reachable by no scoring path, as
-/// [`OFFICIAL_BASELINE_CUDA_VLLM_RETIRED`] rather than deleted. Until the ds4 capture lands
-/// (`benchd iterate --capture-baseline`, then the reviewed sentinel→value re-pin of
-/// docs/qwen38-125b-a6b-baseline-capture.md §7) every CUDA scoring path refuses BY NAME through
-/// [`OFFICIAL_BASELINE_PENDING_CUDA`], and the capture mode is ARMED exactly because the pair is
-/// pending — the two doors are opposites, which is what makes a re-pending build the capture
-/// instrument rather than a weakened scoring binary.
-pub const OFFICIAL_BASELINE_CUDA: Option<OfficialBaseline> = Some(OfficialBaseline {
-    prefill_seconds_per_token: 0.002306397331787109,
-    decode_seconds_per_token: 0.06740963554492188,
-    bands: MTP_SINGLE_LEG_BANDS,
-});
-
-/// The RETIRED vLLM-engine CUDA baseline: the pair [`OFFICIAL_BASELINE_CUDA`] carried until
-/// David's 2026-09-03 ruling put the ds4 engine on the CUDA track in vLLM's place.
+/// The tracks whose ranked run measures its OWN denominator: a SERIAL-CONTROL LEG on the
+/// organizer-staged reference tree, on the same box, in the same job, immediately before the
+/// candidate leg (David 2026-09-08).
 ///
-/// PROVENANCE ONLY, and deliberately not an `Option<OfficialBaseline>` any accessor reads: no
-/// table row, no [`Platform`] arm and no scoring path resolves it, so the ds4 capture cannot
-/// inherit it as a placeholder or a starting point. It records what the CUDA track scored against
-/// before the engine under the number changed: captured on the vLLM serve at the serial launch
-/// reference (David MTP-0 ruling; the #235 Laguna reconstruction), armed in #242 and re-pinned in
-/// #247, mirroring the seconds-per-token values then pinned in
-/// `correctness_prompts/qwen3.8-125b-a6b-cuda-v1/botany.golden.json`
-/// (`benchmark.baseline_{prefill,decode}_seconds_per_token`) in the engine repo — decode
-/// 0.06451959972265625 s/tok = 15.50 tok/s. A ds4 measurement is NOT comparable to it.
-pub const OFFICIAL_BASELINE_CUDA_VLLM_RETIRED: OfficialBaseline = OfficialBaseline {
-    prefill_seconds_per_token: 0.0004879835673828125,
-    decode_seconds_per_token: 0.06451959972265625,
-    bands: MTP_SINGLE_LEG_BANDS,
-};
+/// They store NO pair. There is no constant, no fixture pin and no golden field a run could read a
+/// denominator out of; the per-box calibration file is a HEALTH BAND for the control leg only, and
+/// benchd refuses a golden that carries `benchmark.baseline_*_seconds_per_token` on this path. Read
+/// the list through [`scores_against_live_control_leg`]; it is the ONE accessor.
+pub const LIVE_CONTROL_LEG_TRACKS: &[&str] =
+    &["qwen3.8-125b-a6b-mlx-v1", "qwen3.8-125b-a6b-cuda-v1"];
+
+/// Whether `track_id` scores against a LIVE serial-control leg ([`LIVE_CONTROL_LEG_TRACKS`])
+/// rather than a stored pair. The match is EXACT — a near-miss names no track.
+pub fn scores_against_live_control_leg(track_id: &str) -> bool {
+    LIVE_CONTROL_LEG_TRACKS.contains(&track_id)
+}
 
 /// The MLX (Mac) track's local pre-timing cool-gate temperature (C). A Mac idles well below
 /// this, so the gate blocks only a genuinely warm GPU.
@@ -330,36 +285,6 @@ impl Platform {
             Platform::Mlx => OFFICIAL_PREFILL_WARMUP_RUNS_MLX,
             Platform::Cuda => OFFICIAL_PREFILL_WARMUP_RUNS_CUDA,
         }
-    }
-
-    /// The platform's pending sentinel (see [`OFFICIAL_BASELINE_PENDING_MLX`]).
-    pub fn official_baseline_pending(self) -> &'static str {
-        match self {
-            Platform::Mlx => OFFICIAL_BASELINE_PENDING_MLX,
-            Platform::Cuda => OFFICIAL_BASELINE_PENDING_CUDA,
-        }
-    }
-
-    /// The platform's official baseline as declared (`None` = pending).
-    pub fn official_baseline_declared(self) -> Option<OfficialBaseline> {
-        match self {
-            Platform::Mlx => OFFICIAL_BASELINE_MLX,
-            Platform::Cuda => OFFICIAL_BASELINE_CUDA,
-        }
-    }
-
-    /// The ONE accessor for the official baseline: the pending state is a refusal that names
-    /// the platform's sentinel, so a caller cannot score against nothing by accident.
-    pub fn official_baseline(self) -> Result<OfficialBaseline, String> {
-        self.official_baseline_declared().ok_or_else(|| {
-            format!(
-                "official baseline is {}: the {} track's serial prefill/decode seconds-per-token \
-                 pair and acceptance bands are not captured yet \
-                 (docs/qwen38-125b-a6b-baseline-capture.md); refusing to score",
-                self.official_baseline_pending(),
-                self.key(),
-            )
-        })
     }
 }
 
@@ -490,12 +415,9 @@ const OFFICIAL_BASELINES_BY_TRACK: &[(&str, Option<OfficialBaseline>)] = &[
             bands: LEGACY_TWO_SIDED_BANDS,
         }),
     ),
-    // The two Qwen 3.8 125B-A6B tracks name the PLATFORM constants rather than restating their
-    // numbers: `Platform::official_baseline` is the accessor the armed single-leg official path
-    // resolves through, so a row here that re-typed the pair could drift from the pair the box
-    // actually scores against. One set of numbers, reachable by either key.
-    ("qwen3.8-125b-a6b-mlx-v1", OFFICIAL_BASELINE_MLX),
-    ("qwen3.8-125b-a6b-cuda-v1", OFFICIAL_BASELINE_CUDA),
+    // The two Qwen 3.8 125B-A6B tracks are DELIBERATELY ABSENT. They score against a live
+    // serial-control leg (`LIVE_CONTROL_LEG_TRACKS`), so there is no pair to store and no row a
+    // reader could mistake for one.
 ];
 
 /// The track's captured baseline, or `None` while it is [`OFFICIAL_BASELINE_PENDING`]. The match
@@ -1030,15 +952,6 @@ mod tests {
         const WAS_GEMMA_GLOBAL_PREFILL: f64 = 0.0003276219582519531;
         const WAS_GEMMA_GLOBAL_DECODE: f64 = 0.012374741210937498;
         // The Qwen 3.8 125B-A6B MLX track's pair, as calibrated on the Darkbloom runner on the
-        // track's ranked box (M5 #4, 2026-09-06, ranked run 34062880993, engine 8df7f06 / fork 310daa2).
-        // Spelled out here for the same reason as the two above: the assertion must not be
-        // satisfiable by whatever `OFFICIAL_BASELINE_MLX` happens to say.
-        const WAS_125B_MLX_PREFILL: f64 = 0.0006282488193359375;
-        const WAS_125B_MLX_DECODE: f64 = 0.0329116748046875;
-        // The CUDA track's pair is DELIBERATELY absent from this enumeration: it is PENDING again
-        // for the ds4 engine capture (David 2026-09-03), so there is no pair for it to resolve to.
-        // Its retired vLLM values appear below as the NEGATIVE control.
-
         // The tracks this tree serves, and the pair each one must resolve to — `None` for a track
         // whose pair is pending. One row per declared track: a track added to the table without a
         // row here fails the length check below, so the enumeration cannot silently fall behind.
@@ -1057,22 +970,6 @@ mod tests {
                     prefill_seconds_per_token: WAS_GEMMA_GLOBAL_PREFILL,
                     decode_seconds_per_token: WAS_GEMMA_GLOBAL_DECODE,
                     bands: LEGACY_TWO_SIDED_BANDS,
-                }),
-            ),
-            (
-                "qwen3.8-125b-a6b-mlx-v1",
-                Some(OfficialBaseline {
-                    prefill_seconds_per_token: WAS_125B_MLX_PREFILL,
-                    decode_seconds_per_token: WAS_125B_MLX_DECODE,
-                    bands: MTP_SINGLE_LEG_BANDS,
-                }),
-            ),
-            (
-                "qwen3.8-125b-a6b-cuda-v1",
-                Some(OfficialBaseline {
-                    prefill_seconds_per_token: 0.002306397331787109,
-                    decode_seconds_per_token: 0.06740963554492188,
-                    bands: MTP_SINGLE_LEG_BANDS,
                 }),
             ),
         ];
@@ -1098,33 +995,20 @@ mod tests {
             }
         }
 
-        // NEGATIVE CONTROL for the ds4 re-pending: the retired vLLM pair is preserved BIT-EXACT
-        // for provenance, and NOTHING resolves to it. A re-pending that merely moved the numbers
-        // to another readable slot would pass every assertion above and still let a scored run
-        // reach a pair measured on an engine the track no longer runs.
-        const RETIRED_VLLM_PREFILL: f64 = 0.0004879835673828125;
-        const RETIRED_VLLM_DECODE: f64 = 0.06451959972265625;
-        assert_eq!(
-            OFFICIAL_BASELINE_CUDA_VLLM_RETIRED,
-            OfficialBaseline {
-                prefill_seconds_per_token: RETIRED_VLLM_PREFILL,
-                decode_seconds_per_token: RETIRED_VLLM_DECODE,
-                bands: MTP_SINGLE_LEG_BANDS,
-            },
-            "the retired vLLM pair must be preserved exactly as it was pinned"
-        );
-        for (_, declared) in OFFICIAL_BASELINES_BY_TRACK {
-            assert_ne!(
-                *declared,
-                Some(OFFICIAL_BASELINE_CUDA_VLLM_RETIRED),
-                "the retired vLLM pair is reachable through the table"
+        // NEGATIVE CONTROL for the live-control-leg design (David 2026-09-08): the two Qwen 3.8
+        // 125B-A6B tracks measure their own denominator, so NO row of this table may name one of
+        // them. A design that merely moved their pair to another readable slot would pass every
+        // assertion above and still let a ranked run reach a stored number.
+        for (track_id, _) in OFFICIAL_BASELINES_BY_TRACK {
+            assert!(
+                !scores_against_live_control_leg(track_id),
+                "{track_id} scores against a live control leg, so it must store no pair"
             );
         }
-        for platform in Platform::ALL {
-            assert_ne!(
-                platform.official_baseline_declared(),
-                Some(OFFICIAL_BASELINE_CUDA_VLLM_RETIRED),
-                "the retired vLLM pair is reachable through Platform::{platform:?}"
+        for track_id in LIVE_CONTROL_LEG_TRACKS {
+            assert!(
+                official_baseline_declared(track_id).is_none(),
+                "{track_id} must have no stored pair"
             );
         }
 
@@ -1133,19 +1017,6 @@ mod tests {
             official_baseline_declared(TRACK_ID).is_some(),
             "the release branch's own track {TRACK_ID} has no captured baseline"
         );
-
-        // ONE set of numbers, two keys: the 125B rows and `Platform::official_baseline` are the
-        // same value, so a re-pin on either side cannot leave the other scoring the old pair.
-        for (platform, track_id) in [
-            (Platform::Mlx, "qwen3.8-125b-a6b-mlx-v1"),
-            (Platform::Cuda, "qwen3.8-125b-a6b-cuda-v1"),
-        ] {
-            assert_eq!(
-                platform.official_baseline_declared(),
-                official_baseline_declared(track_id),
-                "{track_id} and Platform::{platform:?} resolve to different baselines"
-            );
-        }
     }
 
     /// A track with no captured pair REFUSES BY NAME instead of falling back. This is the whole
@@ -1273,15 +1144,9 @@ mod tests {
                 err.contains("iterate --mode official"),
                 "must name the path the track DOES score through: {err}"
             );
-            // The retirement is by TRACK, not by absence: the track still has its own row in the
-            // one table (captured, or `None` while its capture is pending — `qwen3.8-125b-a6b-
-            // cuda-v1` is pending for the ds4 engine), it simply does not enter the paired flow.
-            assert!(
-                OFFICIAL_BASELINES_BY_TRACK
-                    .iter()
-                    .any(|(id, _)| id == track),
-                "{track}"
-            );
+            // These are exactly the tracks that measure their own denominator on the box, which
+            // is why they carry no row in the stored-pair table.
+            assert!(scores_against_live_control_leg(track), "{track}");
         }
         // POSITIVE CONTROLS — the tracks that score through the paired flow are untouched.
         for track in ["qwen3.8-27b-mtp-v1", "gemma4-26b-a4b-mlx-v1"] {
@@ -1460,7 +1325,7 @@ mod tests {
     }
 
     #[test]
-    fn platform_facts_are_distinct_well_formed_and_pending_by_name() {
+    fn platform_facts_are_distinct_and_well_formed() {
         let is_hex40 = |s: &str| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit());
         let mlx = Platform::Mlx.reference_model();
         let cuda = Platform::Cuda.reference_model();
@@ -1469,20 +1334,30 @@ mod tests {
             assert!(!m.repository.is_empty() && m.repository.contains('/'));
             assert!(is_hex40(m.revision), "{}", m.revision);
         }
-        assert_ne!(
-            Platform::Mlx.official_baseline_pending(),
-            Platform::Cuda.official_baseline_pending()
+    }
+
+    /// The LIVE-CONTROL-LEG list is the ONE place a track declares that it stores no pair, and
+    /// the accessor matches EXACTLY. A near-miss names no track, so it cannot silently opt a
+    /// track out of the stored-pair table.
+    #[test]
+    fn live_control_leg_tracks_store_no_pair_and_match_exactly() {
+        assert_eq!(
+            LIVE_CONTROL_LEG_TRACKS,
+            ["qwen3.8-125b-a6b-mlx-v1", "qwen3.8-125b-a6b-cuda-v1"]
         );
-        for p in Platform::ALL {
-            assert!(p
-                .official_baseline_pending()
-                .contains(&p.key().to_ascii_uppercase()));
-            if p.official_baseline_declared().is_none() {
-                let err = p.official_baseline().unwrap_err();
-                assert!(err.contains(p.official_baseline_pending()), "{err}");
-                assert!(err.contains(p.key()), "{err}");
-            }
+        for track_id in LIVE_CONTROL_LEG_TRACKS {
+            assert!(scores_against_live_control_leg(track_id));
+            assert!(
+                official_baseline(track_id).is_err(),
+                "{track_id} must resolve no stored pair"
+            );
+            assert!(!scores_against_live_control_leg(&format!(" {track_id}")));
+            assert!(!scores_against_live_control_leg(&track_id.to_uppercase()));
+            assert!(!scores_against_live_control_leg(&format!("{track_id}-v9")));
         }
+        // The stored-pair tracks are NOT live-control-leg tracks: the two sets are disjoint.
+        assert!(!scores_against_live_control_leg(TRACK_ID));
+        assert!(!scores_against_live_control_leg("gemma4-26b-a4b-mlx-v1"));
     }
 
     #[test]

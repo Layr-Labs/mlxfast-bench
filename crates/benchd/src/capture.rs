@@ -80,12 +80,10 @@ pub struct CaptureRecord {
 /// positive one (a pending track admits the mode) is the state a newly cut track branch is in.
 ///
 /// `pending_sentinel` is the NAME of the pending state the caller resolves by, so the refusal
-/// quotes the sentinel an operator can actually grep for. Two resolution paths reach this gate
-/// and they carry different sentinels: the per-track table's
-/// [`bench_core::constants::OFFICIAL_BASELINE_PENDING`], and — on the single-leg official path,
-/// which keys on the platform rather than the track string —
-/// [`bench_core::constants::Platform::official_baseline_pending`]. Naming it here rather than
-/// hard-coding one of them is what lets ONE gate serve both.
+/// quotes the sentinel an operator can actually grep for. Today one resolution path reaches this
+/// gate and it carries the per-track table's
+/// [`bench_core::constants::OFFICIAL_BASELINE_PENDING`]; the sentinel stays a parameter so a
+/// second resolution can name its own state rather than borrow this one's.
 pub fn refuse_unless_pending(
     track_id: &str,
     captured: bool,
@@ -96,6 +94,27 @@ pub fn refuse_unless_pending(
             "--capture-baseline refused: track {track_id:?} is not {pending_sentinel} — its \
              official baseline pair is already captured, so there is nothing to capture. The \
              capture mode never runs on a captured track and never doubles as a scoring bypass"
+        ));
+    }
+    Ok(())
+}
+
+/// The EXACT-MATCH name of the refusal "this track measures its own denominator, so it has no
+/// pair to capture".
+pub const CAPTURE_RETIRED_FOR_LIVE_CONTROL_LEG: &str = "CAPTURE-RETIRED-FOR-LIVE-CONTROL-LEG";
+
+/// The mode's DESIGN gate: `--capture-baseline` captures a STORED pair, and a
+/// [`bench_core::constants::LIVE_CONTROL_LEG_TRACKS`] track stores none — its ranked run measures
+/// a serial-control leg on the box instead (David 2026-09-08). Such a track refuses the mode BY
+/// NAME and is pointed at the verb that replaced it, rather than being allowed to write a record
+/// nothing can consume.
+pub fn refuse_live_control_leg_track(track_id: &str) -> Result<(), String> {
+    if bench_core::constants::scores_against_live_control_leg(track_id) {
+        return Err(format!(
+            "{CAPTURE_RETIRED_FOR_LIVE_CONTROL_LEG}: track {track_id:?} scores against a \
+             serial-control leg measured on the box in the same job, so it stores no baseline pair \
+             and there is nothing for --capture-baseline to capture; what this box needs is its \
+             health band — run `benchd calibrate-baseline`"
         ));
     }
     Ok(())

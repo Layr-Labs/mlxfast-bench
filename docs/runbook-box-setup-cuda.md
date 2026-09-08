@@ -377,18 +377,25 @@ any idle runner with the label.
 
 ## 13. Baseline calibration on a fleet box
 
-The official baseline is the serial pair that every scored leg is divided
-by. `tools/qwen4exp-calibrate.sh` in the engine repository measures it on a
-box. The driver applies nothing. It writes `calibration.json` and a
-constants patch into its run directory. Pinning is a reviewed PR against
-benchd.
+RETIRED for this track (David 2026-09-08). The CUDA track no longer pins a
+serial pair: a ranked run measures a SERIAL-CONTROL leg on the reference tree
+and scores the live ratio against it. What a box carries instead is its own
+health band, written once by `benchd calibrate-baseline`. Follow
+[`qwen38-125b-a6b-baseline-capture.md`](qwen38-125b-a6b-baseline-capture.md).
 
-The driver has two preconditions that a ranked box does not meet:
+The rest of this section describes the retired stored-pair capture. It is kept
+for the legacy tracks that still pin a pair, and for readers of older runs.
+
+`tools/qwen4exp-calibrate.sh` in the engine repository measured the pair on a
+box. The driver applied nothing. It wrote `calibration.json` and a constants
+patch into its run directory. Pinning was a reviewed PR against benchd.
+
+The driver had two preconditions that a ranked box does not meet:
 
 - The declared spec must be `serial`. The release branch declares a depth.
   Use a checkout of `main`, whose manifest is serial.
-- The benchd pair must be capture-armed: a build whose
-  `OFFICIAL_BASELINE_CUDA` is pending. The installed pair is pinned and
+- The benchd pair must be capture-armed: a build whose track row is absent from
+  `OFFICIAL_BASELINES_BY_TRACK`. A pinned pair
   refuses `--capture-baseline`. Build the pair from the bench repository at
   the commit before the pin (`0ca32e2` for this track) with
   `cargo build --release -p benchd --bin benchd --bin record-correctness-golden`.

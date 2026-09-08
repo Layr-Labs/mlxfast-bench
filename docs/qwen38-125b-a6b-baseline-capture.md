@@ -191,6 +191,14 @@ resident that is already gone is not an error. Leg 1 is always booted
 `--stop` when the leg ends, on success and on failure alike, so the two legs
 never hold GPU memory at the same time.
 
+On macOS the Seatbelt profile carries ONE `network-outbound` allowance, naming ONE socket path
+literal, because Seatbelt counts an AF_UNIX connect as network. That profile is therefore built
+PER SPAWN from THAT leg's socket: the reference leg may reach the reference resident and nothing
+else, and the candidate leg may reach the candidate resident and nothing else. The rest of the
+profile is unchanged, and its `(allow default)` base means the reference leg reads the reference
+tree's own weights and metallib with no extra allowance — the only denied reads are the private
+golden and the private dir.
+
 Do NOT wrap benchd in the resident wrapper on the paired path. benchd runs it
 itself, twice. A resident socket inherited from benchd's own environment is
 refused by name (`LEG-SERVE-INHERITED-SOCKET`): one resident for both legs

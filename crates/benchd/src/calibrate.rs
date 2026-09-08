@@ -328,17 +328,12 @@ fn execute(args: &[String]) -> Result<Option<()>, String> {
         baseline::reference_engine_path(&args.engine, Path::new(""), &args.baseline_workspace)?;
     let engine_str = engine.to_string_lossy().to_string();
     let weights_str = args.weights.to_string_lossy().to_string();
-    let sandbox = if cfg!(target_os = "macos") {
-        // The engine is the REFERENCE tree's own, resolved from --baseline-workspace, so the
-        // `MLXFAST_RUNTIME_WORKER_EXECUTABLE` override is deliberately not honoured here.
-        Some(crate::resolve_official_sandbox_from_env(
-            &engine_str,
-            &args.golden,
-            false,
-        )?)
-    } else {
-        None
-    };
+    // The Seatbelt plan is built PER PASS, not once: its one `network-outbound` allowance names
+    // the socket THIS pass's resident answers on, and that socket exists only in the pass's
+    // spawn-env overrides (see `spawn_resident_socket`). One plan up front would name this
+    // process's socket — which a calibrating box does not have — and every pass would die on
+    // `Operation not permitted`.
+    let sandboxed = cfg!(target_os = "macos");
     // The calibration passes run the RANKED leg-1 shape exactly, including its per-leg engine
     // lifecycle: each pass boots the reference tree's OWN resident and tears it down again, on
     // both platforms. An inherited socket is refused for the same reason the ranked path refuses
@@ -371,6 +366,18 @@ fn execute(args: &[String]) -> Result<Option<()>, String> {
         let serve =
             crate::legserve::boot_leg(&args.baseline_workspace, None, "serial-control", platform)?;
         let leg_env = serve.spawn_env();
+        let sandbox = if sandboxed {
+            // The engine is the REFERENCE tree's own, resolved from --baseline-workspace, so the
+            // `MLXFAST_RUNTIME_WORKER_EXECUTABLE` override is deliberately not honoured here.
+            Some(crate::resolve_official_sandbox_from_env(
+                &engine_str,
+                &args.golden,
+                false,
+                crate::spawn_resident_socket(&leg_env, None).as_deref(),
+            )?)
+        } else {
+            None
+        };
         let spawn = || -> bench_runner::Result<Session<ChildStdioTransport>> {
             let transport = crate::spawn_official_worker(
                 sandbox.as_ref(),

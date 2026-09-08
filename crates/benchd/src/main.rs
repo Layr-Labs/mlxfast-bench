@@ -2352,8 +2352,21 @@ fn execute_measure_job(args: &MeasureJobArgs) -> Result<MeasureJobVerdict, Measu
     // the `MLXFAST_RUNTIME_WORKER_EXECUTABLE` override: honouring it would point both legs at one
     // binary. (The override was already inert here in practice — both calls passed their own
     // executable — so this states the existing intent rather than changing it.)
-    let serial_plan = resolve_official_sandbox_from_env(&baseline_exec, golden_path, false)?;
-    let candidate_plan = resolve_official_sandbox_from_env(&candidate_exec, golden_path, false)?;
+    // The paired measure-job runs under ONE resident for the window, so both legs' profiles name
+    // the process env's socket — the legacy single-resident topology, unchanged.
+    let window_socket = process_resident_socket();
+    let serial_plan = resolve_official_sandbox_from_env(
+        &baseline_exec,
+        golden_path,
+        false,
+        window_socket.as_deref(),
+    )?;
+    let candidate_plan = resolve_official_sandbox_from_env(
+        &candidate_exec,
+        golden_path,
+        false,
+        window_socket.as_deref(),
+    )?;
     let serial_weights = args.weights.to_string_lossy().to_string();
     let candidate_weights = args.weights.to_string_lossy().to_string();
     // R15 — per-side heads passed to the ONE spawned worker per leg: the serial control loads the
@@ -3667,6 +3680,36 @@ fn paired_inputs_present(args: &IterateArgs) -> bool {
         && (args.baseline_calibration.is_some() || from_env(baseline::BASELINE_CALIBRATION_ENV))
 }
 
+/// The resident socket a SPAWN's Seatbelt profile must allow: the LEG's own, taken from that
+/// spawn's env overrides, else the process environment's.
+///
+/// The two sources are the two topologies. A PAIRED run boots one resident per leg and hands each
+/// spawn its leg's socket in the overrides — the process env has none, and must not be consulted,
+/// because a stale one would name the wrong resident. The legacy SINGLE-resident path (a local
+/// unscored run under the measure script's own wrapper) has no overrides and its socket is exactly
+/// the process env's. Pure, so the selection is testable without a sandbox or a box.
+fn spawn_resident_socket(
+    leg_env: &[(String, String)],
+    process_env: Option<&str>,
+) -> Option<String> {
+    let non_empty = |value: &str| (!value.trim().is_empty()).then(|| value.to_string());
+    // A leg that supplied the name AT ALL has answered for itself, even with an empty value:
+    // falling back to the process env there would hand that leg a DIFFERENT resident, which is
+    // the whole failure this function exists to stop. An empty leg value means no socket.
+    if let Some((_, value)) = leg_env
+        .iter()
+        .find(|(name, _)| name == legserve::BENCH_WORKER_RESIDENT_SOCKET_ENV)
+    {
+        return non_empty(value);
+    }
+    process_env.and_then(non_empty)
+}
+
+/// The `BENCH_WORKER_RESIDENT_SOCKET` this process inherited, if any.
+fn process_resident_socket() -> Option<String> {
+    std::env::var(legserve::BENCH_WORKER_RESIDENT_SOCKET_ENV).ok()
+}
+
 /// Whether a resident engine socket is already named in THIS process's environment (the
 /// single-leg shape, where the measure script wraps benchd in `tools/serve-up.sh`). The paired
 /// path boots its own per leg and REFUSES an inherited one; every other path still honours it.
@@ -3772,10 +3815,15 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
     // (including the `MLXFAST_NO_SANDBOX` refusal, which only reaches the resolver on macOS).
     let official_sandbox: Option<OfficialSandboxPlan> =
         if args.mode == Mode::Official && cfg!(target_os = "macos") {
+            // The SHAPE of the official plan (is there one at all, and which executable does it
+            // name) — resolved here, before any leg exists. The paired path re-resolves per spawn
+            // with that leg's own resident socket; every other path spawns with this plan and the
+            // process env's socket, which is the topology it runs under.
             Some(resolve_official_sandbox_from_env(
                 &args.engine,
                 &args.golden,
                 true,
+                process_resident_socket().as_deref(),
             )?)
         } else {
             None
@@ -4087,20 +4135,11 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
         let reference_weights =
             baseline::reference_weights_path(&args.weights, &workspace_root, &workspace)?;
         let reference_weights_str = reference_weights.path().to_string_lossy().to_string();
-        // The two legs are wrapped IDENTICALLY: the reference leg resolves a Seatbelt plan
-        // exactly when the candidate leg has one. A run that sandboxed one leg and not the other
-        // would compare two differently-wrapped processes — and a LOCAL paired run, which resolves
-        // no official sandbox at all, would otherwise sandbox only the control leg.
-        let reference_sandbox = match official_sandbox.as_ref() {
-            Some(_) => Some(resolve_official_sandbox_from_env(
-                &reference_engine_str,
-                &args.golden,
-                false,
-            )?),
-            None => None,
-        };
-
-        let plan = official_sandbox.as_ref();
+        // The two legs are wrapped IDENTICALLY: a leg resolves a Seatbelt plan exactly when the
+        // official plan resolved one. A run that sandboxed one leg and not the other would compare
+        // two differently-wrapped processes — and a LOCAL paired run, which resolves no official
+        // plan at all, would otherwise sandbox only the control leg.
+        let sandboxed = official_sandbox.is_some();
         let weights_str = args.weights.to_string_lossy().to_string();
         let commit_env = std::env::var("MLXFAST_COMMIT_SHA").ok();
         let commit = official::commit_identifier(commit_env.as_deref());
@@ -4129,6 +4168,35 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
         let leg_env: std::cell::RefCell<Vec<(String, String)>> =
             std::cell::RefCell::new(Vec::new());
         let candidate_spec = args.spec.clone();
+        // THE PLAN IS PER SPAWN, because the SOCKET is per leg. Seatbelt classifies an AF_UNIX
+        // connect as network, and the profile's one `network-outbound` allowance names ONE
+        // path-literal — so it has to be built from the socket THIS leg's worker will connect to,
+        // which exists only in that leg's spawn-env overrides. Resolving it once up front from
+        // this process's environment left a per-leg worker with no allowance at all
+        // (`cannot reach the resident … Operation not permitted`, box-4 calibration on #296).
+        //
+        // Each leg therefore gets an allowance for ITS OWN socket and nothing else: the reference
+        // leg cannot connect to the candidate's resident, and the candidate cannot connect to the
+        // reference's. The rest of the profile is unchanged, and its `(allow default)` base means
+        // the reference leg reads the reference tree's own weights and metallib without any
+        // checkout-rooted allowance — the deny rules name only the private golden and the private
+        // dir.
+        let leg_sandbox_plan = |engine: &str,
+                                honor_executable_override: bool|
+         -> bench_runner::Result<Option<OfficialSandboxPlan>> {
+            if !sandboxed {
+                return Ok(None);
+            }
+            let socket = spawn_resident_socket(&leg_env.borrow(), None);
+            resolve_official_sandbox_from_env(
+                engine,
+                &args.golden,
+                honor_executable_override,
+                socket.as_deref(),
+            )
+            .map(Some)
+            .map_err(bench_runner::RunnerError::Protocol)
+        };
         let open_baseline_leg = || -> Result<legserve::LegServe, String> {
             // ALWAYS SERIAL, whatever the submission declares: this is the control.
             let serve = legserve::boot_leg(&workspace, None, "serial-control", platform)?;
@@ -4163,8 +4231,9 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
         // the CANDIDATE's — the leg that is scored.
         let baseline_hello = std::cell::RefCell::new(None);
         let spawn_baseline = || -> bench_runner::Result<Session<ChildStdioTransport>> {
+            let plan = leg_sandbox_plan(&reference_engine_str, false)?;
             let transport = spawn_official_worker(
-                reference_sandbox.as_ref(),
+                plan.as_ref(),
                 &reference_engine_str,
                 &reference_weights_str,
                 &args.engine_resources,
@@ -4178,8 +4247,9 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
         // Leg 2's workers, rooted at the SUBMISSION tree — byte-for-byte the single-leg path's.
         let timed_hello = std::cell::RefCell::new(None);
         let spawn_timed = || -> bench_runner::Result<Session<ChildStdioTransport>> {
+            let plan = leg_sandbox_plan(&args.engine, true)?;
             let transport = spawn_official_worker(
-                plan,
+                plan.as_ref(),
                 &args.engine,
                 &weights_str,
                 &args.engine_resources,
@@ -4191,8 +4261,9 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
             Ok(session)
         };
         let spawn_correctness = || -> bench_runner::Result<Session<ChildStdioTransport>> {
+            let plan = leg_sandbox_plan(&args.engine, true)?;
             let transport = spawn_official_worker(
-                plan,
+                plan.as_ref(),
                 &args.engine,
                 &weights_str,
                 &args.engine_resources,
@@ -4827,6 +4898,7 @@ fn resolve_official_sandbox_from_env(
     engine: &str,
     golden: &Path,
     honor_executable_override: bool,
+    resident_socket: Option<&str>,
 ) -> Result<OfficialSandboxPlan, String> {
     let use_rw = std::env::var("MLXFAST_USE_RUNTIME_WORKER").ok();
     let no_sb = std::env::var("MLXFAST_NO_SANDBOX").ok();
@@ -4839,13 +4911,13 @@ fn resolve_official_sandbox_from_env(
         .flatten();
     let prof_ov = std::env::var("MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE").ok();
     let priv_dir = std::env::var("MLXFAST_PRIVATE_DIR").ok();
-    // The resident bench-worker socket. This is read from OUR env deliberately: the engine
-    // child gets it through the `BENCH_WORKER_` allowlist prefix
-    // (bench_runner::transport::ENGINE_ENV_ALLOWED_PREFIXES), which copies it straight from
-    // this process, so the name the profile allows is exactly the name the worker will
-    // connect to. Seatbelt counts an AF_UNIX connect as network, so without this the
-    // sandboxed worker cannot attach to the resident at all (see bench_runner::sandbox).
-    let resident_socket = std::env::var("BENCH_WORKER_RESIDENT_SOCKET").ok();
+    // THE RESIDENT SOCKET IS THE SPAWN'S, NOT THE PROCESS'S. Seatbelt counts an AF_UNIX
+    // connect as network, so the profile's one `network-outbound` allowance must name exactly
+    // the socket THIS spawn's worker will connect to. On the paired path that socket lives in
+    // the LEG's spawn-env overrides and nowhere else — reading it from this process's own env
+    // gave a per-leg spawn no allowance at all, and the box-4 calibration died on
+    // `cannot reach the resident … Operation not permitted`. The caller passes the leg's
+    // socket; the legacy single-resident path passes the process env's.
     let golden_str = golden.to_string_lossy().to_string();
     let inputs = OfficialSandboxInputs {
         use_runtime_worker: use_rw.as_deref(),
@@ -4853,7 +4925,7 @@ fn resolve_official_sandbox_from_env(
         executable_override: exec_ov.as_deref(),
         profile_override: prof_ov.as_deref(),
         private_dir: priv_dir.as_deref(),
-        resident_socket: resident_socket.as_deref(),
+        resident_socket,
         fallback_executable: engine,
         golden_path: &golden_str,
         sandbox_exec_available: sandbox_exec_is_executable(),
@@ -6853,6 +6925,136 @@ mod tests {
             err.contains(baseline::STORED_BASELINE_OVERRIDE_REFUSED),
             "{err}"
         );
+    }
+
+    /// THE LEG'S OWN SOCKET, AND ONLY ITS OWN, REACHES THAT LEG'S SEATBELT PROFILE.
+    ///
+    /// Seatbelt counts an AF_UNIX connect as network, so the profile's one `network-outbound`
+    /// allowance must name the socket THIS spawn's worker will connect to. With per-leg residents
+    /// that socket lives in the leg's spawn-env overrides and nowhere else — the process
+    /// environment has none — and reading it from the process env left a leg worker with no
+    /// allowance at all (`cannot reach the resident … Operation not permitted`, box-4 calibration).
+    ///
+    /// The profile is built here through the same pure resolver `resolve_official_sandbox_from_env`
+    /// delegates to, with `sandbox_exec_available` injected, so the assertion holds on any host.
+    #[test]
+    fn a_leg_spawns_profile_allows_exactly_its_own_resident_socket() {
+        const REFERENCE_SOCKET: &str = "/tmp/bench-worker-resident.reference.sock";
+        const CANDIDATE_SOCKET: &str = "/tmp/bench-worker-resident.candidate.sock";
+        const PROCESS_SOCKET: &str = "/tmp/bench-worker-resident.window.sock";
+
+        let leg_env = |socket: &str| {
+            vec![(
+                legserve::BENCH_WORKER_RESIDENT_SOCKET_ENV.to_string(),
+                socket.to_string(),
+            )]
+        };
+        let profile_for = |socket: Option<&str>| -> String {
+            let plan = bench_runner::resolve_official_sandbox(
+                &bench_runner::OfficialSandboxInputs {
+                    resident_socket: socket,
+                    fallback_executable: "/ref/tree/.build/release/bench-worker",
+                    golden_path: "/private/goldens/botany.golden.json",
+                    sandbox_exec_available: true,
+                    ..Default::default()
+                },
+                false,
+            )
+            .expect("the plan resolves with a sandbox-exec available");
+            match plan.profile {
+                bench_runner::SandboxProfile::Generated(source) => source,
+                other => panic!("expected a generated profile, got {other:?}"),
+            }
+        };
+
+        // THE SELECTION: the leg's override wins, and the process env is not consulted when a leg
+        // named one. A leg with no override falls back to the process env — the legacy
+        // single-resident topology, which is the only one that has a process socket.
+        let reference = spawn_resident_socket(&leg_env(REFERENCE_SOCKET), Some(PROCESS_SOCKET));
+        assert_eq!(reference.as_deref(), Some(REFERENCE_SOCKET));
+        let candidate = spawn_resident_socket(&leg_env(CANDIDATE_SOCKET), Some(PROCESS_SOCKET));
+        assert_eq!(candidate.as_deref(), Some(CANDIDATE_SOCKET));
+        assert_eq!(
+            spawn_resident_socket(&[], Some(PROCESS_SOCKET)).as_deref(),
+            Some(PROCESS_SOCKET),
+            "the legacy single-resident path keeps its process-env socket"
+        );
+        // An empty value is no socket at all — and a leg that named the variable at all has
+        // ANSWERED, so it never falls back to a process socket that names a different resident.
+        assert_eq!(spawn_resident_socket(&[], Some("  ")), None);
+        assert_eq!(
+            spawn_resident_socket(&leg_env(""), Some(PROCESS_SOCKET)),
+            None
+        );
+
+        // THE PROFILE: each leg's profile allows exactly its own socket — not the other leg's, and
+        // not the process env's.
+        let reference_profile = profile_for(reference.as_deref());
+        assert!(
+            reference_profile.contains(&format!(
+                "(allow network-outbound (remote unix-socket (path-literal \"{REFERENCE_SOCKET}\")))"
+            )),
+            "{reference_profile}"
+        );
+        assert!(
+            !reference_profile.contains(CANDIDATE_SOCKET),
+            "the reference leg must not be allowed to reach the candidate's resident: \
+             {reference_profile}"
+        );
+        assert!(
+            !reference_profile.contains(PROCESS_SOCKET),
+            "the reference leg must not be allowed to reach a window resident: {reference_profile}"
+        );
+
+        let candidate_profile = profile_for(candidate.as_deref());
+        assert!(
+            candidate_profile.contains(&format!(
+                "(allow network-outbound (remote unix-socket (path-literal \"{CANDIDATE_SOCKET}\")))"
+            )),
+            "{candidate_profile}"
+        );
+        assert!(
+            !candidate_profile.contains(REFERENCE_SOCKET),
+            "{candidate_profile}"
+        );
+        assert!(
+            !candidate_profile.contains(PROCESS_SOCKET),
+            "{candidate_profile}"
+        );
+        // Exactly ONE allowance, on each side.
+        for profile in [&reference_profile, &candidate_profile] {
+            assert_eq!(
+                profile.matches("network-outbound").count(),
+                1,
+                "one allowance and no more: {profile}"
+            );
+        }
+
+        // NO SOCKET ANYWHERE: no unix-socket allowance at all, and the blanket network deny stands.
+        assert_eq!(spawn_resident_socket(&[], None), None);
+        let bare = profile_for(None);
+        assert!(
+            !bare.contains("unix-socket") && !bare.contains("network-outbound"),
+            "a run with no resident must widen nothing: {bare}"
+        );
+        assert!(bare.contains("(deny network*)"), "{bare}");
+
+        // THE READ SURFACE. The profile's base is `(allow default)` and its only read denials name
+        // the private golden and the private dir — nothing is rooted at the candidate checkout. So
+        // the REFERENCE leg reads the reference tree's own weights and metallib, which live
+        // outside that checkout, with no extra allowance needed.
+        for profile in [&reference_profile, &bare] {
+            assert!(profile.contains("(allow default)"), "{profile}");
+            let denied_reads: Vec<&str> = profile
+                .lines()
+                .filter(|l| l.starts_with("(deny file-read*"))
+                .collect();
+            assert_eq!(
+                denied_reads,
+                vec!["(deny file-read* (literal \"/private/goldens/botany.golden.json\"))"],
+                "the only denied read is the private golden: {profile}"
+            );
+        }
     }
 
     /// THE PAIRED PATH's two runner inputs are FLAGS as well as environment variables, and both

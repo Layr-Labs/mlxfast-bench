@@ -1,0 +1,8 @@
+{
+  "version": "0.0.0",
+  "branch": "qwen3.8-125b-a6b-v1",
+  "source_commit": "6607432f4b4c7340851afa774efd6111316902b6",
+  "target_triple": "aarch64-apple-darwin",
+  "sha256": "528182529920f03f18e4867eb494e8704bb11f4cdef9bc4530a2bf735eb65b5d",
+  "bytes": 1648032
+}

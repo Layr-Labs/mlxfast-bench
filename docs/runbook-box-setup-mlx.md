@@ -201,3 +201,34 @@ so the readiness receipt is a passing run that scores near 1.00.
 - [ ] reference tree built and calibrated; `MLXFAST_BASELINE_WORKSPACE` and `MLXFAST_BASELINE_CALIBRATION` in the runner `.env`
 - [ ] one `workflow_dispatch` of `benchmark.yml` passes end to end
 - [ ] sealed serial score near 1.00 on the paired run
+
+## Reading local failures
+
+Local `iterate` results include `metrics.local_phases` alongside the legacy score
+fields. Inspect it with:
+
+```sh
+jq '{passed, score, phases: .metrics.local_phases, error: .metrics.error}' score.local-iterate.json
+```
+
+`correctness` describes the untimed conformance gate; `timing` describes completion
+of the measured prefill/decode pair. Each is `not_run`, `passed`, or `failed`.
+`correctness_checked_steps` counts the conformance steps actually checked; it is
+`null` if the gate started but a protocol/transport error prevented a report.
+A timing result is `not_run` when no timing cool gate cleared, which includes a
+timing failure raised before the first gate (a parameter or worker-spawn error:
+read `metrics.error`), or `failed` when a started measurement did not complete
+(including a later decode cool-gate abort). Old artifacts and official paths do not carry this local-only field.
+
+For example, a prefill thermal abort after conformance can correctly report
+`correctness: "passed"` and `timing: "not_run"`. The legacy `checked_steps` remains
+zero on that failure path for Swift checked-timing parity; it is not evidence that
+the separate conformance gate was skipped. `passed_correctness` remains false if
+a failed gate is followed by a phase-close error, or a timed-only pass fails without
+running the gate. A successful local measurement without a baseline still has
+`score: null`; consult `passed`, phase outcomes, and `error` together.
+
+While cooling, benchd prints the phase, current and minimum GPU temperature,
+target, wall-clock elapsed time, and logical gate wait on each usable sample.
+The MLX threshold remains 40 C, with the existing polling, stall-abort, and maximum
+wait rules. Progress output does not relax or bypass the gate.

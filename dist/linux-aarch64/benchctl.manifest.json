@@ -1,8 +1,0 @@
-{
-  "version": "0.0.0",
-  "branch": "qwen3.8-125b-a6b-v1",
-  "source_commit": "6607432f4b4c7340851afa774efd6111316902b6",
-  "target_triple": "aarch64-unknown-linux-gnu",
-  "sha256": "d1a15e3862507b9da404362583dffc587c7cbaf08fcc5c7fe7c121a0763458dd",
-  "bytes": 1851856
-}

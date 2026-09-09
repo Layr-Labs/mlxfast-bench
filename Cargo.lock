@@ -9,25 +9,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
-name = "bench-adapter"
-version = "0.0.0"
-dependencies = [
- "bench-core",
- "bench-protocol",
- "serde_json",
-]
-
-[[package]]
-name = "bench-agent"
-version = "0.0.0"
-dependencies = [
- "bench-core",
- "bench-protocol",
- "bench-runner",
- "bench-telemetry",
-]
-
-[[package]]
 name = "bench-core"
 version = "0.0.0"
 dependencies = [
@@ -52,21 +33,8 @@ version = "0.0.0"
 dependencies = [
  "bench-core",
  "bench-protocol",
- "serde",
  "serde_json",
 ]
-
-[[package]]
-name = "bench-telemetry"
-version = "0.0.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "bench-transform"
-version = "0.0.0"
 
 [[package]]
 name = "benchd"
@@ -75,8 +43,6 @@ dependencies = [
  "bench-core",
  "bench-protocol",
  "bench-runner",
- "bench-telemetry",
- "bench-transform",
  "libc",
  "serde",
  "serde_json",

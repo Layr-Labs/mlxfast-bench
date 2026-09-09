@@ -24,8 +24,8 @@ seam. The plan: freeze it as **Engine Protocol v1**, rebuild the trusted side
 `benchmark.sh`, the Swift harness targets, and duplicated jq) as a single Rust
 workspace shipped as a pinned Docker image, and let engines be dumb protocol
 servers: the existing Swift/MLX engine running raw on M5s, and a new CUDA engine in
-an Ubuntu container. Container isolation replaces macOS Seatbelt on Linux; a thin
-host agent keeps Seatbelt on the Macs.
+an Ubuntu container. Container isolation replaces macOS Seatbelt on Linux; the
+Macs keep Seatbelt.
 
 > **Why this works:** because the harness only ever sends token IDs and measures
 > round-trip wall time, the engine's language, framework, and GPU are invisible to
@@ -112,7 +112,7 @@ flowchart LR
     RUN -- "Engine Protocol v1<br/>NDJSON · token IDs only<br/>stdio or localhost TCP" --> E1
     RUN -. same protocol .-> E2
     subgraph ENGINES ["untrusted engine plane"]
-        E1["mlxfast-engine (Swift/MLX)<br/>raw M5 · Seatbelt via bench-agent"]
+        E1["mlxfast-engine (Swift/MLX)<br/>raw M5 · Seatbelt"]
         E2["cudafast-engine<br/>Ubuntu container · --network none"]
     end
 ```
@@ -132,16 +132,6 @@ use). Absorbs and retires: `benchmark.sh`, the Swift harness targets
 - `bench-runner` — engine lifecycle (spawn / connect), parent-side `Instant`
   timing, phase sequencing, allocator-drain and anti-memoization enforcement,
   offline probe.
-- `bench-transform` — port of the MLX-free Swift transform + the staged-output
-  validation currently in `benchmark.sh` (gap-free safetensors tiling, atomic
-  publish). One implementation serves both platforms; it must run on Linux anyway
-  for CUDA provisioning.
-- `bench-telemetry` — a provider trait: `macmon` on M5 (temp gate, GPU clock floor,
-  util samples), `NVML` on CUDA boxes. Thermal gates and clock-floor rejection
-  become config, not hardcoded Apple numbers.
-- `bench-adapter` — the third-party SDK: the Engine Protocol v1 NDJSON-over-stdio
-  loop, generic over an `Engine` trait. A track engine repository implements that
-  trait and reuses this loop instead of writing its own.
 - `benchd` — the CLI: `setup`, `transform`, `iterate`, `submit`, `official`.
 
 **Reproducible + secure by construction:** `cargo build --locked` with a pinned
@@ -183,27 +173,12 @@ drain, mirroring the Swift engine's existing split between the harness-owned ser
 loop and the editable model modules. The container pins the runtime; the editable
 paths are the static-review target.
 
-### Deliverable 4 · trusted timing peer — `bench-agent` (for raw M5 engines)
-
-Docker on macOS is a Linux VM, so a containerized benchd can't spawn a host process
-— and, per §8 cycle 1, it must not *time* one either, since a VM clock across the
-VM↔host boundary is less accurate than a native one. `bench-agent` is a small static
-Rust binary (same workspace) that runs natively on the Mac: it wraps the engine in a
-generated Seatbelt profile, sanitizes the env, spawns it, and **owns the
-parent-side wall clock** for the protocol round trips, exposing sealed timing
-samples to the containerized benchd, which orchestrates and scores. It bridges the
-engine over a `127.0.0.1` listener guarded by a single-use, session-bound token
-(§4). Because it holds the most attackable number in the system, bench-agent is
-**ring-0 trusted**: release-hash pinned and verified by benchd before each run — a
-trusted timing peer, not a passive shim. On Linux none of this applies: the engine
-is a peer container on an internal compose network and benchd times it natively.
-
 ---
 
 ## 3. Engine Protocol v1
 
 Freeze what exists; add only a version handshake. Transport: NDJSON over stdio
-(default, co-located) or localhost TCP (cross-boundary via bench-agent / compose
+(default, co-located) or localhost TCP (cross-boundary via a compose
 network). Request `{id, kind, ...}` → response `{id, nonce, ok, ...}`.
 
 | kind | in | out | notes |
@@ -311,12 +286,12 @@ confinement, process cap), the runtime worker runs under Seatbelt (ring 3), and
 
 | today (macOS) | new Linux path | new M5 path |
 |---|---|---|
-| Seatbelt `deny network*` + curl self-test | engine container `--network none`; benchd probes egress before each run | bench-agent keeps the generated Seatbelt profile |
-| the ONE exception to `deny network*`: on a RESIDENT run (`BENCH_WORKER_RESIDENT_SOCKET` set) the profile adds `(allow network-outbound (remote unix-socket (path-literal "<socket>")))`, because Seatbelt classifies an AF_UNIX connect as network and the worker must attach to the already-loaded resident instead of re-loading the weights per phase | not needed: the resident and the worker share a container network namespace | bench-agent emits the same one-socket rule |
+| Seatbelt `deny network*` + curl self-test | engine container `--network none`; benchd probes egress before each run | benchd keeps the generated Seatbelt profile |
+| the ONE exception to `deny network*`: on a RESIDENT run (`BENCH_WORKER_RESIDENT_SOCKET` set) the profile adds `(allow network-outbound (remote unix-socket (path-literal "<socket>")))`, because Seatbelt classifies an AF_UNIX connect as network and the worker must attach to the already-loaded resident instead of re-loading the weights per phase | not needed: the resident and the worker share a container network namespace | benchd emits the same one-socket rule |
 | `deny process-fork/exec*` | default seccomp, `pids-limit`, `no-new-privileges` | unchanged (Seatbelt) |
 | write-deny + `MLXFAST_OFFLINE_WRITABLE_PATHS` allowlist | read-only rootfs, ro weights mount, tmpfs scratch | unchanged |
-| `deny file-read` on golden + private dir | **stronger:** golden is never in the engine's mount namespace at all | same — golden stays inside benchd's container |
-| env sanitization allowlist in Swift | containers start with an explicit env; benchd passes nothing | bench-agent applies the allowlist |
+| `deny file-read` on golden + private dir | **stronger:** golden is never in the engine's mount namespace at all | unchanged |
+| env sanitization allowlist in Swift | containers start with an explicit env; benchd passes nothing | benchd applies the allowlist |
 | `pin-trusted-harness.sh` (3× TOCTOU checks) | image digest pinning + signatures for benchd and the CUDA engine; release-hash pin for the M5 engine binary + metallib, verified by benchd at spawn | ← same |
 | score discarded from disk, re-sealed from stdout | structurally gone: only benchd writes scores; engines never see score paths | ← same |
 | macmon thermal gate, 1600 MHz clock floor | NVML provider: temp gate, SM-clock floor, util sampling — values from `target.toml` | macmon provider, same trait |
@@ -325,25 +300,18 @@ confinement, process cap), the runtime worker runs under Seatbelt (ring 3), and
 
 | ring (today, M5) | new M5 path | new Ubuntu/CUDA path |
 |---|---|---|
-| **Ring 0** — CI runner user: secrets, golden pulls, score sealing, artifact validation | Runner user unchanged: runs the benchd container, holds secrets, owns score outputs. Secrets reach benchd only in `official` mode via a runner-owned mounted file (0600) — never the engine side. | Dedicated unprivileged `bench-runner` host user — *not* in the `docker` group. Runs benchd via **rootless podman**. Same secrets rule. |
-| **Ring 1→2 bridge** — `sudo -n bench-exec.sh` drops to ephemeral `bench` uid; per-uid PF egress block; workspace confinement; process cap | **Kept.** bench-agent spawns the engine through the same sudo bridge to the `bench` uid; PF egress + confinement unchanged. | Second host user `bench-engine` with a subordinate uid/gid range (**userns remap**). A container escape lands in an unprivileged uid that owns nothing but per-run scratch. Egress: `--network none` + nftables per-uid block. |
+| **Ring 0** — CI runner user: secrets, golden pulls, score sealing, artifact validation | Runner user unchanged: runs benchd, holds secrets, owns score outputs. Secrets reach benchd only in `official` mode via a runner-owned file (0600) — never the engine side. | Dedicated unprivileged `bench-runner` host user — *not* in the `docker` group. Runs benchd via **rootless podman**. Same secrets rule. |
+| **Ring 1→2 bridge** — `sudo -n bench-exec.sh` drops to ephemeral `bench` uid; per-uid PF egress block; workspace confinement; process cap | **Kept:** the engine is spawned through the same sudo bridge to the `bench` uid; PF egress + confinement unchanged. | Second host user `bench-engine` with a subordinate uid/gid range (**userns remap**). A container escape lands in an unprivileged uid that owns nothing but per-run scratch. Egress: `--network none` + nftables per-uid block. |
 | **Build of submitted code** — runs as `bench` via bench-exec | Unchanged. | Throwaway build container under `bench-engine`'s range, no network (vendored/locked deps), fresh cache per run; only the built artifact is handed forward. |
-| **Ring 3** — Seatbelt around `runtime-worker` | Kept: bench-agent generates the profile. | The engine container: read-only rootfs, `cap-drop ALL`, `no-new-privileges`, default seccomp, pids/memory limits. |
+| **Ring 3** — Seatbelt around `runtime-worker` | Kept: benchd generates the profile. | The engine container: read-only rootfs, `cap-drop ALL`, `no-new-privileges`, default seccomp, pids/memory limits. |
 | **Post-run** — `janitor.sh` wipe + signed audit; `quarantine.flag` | Unchanged. | Per-run ephemeral containers + volumes destroyed by a `bench-runner`-owned janitor unit; quarantine = host flag checked by ring-0 preflight. |
 
-**Three rules that keep the rings honest:**
+**Two rules that keep the rings honest:**
 
 - **benchd never touches a container-control socket.** A container holding the
   Docker/podman socket is root on the host. Engine lifecycle belongs to host-side
-  units owned by `bench-runner`/`bench-engine` (compose services, systemd/quadlet,
-  or bench-agent); benchd only ever *connects* to an engine, it never launches
-  containers.
-- **The TCP bridge is authenticated (§8, cycle 5).** bench-agent binds `127.0.0.1`
-  only and requires a *single-use, session-bound* token minted by ring 0, carried
-  in the `hello` and bound to the session nonce. Exactly one authenticated session
-  per run; a second connection or a nonce mismatch is rejected and discards the
-  session — defeating co-tenant injection and token replay on these multi-user
-  boxes.
+  units owned by `bench-runner`/`bench-engine` (compose services, systemd/quadlet);
+  benchd only ever *connects* to an engine, it never launches containers.
 - **Ownership follows the rings.** Weights: written by ring 0's transform, mounted
   read-only to the engine uid. Goldens and scores: ring 0 only, never in any
   engine-side namespace. Telemetry binaries (macmon/NVML readers): ring-0-owned and
@@ -384,21 +352,16 @@ together or not at all.
 ### M5 (today's hardware)
 
 ```
-bench-agent   native, ring-0 pinned (static bin, launchd)
-(on box):     ├─ sandbox-exec → mlxfast-engine runtime-worker --weights …
+benchd:       native, ring-0 pinned (static bin)
+(on box):     benchd iterate --target qwen36-27b.m5.toml
+              ├─ sandbox-exec → mlxfast-engine runtime-worker --weights …
               ├─ OWNS the wall clock: times protocol round trips natively
-              └─ 127.0.0.1:7331, single-use session-bound token
-
-benchd:       docker run --pull=never ghcr.io/…/benchd@sha256:…  \
-                benchd iterate --target qwen36-27b.m5.toml
-              orchestrates + scores; consumes bench-agent's sealed timings
-              (never times through the VM — §8 cycle 1)
+              └─ orchestrates + scores
 ```
 
-Minimal setup goal: `curl -fsSL …/install-m5.sh | sh` installs bench-agent + pinned
+Minimal setup goal: `curl -fsSL …/install-m5.sh | sh` installs benchd + pinned
 engine release + verifies the weights manifest; after that every run is one
-`benchd` command. (Dev shortcut: benchd also ships as a native macOS binary that
-spawns the engine directly over stdio — no Docker, no agent — for tight iteration.)
+`benchd` command.
 
 ### Ubuntu / CUDA (migration target)
 
@@ -463,28 +426,10 @@ implementation on the same hardware class.
 
 ## 8. Red / green teaming
 
-Six adversarial passes. Each is an attack (**red**) a cheating submission or a
-co-tenant could attempt, the fix that folds back into the design (**green**), and —
-where the fix invites a follow-on — the counter-attack (**red↩**). Findings 1–4
-changed the architecture; 5–6 confirmed it holds.
-
-### Cycle 1 — Timing moved into a VM-hosted container on the M5
-
-- **red:** §2 had benchd (containerized) doing the timing on M5. But Docker on
-  macOS is a LinuxKit VM — its clock and VM↔host scheduling add jitter and can step
-  relative to host wall time. Today's timing lives in a *native* Swift process
-  (`DispatchTime` uptime). Measuring ~100 ms decode steps across the container/VM
-  boundary is strictly less accurate than the thing it replaces, and the error is
-  systematic. A submission doesn't even need to attack this.
-- **green:** On M5, timing does not enter the VM. `bench-agent` (native) owns the
-  parent-side clock and the protocol round trips; the containerized benchd
-  orchestrates, scores, and seals but never holds the stopwatch. On Linux the engine
-  is a peer container and benchd times it natively — only the M5 topology changes.
-- **red↩ / green:** Then bench-agent is trusted for the most attackable number in
-  the system — correct, so it joins ring 0's trust boundary: release-hash pinned,
-  verified by benchd before each run, clock code owned by the runner uid. On M5 the
-  clock must be native, and native means pinned.
-- **Verdict — design changed.** §2 topology and §4 rings updated.
+Four adversarial passes. Each is an attack (**red**) a cheating submission could
+attempt, the fix that folds back into the design (**green**), and — where the fix
+invites a follow-on — the counter-attack (**red↩**). Findings 2–4 changed the
+architecture; 6 confirmed it holds.
 
 ### Cycle 2 — "Force full evaluation before responding" is self-attested
 
@@ -533,18 +478,6 @@ changed the architecture; 5–6 confirmed it holds.
   artifact.
 - **Verdict — design reinforced.** §2 and §5 state goldens are runtime mounts.
 
-### Cycle 5 — Replay / co-tenant injection on the M5 TCP bridge
-
-- **red:** Another local user (M5s are multi-user) connects to bench-agent's
-  `127.0.0.1` listener and injects requests mid-run, or replays a captured per-run
-  token.
-- **green:** The token is single-use and session-bound: minted by ring 0, readable
-  only by the runner uid, carried in `hello` and bound to the session nonce; any
-  second connection or nonce mismatch is rejected and discards the session.
-  bench-agent accepts exactly one authenticated session per run. (On Linux the
-  internal-only compose network removes the shared-localhost surface entirely.)
-- **Verdict — confirmed with refinement.** §4 token rule tightened.
-
 ### Cycle 6 — Telemetry and paired-baseline ordering as scoring attacks
 
 - **red:** The engine runs on the GPU it's measured on — can it game the thermal
@@ -563,7 +496,7 @@ changed the architecture; 5–6 confirmed it holds.
 
 > **STATUS: CLOSED as a live list.** Each item below has since been reconstructed,
 > ruled, or superseded — the operator contract was reconstructed and is now normative in
-> code (`crates/benchd/src/measure_job.rs`, `crates/bench-telemetry`); per-platform
+> code (`crates/benchd/src/measure_job.rs`); per-platform
 > baselines are settled per `track_id` (`docs/track-release-branches.md`) — a track either
 > measures its own denominator on the box or stores one captured pair — which makes
 > cross-track comparison a refused operation rather than a caveat; and the CUDA-side items are carried by the CUDA parity

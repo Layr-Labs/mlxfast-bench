@@ -47,9 +47,6 @@ A run resolves its platform from the track id it declares (`--contract` `track_i
 | `bench-protocol` | Engine Protocol v1 wire types + JSON Schema (normative) | live |
 | `bench-core` | golden schema · score formula · floors · bands · sealing · conformance kit | live |
 | `bench-runner` | engine lifecycle · parent-side timing · phase barriers · paired baseline | live |
-| `bench-telemetry` | telemetry provider trait + the **macmon** (M5) provider | live; the `nvml` provider is **not written yet** |
-| `bench-transform` | safetensors staging + validation; per-target quant emit | **PLACEHOLDER** — a doc comment, no code. Weight transform still happens in the harness. |
-| `bench-agent` | native M5 timing peer (aarch64 macOS); no-op on Linux | **PLACEHOLDER** — a `main` that prints "scaffold" |
 | `benchd` | the CLI; everything below runs through it | live |
 
 ### `benchd` subcommands
@@ -83,7 +80,7 @@ bundles will go — **today it holds only a README**; those values still live in
 
 ## Status
 
-Shipped and driving live ranked windows — ~44.9k lines of Rust across the seven crates.
+Shipped and driving live ranked windows.
 **Measurement and scoring live here, not in the engine repo.** On the Qwen 3.8
 125B-A6B tracks `benchd iterate --mode official` measures the pairs and seals
 `score.json`; on the earlier tracks `benchd measure-job` seals `results.json` and
@@ -93,8 +90,6 @@ profiling only. `scripts/benchmark.sh` is the harness root the engine repo's
 
 Known incomplete surfaces, stated plainly:
 
-- `bench-transform` and `bench-agent` are placeholder crates (see the table above).
-- `bench-telemetry` ships the macmon provider only; the CUDA/`nvml` provider is unwritten.
 - `benchd transform` and `benchd submit` are declared and unimplemented.
 - One `TODO(phase-N)` marker remains in the tree: `deploy/Dockerfile.benchd`
   (phase-5: multi-stage build, sign + publish by digest).

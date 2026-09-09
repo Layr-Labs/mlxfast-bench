@@ -9,8 +9,6 @@ publish = false
 bench-protocol.workspace = true
 bench-core.workspace = true
 bench-runner.workspace = true
-bench-transform.workspace = true
-bench-telemetry.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The `asm` feature is what turns ON sha2 0.10's aarch64 backend: without it

@@ -20,7 +20,7 @@ content lived, and where the thing the file was doing lives now.
 
 | evicted path | evicted at | last living revision | successor / resolution |
 |---|---|---|---|
-| `docs/measure-job-contract.md` | `cd5782e` (#155) | `fe2da64` | **Normative in code**: `crates/bench-telemetry` (gate logic), `crates/benchctl/src/measure_job.rs` (paired flow, retry, rejection classes), `docs/architecture.md` §8. Surviving cites are pinned `@fe2da64` (final revision) or `@7c6be14` (the WS2-5 revision the line-numbered cites were written against). |
+| `docs/measure-job-contract.md` | `cd5782e` (#155) | `fe2da64` | **Normative in code**: `crates/benchctl/src/measure_job.rs` (paired flow, retry, rejection classes), `docs/architecture.md` §8. Surviving cites are pinned `@fe2da64` (final revision) or `@7c6be14` (the WS2-5 revision the line-numbered cites were written against). |
 | `docs/paired-flow-design-note.md` | `cd5782e` (#155) | `3af70c8` | **Implemented**: the three seams are `scripts/official-paired.sh` (driver), `benchctl measure-job` (A-1), the gates producer (A-2), `benchctl overlay-timing` (A-3). Surviving cites pinned `@3af70c8`. |
 | `docs/parity-matrix.md` | `fe2da64` (#159) | `fe2da64^` | **`crates/benchctl/tests/fixtures/waiver-ledger.json`** — the §13 waiver rows as structured data, read directly by `parity.rs`'s sign-off test. `docs/parity-completion-gate.md`'s `@35c100a` cites resolve unchanged via git. |
 | `docs/iterate-128-window-reverify.md` | `cd5782e` (#155) | `2bb88c0` | Record doc; its result is carried by `docs/parity-completion-gate.md` §8 and by the pinned baseline constants. No living successor doc. |

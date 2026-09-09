@@ -20,8 +20,9 @@
 //!    every timed token is verified against `golden.benchmark.expected_*`; a corrupted
 //!    oracle FAILS official (`BenchmarkTokenMismatchError`) — the failure class the local
 //!    path structurally cannot test.
-//! 5. **Official gating** — 0.95 speedup floors, prefill band ±5% / decode +2%−5%, and a
-//!    non-finite score fails, evaluated BEFORE correctness (Score.swift:50-126).
+//! 5. **Official gating** — the generic path uses 0.95 speedup floors; paired Qwen uses its
+//!    declared 0.90 decode / 0.95 prefill floors. Acceptance bands and non-finite rejection run
+//!    BEFORE correctness (Score.swift:50-126).
 //! 6. **Sealing/integrity** — the sealed stdout payload is the coarsened score (2-sig-fig
 //!    diagnostics, ranking fields untouched); the `metrics.commit` carries the resolved
 //!    commit identifier (official-only).
@@ -32,9 +33,11 @@
 //! unit-tested against a stub `MockEngine` (no real engine, no GPU).
 
 use bench_core::conformance::{run_conformance, ConformanceReport, CorrectnessScope};
-use bench_core::constants::{AcceptanceBands, Platform};
+use bench_core::constants::{
+    AcceptanceBands, Platform, QWEN_MTP_DECODE_SPEEDUP_FLOOR, SCORE_DECODE_SPEEDUP_FLOOR,
+};
 use bench_core::golden::GoldenFixture;
-use bench_core::score::evaluate_timed_run;
+use bench_core::score::evaluate_timed_run_with_decode_floor;
 use bench_protocol::SpecConfig;
 use bench_runner::{
     run_timed_benchmark_fresh_per_phase, run_timed_benchmark_persistent_on_session,
@@ -566,12 +569,53 @@ pub fn official_core_windowed<T, FT, FC, G>(
     bands: AcceptanceBands,
     digests: RunDigests<'_>,
     commit: &str,
+    spawn_timed: FT,
+    spawn_correctness: FC,
+    residency: WorkerResidency,
+    spec: Option<SpecConfig>,
+    platform: Platform,
+    cool_gate: G,
+) -> ScorePayload
+where
+    T: LineTransport,
+    FT: FnMut() -> bench_runner::Result<Session<T>>,
+    FC: FnMut() -> bench_runner::Result<Session<T>>,
+    G: FnMut(&str) -> bench_runner::Result<()>,
+{
+    official_core_windowed_with_decode_floor(
+        golden,
+        baseline_prefill_spt,
+        baseline_decode_spt,
+        bands,
+        digests,
+        commit,
+        spawn_timed,
+        spawn_correctness,
+        residency,
+        spec,
+        platform,
+        cool_gate,
+        SCORE_DECODE_SPEEDUP_FLOOR,
+    )
+}
+
+/// The common official window with a caller-selected decode floor. Only the paired-Qwen entry
+/// point selects a non-default floor; the public historical entry point above retains 0.95.
+#[allow(clippy::too_many_arguments)]
+fn official_core_windowed_with_decode_floor<T, FT, FC, G>(
+    golden: &GoldenFixture,
+    baseline_prefill_spt: f64,
+    baseline_decode_spt: f64,
+    bands: AcceptanceBands,
+    digests: RunDigests<'_>,
+    commit: &str,
     mut spawn_timed: FT,
     spawn_correctness: FC,
     residency: WorkerResidency,
     spec: Option<SpecConfig>,
     platform: Platform,
     mut cool_gate: G,
+    decode_speedup_floor: f64,
 ) -> ScorePayload
 where
     T: LineTransport,
@@ -725,7 +769,7 @@ where
     // gating/scoring/order is IDENTICAL either way — only the source of the correctness session
     // differs, and it consumes exactly one session either way.
     match residency {
-        WorkerResidency::FreshPerPhase => finish_official(
+        WorkerResidency::FreshPerPhase => finish_official_with_decode_floor(
             golden,
             (baseline_prefill_spt, baseline_decode_spt),
             bands,
@@ -733,6 +777,7 @@ where
             commit,
             &measured,
             spawn_correctness,
+            decode_speedup_floor,
         ),
         WorkerResidency::PersistentWindow => {
             // Correctness on the SAME resident worker: the timed decode phase closed its barrier
@@ -741,7 +786,7 @@ where
             // substitute. The take-closure hands `finish_official` that one held session exactly
             // once; `spawn_correctness` is never called on this path.
             let mut held = held_session;
-            finish_official(
+            finish_official_with_decode_floor(
                 golden,
                 (baseline_prefill_spt, baseline_decode_spt),
                 bands,
@@ -757,6 +802,7 @@ where
                         )
                     })
                 },
+                decode_speedup_floor,
             )
         }
     }
@@ -859,6 +905,12 @@ pub struct PairedBaselineSeal<'a> {
 /// already carry the control leg's values, because the control leg's values are what the scoring
 /// call was given — that is the point of the design, and the board keeps reading them.
 pub fn seal_paired_baseline(metrics: &mut ScoreMetrics, seal: &PairedBaselineSeal<'_>) {
+    // The paired Qwen track contract declares a 0.90 decode floor. Stamp it on every paired
+    // payload, including pre-timing refusals and timed failures, so the published policy and flag
+    // cannot retain the generic 0.95 default from `base_metrics`.
+    metrics.decode_speedup_floor = QWEN_MTP_DECODE_SPEEDUP_FLOOR;
+    metrics.passed_decode_speedup_floor =
+        metrics.decode_speedup >= QWEN_MTP_DECODE_SPEEDUP_FLOOR;
     metrics.baseline_source = Some(crate::baseline::BASELINE_SOURCE_SERIAL_CONTROL_LEG.to_string());
     metrics.baseline_box = Some(seal.box_name.to_string());
     metrics.baseline_calibration_sha256 = Some(seal.calibration_sha256.to_string());
@@ -1042,7 +1094,7 @@ where
         Ok(guard) => guard,
         Err(e) => return paired_refusal(golden, digests, commit, e, seal, measured_leg),
     };
-    let mut payload = official_core_windowed(
+    let mut payload = official_core_windowed_with_decode_floor(
         golden,
         control.prefill_seconds_per_token,
         control.decode_seconds_per_token,
@@ -1055,6 +1107,7 @@ where
         spec,
         platform,
         cool_gate,
+        QWEN_MTP_DECODE_SPEEDUP_FLOOR,
     );
     drop(candidate_leg);
     let mut seal = seal;
@@ -1068,6 +1121,7 @@ where
 /// (non-finite → floors → bands), then FULL-scope correctness on a fresh worker, then the
 /// passing-score assembly. Separated from the timed phase so both the gating (with synthetic
 /// in-band timings) and the orchestration (with a mock timed phase) are unit-testable.
+#[cfg(test)]
 fn finish_official<T, FC>(
     golden: &GoldenFixture,
     baselines: (f64, f64),
@@ -1075,7 +1129,34 @@ fn finish_official<T, FC>(
     digests: RunDigests<'_>,
     commit: &str,
     timing: &TimingResult,
+    spawn_correctness: FC,
+) -> ScorePayload
+where
+    T: LineTransport,
+    FC: FnMut() -> bench_runner::Result<Session<T>>,
+{
+    finish_official_with_decode_floor(
+        golden,
+        baselines,
+        bands,
+        digests,
+        commit,
+        timing,
+        spawn_correctness,
+        SCORE_DECODE_SPEEDUP_FLOOR,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_official_with_decode_floor<T, FC>(
+    golden: &GoldenFixture,
+    baselines: (f64, f64),
+    bands: AcceptanceBands,
+    digests: RunDigests<'_>,
+    commit: &str,
+    timing: &TimingResult,
     mut spawn_correctness: FC,
+    decode_speedup_floor: f64,
 ) -> ScorePayload
 where
     T: LineTransport,
@@ -1083,17 +1164,18 @@ where
 {
     let (baseline_prefill_spt, baseline_decode_spt) = baselines;
     // 2. Official GATING, evaluated BEFORE correctness (Swift Score.swift:50-126,
-    //    QwenRuntimeBenchmark.swift:513-558): non-finite score → floors (0.95) → acceptance
-    //    bands (prefill ±5%, decode +2%/−5%). The FIRST failure reason (in that priority)
+    //    QwenRuntimeBenchmark.swift:513-558): non-finite score → selected decode floor / 0.95
+    //    prefill floor → acceptance bands. The FIRST failure reason (in that priority)
     //    fails the run; real timing is retained.
-    let eval = evaluate_timed_run(
+    let eval = evaluate_timed_run_with_decode_floor(
         timing.decode_seconds_per_token,
         timing.prefill_seconds_per_token,
         baseline_decode_spt,
         baseline_prefill_spt,
         bands,
+        decode_speedup_floor,
     );
-    if let Some(reason) = eval.first_failure_reason() {
+    if let Some(reason) = eval.first_failure_reason_with_decode_floor(decode_speedup_floor) {
         // RULING 2 (trusted-core, official path): this is the TIMED-band failure — non-finite
         // score / speedup floor / acceptance band — which Swift evaluates BEFORE correctness
         // runs. `official_failed_timed_band` retains the real measured timing surface but
@@ -4094,6 +4176,60 @@ mod tests {
         }
     }
 
+    const LOOSE_PAIRED_FLOOR_TEST_BANDS: AcceptanceBands = AcceptanceBands {
+        prefill_up_tolerance: 0.50,
+        prefill_down_tolerance: 0.50,
+        decode_up_tolerance: 0.50,
+        decode_down_tolerance: 0.50,
+        decode_down_enabled: false,
+    };
+
+    fn finish_paired_at_decode_speedup(decode_speedup: f64) -> ScorePayload {
+        let golden = official_golden(None);
+        let mut timing = in_band_timing();
+        timing.prefill_seconds_per_token = 1.0;
+        timing.decode_seconds_per_token = 1.0;
+        let mut payload = finish_official_with_decode_floor(
+            &golden,
+            (1.0, decode_speedup),
+            LOOSE_PAIRED_FLOOR_TEST_BANDS,
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            &timing,
+            || Session::connect(conformant_engine()).map(|(s, _)| s),
+            QWEN_MTP_DECODE_SPEEDUP_FLOOR,
+        );
+        let calibration = wide_calibration();
+        let mut seal = paired_seal_for_test(&calibration);
+        seal.band_passed = true;
+        seal.leg = Some((1.0, decode_speedup));
+        seal_paired_baseline(&mut payload.metrics, &seal);
+        payload
+    }
+
+    #[test]
+    fn paired_floor_enforcement_and_sealed_metrics_both_use_point_nine() {
+        for decode_speedup in [QWEN_MTP_DECODE_SPEEDUP_FLOOR, 0.925] {
+            let payload = finish_paired_at_decode_speedup(decode_speedup);
+            assert!(payload.passed, "{}", payload.metrics.error);
+            assert_eq!(payload.metrics.decode_speedup_floor, 0.90);
+            assert!(payload.metrics.passed_decode_speedup_floor);
+            let sealed: serde_json::Value =
+                serde_json::from_str(&payload.to_sealed_json().unwrap()).unwrap();
+            assert_eq!(sealed["metrics"]["decode_speedup_floor"], json!(0.90));
+            assert_eq!(sealed["metrics"]["passed_decode_speedup_floor"], json!(true));
+        }
+
+        let below = finish_paired_at_decode_speedup(0.899);
+        assert!(!below.passed);
+        assert!(below
+            .metrics
+            .error
+            .contains("decode_speedup=0.899000 floor=0.900000"));
+        assert_eq!(below.metrics.decode_speedup_floor, 0.90);
+        assert!(!below.metrics.passed_decode_speedup_floor);
+    }
+
     /// TWO ROOTS, ONE BOX, IN ORDER. The paired run spawns leg 1's worker from the REFERENCE root
     /// and leg 2's from the CANDIDATE root, and the score's denominator is the number leg 1
     /// MEASURED — not any number in the calibration file.
@@ -4208,6 +4344,11 @@ mod tests {
             Some(calibration.reference_commit.as_str())
         );
         assert_eq!(m.baseline_band_passed, Some(true));
+        assert_eq!(m.decode_speedup_floor, 0.90);
+        assert_eq!(
+            m.passed_decode_speedup_floor,
+            m.decode_speedup >= QWEN_MTP_DECODE_SPEEDUP_FLOOR
+        );
         // The CANDIDATE leg's numbers are read back from the enforced fields.
         assert_eq!(
             m.candidate_leg_prefill_seconds_per_token,
@@ -4279,6 +4420,8 @@ mod tests {
         );
         assert_eq!(candidate_spawns.get(), 0, "leg 2's worker must not spawn");
         assert_eq!(payload.metrics.baseline_band_passed, Some(false));
+        assert_eq!(payload.metrics.decode_speedup_floor, 0.90);
+        assert!(!payload.metrics.passed_decode_speedup_floor);
         assert_eq!(
             payload.metrics.baseline_source.as_deref(),
             Some("serial-control-leg")

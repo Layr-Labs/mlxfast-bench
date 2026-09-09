@@ -156,7 +156,7 @@ pub fn robust_reference(samples: &[f64]) -> Option<f64> {
 /// and only the upper bound is enforced. The lower bound is disabled for the MTP timed leg's decode
 /// axis (see [`crate::constants::AcceptanceBands::decode_down_enabled`]): MTP decode legitimately
 /// runs much faster than the serial baseline, so the -tolerance% lower guard would wrongly fail a
-/// healthy run — the 0.95 decode speedup floor is the only lower guard the decode axis needs.
+/// healthy run — the configured decode speedup floor is the only lower guard the decode axis needs.
 pub fn check(
     value: f64,
     reference: f64,
@@ -213,6 +213,12 @@ impl TimedRunScoreEvaluation {
 
     /// `firstFailureReason`: same priority order (non-finite score -> floors -> bands).
     pub fn first_failure_reason(&self) -> Option<String> {
+        self.first_failure_reason_with_decode_floor(SCORE_DECODE_SPEEDUP_FLOOR)
+    }
+
+    /// As [`Self::first_failure_reason`], with a caller-selected decode floor. The prefill floor
+    /// remains the generic official floor; paired Qwen scoring only varies the decode policy.
+    pub fn first_failure_reason_with_decode_floor(&self, decode_floor: f64) -> Option<String> {
         if !self.has_finite_score() {
             return Some("computed score was not finite".to_string());
         }
@@ -220,7 +226,7 @@ impl TimedRunScoreEvaluation {
             return Some(speedup_floor_failure_message(
                 self.decode_speedup,
                 self.prefill_speedup,
-                SCORE_DECODE_SPEEDUP_FLOOR,
+                decode_floor,
                 SCORE_PREFILL_SPEEDUP_FLOOR,
             ));
         }
@@ -245,6 +251,26 @@ pub fn evaluate_timed_run(
     baseline_prefill_spt: f64,
     bands: AcceptanceBands,
 ) -> TimedRunScoreEvaluation {
+    evaluate_timed_run_with_decode_floor(
+        decode_spt,
+        prefill_spt,
+        baseline_decode_spt,
+        baseline_prefill_spt,
+        bands,
+        SCORE_DECODE_SPEEDUP_FLOOR,
+    )
+}
+
+/// Evaluate a timed run with a caller-selected decode floor while retaining the generic prefill
+/// floor, score weights, and acceptance-band behavior.
+pub fn evaluate_timed_run_with_decode_floor(
+    decode_spt: f64,
+    prefill_spt: f64,
+    baseline_decode_spt: f64,
+    baseline_prefill_spt: f64,
+    bands: AcceptanceBands,
+    decode_floor: f64,
+) -> TimedRunScoreEvaluation {
     let s = score_default_weights(
         decode_spt,
         prefill_spt,
@@ -255,7 +281,7 @@ pub fn evaluate_timed_run(
     let prefill_speedup = speedup(baseline_prefill_spt, prefill_spt);
     // Prefill is ALWAYS two-sided (±tolerance symmetric health gate). The decode LOWER bound is
     // conditional: the MTP timed leg disables it (`decode_down_enabled == false`), leaving only the
-    // decode UP bound and the 0.95 decode speedup floor as guards.
+    // decode UP bound and the configured decode speedup floor as guards.
     let prefill_band = check(
         prefill_spt,
         baseline_prefill_spt,
@@ -279,7 +305,7 @@ pub fn evaluate_timed_run(
         passes_floors: passes_speedup_floors(
             decode_speedup,
             prefill_speedup,
-            SCORE_DECODE_SPEEDUP_FLOOR,
+            decode_floor,
             SCORE_PREFILL_SPEEDUP_FLOOR,
         ),
         prefill_band,
@@ -749,5 +775,84 @@ prefill_speedup=0.800000 floor=0.950000"
             e.first_failure_reason().as_deref(),
             Some("computed score was not finite")
         );
+    }
+
+    #[test]
+    fn caller_selected_decode_floor_has_inclusive_boundary_and_formats_that_floor() {
+        let loose_bands = AcceptanceBands {
+            prefill_up_tolerance: 0.50,
+            prefill_down_tolerance: 0.50,
+            decode_up_tolerance: 0.50,
+            decode_down_tolerance: 0.50,
+            decode_down_enabled: false,
+        };
+
+        for decode_speedup in [QWEN_MTP_DECODE_SPEEDUP_FLOOR, 0.925] {
+            let e = evaluate_timed_run_with_decode_floor(
+                1.0,
+                1.0,
+                decode_speedup,
+                1.0,
+                loose_bands,
+                QWEN_MTP_DECODE_SPEEDUP_FLOOR,
+            );
+            assert!(
+                e.passes_floors,
+                "{decode_speedup} must clear the 0.90 floor"
+            );
+            assert_eq!(
+                e.first_failure_reason_with_decode_floor(QWEN_MTP_DECODE_SPEEDUP_FLOOR),
+                None
+            );
+        }
+
+        let below = evaluate_timed_run_with_decode_floor(
+            1.0,
+            1.0,
+            0.899,
+            1.0,
+            loose_bands,
+            QWEN_MTP_DECODE_SPEEDUP_FLOOR,
+        );
+        assert!(!below.passes_floors);
+        assert!(below
+            .first_failure_reason_with_decode_floor(QWEN_MTP_DECODE_SPEEDUP_FLOOR)
+            .unwrap()
+            .contains("decode_speedup=0.899000 floor=0.900000"));
+
+        let generic = evaluate_timed_run(1.0, 1.0, 0.925, 1.0, loose_bands);
+        assert!(
+            !generic.passes_floors,
+            "generic scoring must retain its 0.95 floor"
+        );
+        assert!(generic
+            .first_failure_reason()
+            .unwrap()
+            .contains("decode_speedup=0.925000 floor=0.950000"));
+
+        let prefill_below_generic_floor = evaluate_timed_run_with_decode_floor(
+            1.0,
+            1.0,
+            1.0,
+            0.94,
+            loose_bands,
+            QWEN_MTP_DECODE_SPEEDUP_FLOOR,
+        );
+        assert!(!prefill_below_generic_floor.passes_floors);
+        assert!(prefill_below_generic_floor
+            .first_failure_reason_with_decode_floor(QWEN_MTP_DECODE_SPEEDUP_FLOOR)
+            .unwrap()
+            .contains("prefill_speedup=0.940000 floor=0.950000"));
+
+        let production_band = evaluate_timed_run_with_decode_floor(
+            1.0,
+            1.0,
+            0.925,
+            1.0,
+            crate::constants::MTP_SINGLE_LEG_BANDS,
+            QWEN_MTP_DECODE_SPEEDUP_FLOOR,
+        );
+        assert!(production_band.passes_floors);
+        assert!(!production_band.passes_acceptance_bands());
     }
 }

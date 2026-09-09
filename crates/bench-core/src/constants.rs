@@ -42,8 +42,8 @@ pub const SCORE_PREFILL_SPEEDUP_FLOOR: f64 = 0.95;
 // (serial control = 1.0, no normalization): per prompt the raw ratio is
 // `mean(serial depth-0 decode s/tok) / mean(candidate decode s/tok)` over that prompt's
 // accepted pairs, and the published score is the EVEN-N median of the per-prompt raw ratios.
-// These constants REPLACE the generic 0.95 decode/prefill speedup floors for the paired
-// score; the generic `SCORE_*_SPEEDUP_FLOOR` path (ds^0.75·ps^0.25) is untouched.
+// For the Qwen 125B iterate paired path, the decode floor below replaces the generic 0.95 and the
+// prefill floor remains 0.95. The legacy decode-only overlay policy is unchanged.
 
 /// Paired decode-only submission floor on the RAW median (ranked workflow
 /// `MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR`). Operator decision 2026-08-14: 0.90 — "do not
@@ -95,8 +95,8 @@ pub struct AcceptanceBands {
     /// "improvement too large"). `true` for a normal two-sided band; `false` for the MTP timed leg,
     /// where the ruling is: decode DOWN-band DISABLED. MTP spec-decode decode is legitimately much
     /// faster than the serial baseline, so Laguna's "-5% improvement too large" lower guard would
-    /// WRONGLY fail a healthy MTP run — the 0.95 decode speedup FLOOR is the only lower guard the
-    /// decode axis needs. When `false`, [`crate::score::evaluate_timed_run`]/`check` skip the
+    /// WRONGLY fail a healthy MTP run — the configured decode speedup FLOOR is the only lower guard
+    /// the decode axis needs. When `false`, [`crate::score::evaluate_timed_run`]/`check` skip the
     /// decode lower-bound test and keep the decode UP bound. `decode_down_tolerance` is then inert.
     pub decode_down_enabled: bool,
 }
@@ -151,8 +151,9 @@ pub const TRACK_REFERENCE_MODEL_CUDA: TrackReferenceModel = TrackReferenceModel 
 /// The band shape of the SINGLE-LEG MTP-on-the-timed-leg regime (David ruling), shared by both
 /// Qwen 3.8 125B-A6B tracks: prefill +/-5% SYMMETRIC health gate; decode +2% UP only, with the
 /// DOWN band DISABLED. MTP spec-decode decode is legitimately much faster than the serial
-/// baseline, so a lower band would fail a healthy run — the 0.95 decode speedup floor is the only
-/// lower guard the decode axis needs. `decode_down_tolerance` is INERT while `decode_down_enabled`
+/// baseline, so a lower band would fail a healthy run — the configured decode speedup floor is the
+/// only lower guard the decode axis needs. `decode_down_tolerance` is INERT while
+/// `decode_down_enabled`
 /// is false; the ruling gives no down value, so it mirrors the prefill magnitude.
 ///
 /// The fixed literals of docs/qwen38-125b-a6b-baseline-capture.md §1, named once rather than

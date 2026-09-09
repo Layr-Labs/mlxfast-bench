@@ -10,6 +10,9 @@ checklist, is in its own runbook:
 - [`runbook-box-setup-cuda.md`](runbook-box-setup-cuda.md) for a DGX Spark
 - [`runbook-box-setup-mlx.md`](runbook-box-setup-mlx.md) for a Mac
 
+The software chain from a runner in the fork to a scored Yukon row, done once per
+track rather than once per box, is [`runbook-new-engine.md`](runbook-new-engine.md).
+
 ## 1. What both box types need
 
 | item | where it comes from | notes |

@@ -274,10 +274,18 @@ A ranked paired run seals these fields in `score.json` `metrics`:
 - `baseline_box`, `baseline_calibration_sha256`, `baseline_reference_commit`.
 - `baseline_band_passed`.
 - `baseline_leg_prefill_seconds_per_token`,
-  `baseline_leg_decode_seconds_per_token` — leg 1's measurement.
+  `baseline_leg_decode_seconds_per_token` — the serial-control legs' mean
+  per-token times over the pairs.
 - `candidate_leg_prefill_seconds_per_token`,
-  `candidate_leg_decode_seconds_per_token` — leg 2's measurement.
+  `candidate_leg_decode_seconds_per_token` — the candidate legs' mean per-token
+  times over the pairs.
+- `paired_legs` — one row per pair, in order: `pair`,
+  `control_prefill_seconds_per_token`, `control_decode_seconds_per_token`,
+  `candidate_prefill_seconds_per_token`, `candidate_decode_seconds_per_token`,
+  as measured. The track fixture's `official_pairs` sets the row count (2 on
+  both platforms, David ruling 2026-09-09). A run that stops early keeps the
+  pairs it measured in this list and seals no score.
 
 `baseline_prefill_seconds_per_token` and `baseline_decode_seconds_per_token`
-carry the leg-1 values, so the board reads them unchanged.
+carry the serial-control mean values, so the board reads them unchanged.
 `prefill_speedup`, `decode_speedup` and the score are the live ratios.

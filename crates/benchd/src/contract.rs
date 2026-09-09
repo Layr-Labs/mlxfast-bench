@@ -29,6 +29,29 @@ pub struct Contract {
     /// Absence is never armed.
     #[serde(default)]
     pub official_scoring_enabled: Option<bool>,
+    /// PAIRS PER SCORED RUN on the paired per-box path (David 2026-09-09: "2 pairs on both mlx and
+    /// cuda"; "1 pair is not sufficient"). Each pair is one serial-control leg on the reference
+    /// tree followed by one candidate leg, same prompt, same box. The fixture is the ONLY source
+    /// of this count: no flag, no environment, no default — so a box cannot silently run fewer
+    /// pairs than the track declares.
+    #[serde(default)]
+    pub official_pairs: Option<u32>,
+}
+
+/// The paired path's pair count, or the refusal naming what the fixture must declare.
+pub fn official_pairs(contract: &Contract, track_id: &str) -> Result<usize, String> {
+    match contract.official_pairs {
+        Some(n) if n >= 1 => Ok(n as usize),
+        Some(n) => Err(format!(
+            "the --contract track fixture for {track_id:?} declares official_pairs: {n}; the paired \
+             official run needs at least 1 pair (David 2026-09-09 ruled 2)"
+        )),
+        None => Err(format!(
+            "the --contract track fixture for {track_id:?} declares no official_pairs; the paired \
+             official run refuses to guess a pair count (David 2026-09-09 ruled 2 on both \
+             platforms) — pin it in the fixture"
+        )),
+    }
 }
 
 impl Contract {
@@ -185,5 +208,25 @@ mod tests {
                 "a non-scoring run must be unaffected by official_scoring_enabled = {state:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod official_pairs_tests {
+    use super::*;
+
+    #[test]
+    fn the_pair_count_comes_from_the_fixture_alone() {
+        let two =
+            Contract::parse(br#"{"official_scoring_enabled": true, "official_pairs": 2}"#).unwrap();
+        assert_eq!(official_pairs(&two, "t"), Ok(2));
+        let absent = Contract::parse(br#"{"official_scoring_enabled": true}"#).unwrap();
+        let err = official_pairs(&absent, "qwen3.8-125b-a6b-cuda-v1").unwrap_err();
+        assert!(err.contains("declares no official_pairs"), "{err}");
+        assert!(err.contains("qwen3.8-125b-a6b-cuda-v1"), "{err}");
+        let zero =
+            Contract::parse(br#"{"official_scoring_enabled": true, "official_pairs": 0}"#).unwrap();
+        let err = official_pairs(&zero, "t").unwrap_err();
+        assert!(err.contains("official_pairs: 0"), "{err}");
     }
 }

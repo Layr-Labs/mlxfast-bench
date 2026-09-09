@@ -21,7 +21,7 @@
 //! the engine chooses the key names.
 //!
 //! LIFT ORIGIN: adapted from the CUDA track's standalone `protocol-adapter`
-//! crate (`cudafast-qwen38-125b-a6b-engine/harness/protocol-adapter/src/`:
+//! crate (`cudafast-qwen38-125b-a6b-engine-dev/harness/protocol-adapter/src/`:
 //! `adapter.rs`, `engine.rs`, `mock.rs`, `tests.rs`, `lib.rs`), whose vendored
 //! `protocol.rs` copy of the wire is replaced here by `bench-protocol`.
 

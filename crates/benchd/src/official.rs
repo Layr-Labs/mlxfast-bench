@@ -558,6 +558,150 @@ where
     }
 }
 
+/// The CANDIDATE leg's timed window (warmup + prefill + decode, every token oracle-checked), or the
+/// failed payload that ends the run. Shared by the single-leg window and the paired path, so an
+/// oracle mismatch, a warmup fault and a protocol fault are classified ONCE. On the load-once
+/// residency the measured session comes back still open for the correctness gate.
+#[allow(clippy::too_many_arguments)]
+fn measure_candidate_window<T, FT, G>(
+    golden: &GoldenFixture,
+    benchmark: &bench_core::golden::BenchmarkGolden,
+    baseline_prefill_spt: f64,
+    baseline_decode_spt: f64,
+    digests: RunDigests<'_>,
+    commit: &str,
+    spawn_timed: &mut FT,
+    residency: WorkerResidency,
+    spec: Option<SpecConfig>,
+    platform: Platform,
+    cool_gate: &mut G,
+) -> Result<(TimingResult, Option<Session<T>>), Box<ScorePayload>>
+where
+    T: LineTransport,
+    FT: FnMut() -> bench_runner::Result<Session<T>>,
+    G: FnMut(&str) -> bench_runner::Result<()>,
+{
+    let params = official_timed_params(benchmark, spec.clone(), platform);
+
+    // MEASUREMENT-INTEGRITY WARMUP + the TIMED legs, in the window shape this platform runs
+    // ([`run_timed_window`], which carries the whole rationale). The warmup leg is unmeasured and
+    // discarded; the timed legs pass the caller's cool gate; the held session (PersistentWindow
+    // only) comes back so the correctness phase below can reuse the ONE model residency.
+    let warmup_params = official_warmup_params(benchmark, spec.clone());
+    let (measured_result, held) = run_timed_window(
+        &params,
+        warmup_params.as_ref(),
+        residency,
+        spawn_timed,
+        cool_gate,
+    );
+    let held_session: Option<Session<T>> = held;
+    let measured = match measured_result {
+        Ok(t) => t,
+        Err(TimedWindowFailure::WarmupSpawn(e)) => {
+            return Err(Box::new(official_failed(
+                golden,
+                digests,
+                commit,
+                format!("official warmup worker spawn failed: {e}"),
+                false,
+                None,
+                None,
+                None,
+                None,
+                (baseline_prefill_spt, baseline_decode_spt),
+            )));
+        }
+        Err(TimedWindowFailure::Warmup(e)) => {
+            return Err(Box::new(official_failed(
+                golden,
+                digests,
+                commit,
+                format!("official warmup leg failed: {e}"),
+                false,
+                None,
+                None,
+                None,
+                None,
+                (baseline_prefill_spt, baseline_decode_spt),
+            )));
+        }
+        Err(TimedWindowFailure::Timed(RunnerError::TokenMismatch { label, step, .. })) => {
+            // The benchmark-ORACLE failure class the local path cannot test: a corrupted
+            // oracle (or a fast-garbage engine) diverges and FAILS official. Byte-match Swift
+            // `makeFailedScore` for a `BenchmarkTokenMismatchError`
+            // (QwenRuntimeBenchmark.swift:668-676): `error = mismatch.description`,
+            // `firstFailingCase = "benchmark"`, `firstFailingStep = mismatch.step`, and
+            // `expectedToken`/`actualToken` are ALWAYS nil.
+            //
+            // Swift's PREFILL and decode-SEED comparisons go through `compareOne`
+            // (Golden.swift:560-581) with `step: nil`, so `description` has NO " at step N"
+            // suffix and `firstFailingStep = nil`. Only the decode-TOKEN class
+            // (`compareDecodeTokens`, Golden.swift:533-551) carries a step. benchd's
+            // `RunnerError::TokenMismatch.step` is non-optional, so distinguish by label.
+            //
+            // A8/DAVID RULING (timed decode = INCREMENTAL FREE-RUN): the timed decode leg now
+            // drives `free_decode_begin` + `free_decode_run`, so its oracle-mismatch labels are
+            // "benchmark free-run decode seed token" (step-less) and "benchmark free-run decode
+            // token" (the stepped class). The PREFILL label is unchanged ("benchmark prefill
+            // token", still teacher-forced). The sealed error strings therefore name the
+            // free-run mechanism ("benchmark free-run decode token mismatch at step N", …) — an
+            // intentional divergence from Swift's teacher-forced description, sanctioned by the
+            // ruling: teacher-forced-per-step is retained ONLY for the untimed correctness gate.
+            let is_decode_token_class = label == "benchmark free-run decode token";
+            let (error, first_failing_step) = if is_decode_token_class {
+                (
+                    format!("{label} mismatch at step {step}"),
+                    Some(step as i64),
+                )
+            } else {
+                (format!("{label} mismatch"), None)
+            };
+            // The benchmark-ORACLE mismatch is a TIMED-phase failure BEFORE correctness runs
+            // (official is timed-first). Like RULING-2's band/floor/finite path, Swift returns
+            // via makeFailedScore(correctness: nil) — BLANKING the correctness audit fields
+            // (golden_hash="", case_count=0, checked_steps=0) — but RETAINS the resolved
+            // baselines (baselinePrefill/DecodeSecondsPerToken, set at :434-435 before the timed
+            // phase). See official_failed_timed_oracle.
+            return Err(Box::new(official_failed_timed_oracle(
+                golden,
+                digests,
+                commit,
+                error,
+                first_failing_step,
+                baseline_prefill_spt,
+                baseline_decode_spt,
+            )));
+        }
+        Err(TimedWindowFailure::Timed(e)) => {
+            // A non-oracle timed failure (protocol / completed-work barrier / spawn): fail
+            // closed with the runner's message. No trustworthy timing to retain.
+            return Err(Box::new(official_failed(
+                golden,
+                digests,
+                commit,
+                format!("{e}"),
+                false,
+                None,
+                None,
+                None,
+                None,
+                (baseline_prefill_spt, baseline_decode_spt),
+            )));
+        }
+    };
+
+    // Steps 2-4 (gating → correctness → assembly) operate on the measured `timing`; they are
+    // factored into `finish_official` so they can be unit-tested with a SYNTHETIC in-band
+    // TimingResult (a mock's ~0 wall-clock can never sit inside the acceptance band). The
+    // correctness worker is keyed by `residency`: FreshPerPhase spawns a THIRD fresh worker;
+    // PersistentWindow reuses the ONE resident session the timed phases ran on (load-once), so the
+    // window never loads the model twice and never holds two residencies. `finish_official`'s
+    // gating/scoring/order is IDENTICAL either way — only the source of the correctness session
+    // differs, and it consumes exactly one session either way.
+    Ok((measured, held_session))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn official_core_windowed<T, FT, FC, G>(
     golden: &GoldenFixture,
@@ -605,125 +749,23 @@ where
     // being scored against the MTP oracle. The resolved spec now rides the timed window, and the
     // engine's `effective_spec` echo must equal it or the leg is discarded (spec-never-ignored,
     // enforced in `bench_runner`). `None` is byte-for-byte the historical bare request.
-    let params = official_timed_params(benchmark, spec.clone(), platform);
-
-    // MEASUREMENT-INTEGRITY WARMUP + the TIMED legs, in the window shape this platform runs
-    // ([`run_timed_window`], which carries the whole rationale). The warmup leg is unmeasured and
-    // discarded; the timed legs pass the caller's cool gate; the held session (PersistentWindow
-    // only) comes back so the correctness phase below can reuse the ONE model residency.
-    let warmup_params = official_warmup_params(benchmark, spec.clone());
-    let (measured_result, held) = run_timed_window(
-        &params,
-        warmup_params.as_ref(),
-        residency,
+    let (measured, held_session) = match measure_candidate_window(
+        golden,
+        benchmark,
+        baseline_prefill_spt,
+        baseline_decode_spt,
+        digests,
+        commit,
         &mut spawn_timed,
+        residency,
+        spec,
+        platform,
         &mut cool_gate,
-    );
-    let held_session: Option<Session<T>> = held;
-    let measured =
-        match measured_result {
-            Ok(t) => t,
-            Err(TimedWindowFailure::WarmupSpawn(e)) => {
-                return official_failed(
-                    golden,
-                    digests,
-                    commit,
-                    format!("official warmup worker spawn failed: {e}"),
-                    false,
-                    None,
-                    None,
-                    None,
-                    None,
-                    (baseline_prefill_spt, baseline_decode_spt),
-                );
-            }
-            Err(TimedWindowFailure::Warmup(e)) => {
-                return official_failed(
-                    golden,
-                    digests,
-                    commit,
-                    format!("official warmup leg failed: {e}"),
-                    false,
-                    None,
-                    None,
-                    None,
-                    None,
-                    (baseline_prefill_spt, baseline_decode_spt),
-                );
-            }
-            Err(TimedWindowFailure::Timed(RunnerError::TokenMismatch { label, step, .. })) => {
-                // The benchmark-ORACLE failure class the local path cannot test: a corrupted
-                // oracle (or a fast-garbage engine) diverges and FAILS official. Byte-match Swift
-                // `makeFailedScore` for a `BenchmarkTokenMismatchError`
-                // (QwenRuntimeBenchmark.swift:668-676): `error = mismatch.description`,
-                // `firstFailingCase = "benchmark"`, `firstFailingStep = mismatch.step`, and
-                // `expectedToken`/`actualToken` are ALWAYS nil.
-                //
-                // Swift's PREFILL and decode-SEED comparisons go through `compareOne`
-                // (Golden.swift:560-581) with `step: nil`, so `description` has NO " at step N"
-                // suffix and `firstFailingStep = nil`. Only the decode-TOKEN class
-                // (`compareDecodeTokens`, Golden.swift:533-551) carries a step. benchd's
-                // `RunnerError::TokenMismatch.step` is non-optional, so distinguish by label.
-                //
-                // A8/DAVID RULING (timed decode = INCREMENTAL FREE-RUN): the timed decode leg now
-                // drives `free_decode_begin` + `free_decode_run`, so its oracle-mismatch labels are
-                // "benchmark free-run decode seed token" (step-less) and "benchmark free-run decode
-                // token" (the stepped class). The PREFILL label is unchanged ("benchmark prefill
-                // token", still teacher-forced). The sealed error strings therefore name the
-                // free-run mechanism ("benchmark free-run decode token mismatch at step N", …) — an
-                // intentional divergence from Swift's teacher-forced description, sanctioned by the
-                // ruling: teacher-forced-per-step is retained ONLY for the untimed correctness gate.
-                let is_decode_token_class = label == "benchmark free-run decode token";
-                let (error, first_failing_step) = if is_decode_token_class {
-                    (
-                        format!("{label} mismatch at step {step}"),
-                        Some(step as i64),
-                    )
-                } else {
-                    (format!("{label} mismatch"), None)
-                };
-                // The benchmark-ORACLE mismatch is a TIMED-phase failure BEFORE correctness runs
-                // (official is timed-first). Like RULING-2's band/floor/finite path, Swift returns
-                // via makeFailedScore(correctness: nil) — BLANKING the correctness audit fields
-                // (golden_hash="", case_count=0, checked_steps=0) — but RETAINS the resolved
-                // baselines (baselinePrefill/DecodeSecondsPerToken, set at :434-435 before the timed
-                // phase). See official_failed_timed_oracle.
-                return official_failed_timed_oracle(
-                    golden,
-                    digests,
-                    commit,
-                    error,
-                    first_failing_step,
-                    baseline_prefill_spt,
-                    baseline_decode_spt,
-                );
-            }
-            Err(TimedWindowFailure::Timed(e)) => {
-                // A non-oracle timed failure (protocol / completed-work barrier / spawn): fail
-                // closed with the runner's message. No trustworthy timing to retain.
-                return official_failed(
-                    golden,
-                    digests,
-                    commit,
-                    format!("{e}"),
-                    false,
-                    None,
-                    None,
-                    None,
-                    None,
-                    (baseline_prefill_spt, baseline_decode_spt),
-                );
-            }
-        };
+    ) {
+        Ok(measured) => measured,
+        Err(payload) => return *payload,
+    };
 
-    // Steps 2-4 (gating → correctness → assembly) operate on the measured `timing`; they are
-    // factored into `finish_official` so they can be unit-tested with a SYNTHETIC in-band
-    // TimingResult (a mock's ~0 wall-clock can never sit inside the acceptance band). The
-    // correctness worker is keyed by `residency`: FreshPerPhase spawns a THIRD fresh worker;
-    // PersistentWindow reuses the ONE resident session the timed phases ran on (load-once), so the
-    // window never loads the model twice and never holds two residencies. `finish_official`'s
-    // gating/scoring/order is IDENTICAL either way — only the source of the correctness session
-    // differs, and it consumes exactly one session either way.
     match residency {
         WorkerResidency::FreshPerPhase => finish_official(
             golden,
@@ -950,6 +992,9 @@ pub struct PairedWindow<G> {
     pub spec: Option<SpecConfig>,
     pub platform: Platform,
     pub cool_gate: G,
+    /// Pairs per scored run, from the pinned track fixture (`official_pairs`; David 2026-09-09
+    /// ruled 2 on both platforms). Every pair is one serial-control leg then one candidate leg.
+    pub pairs: usize,
 }
 
 /// THE RANKED PAIRED PATH (David ruling 2026-09-08): two legs on one box in one job.
@@ -986,8 +1031,8 @@ pub fn official_core_paired<T, L, LB, LC, FB, FT, FC, G>(
 ) -> ScorePayload
 where
     T: LineTransport,
-    LB: FnOnce() -> Result<L, String>,
-    LC: FnOnce() -> Result<L, String>,
+    LB: FnMut() -> Result<L, String>,
+    LC: FnMut() -> Result<L, String>,
     FB: FnMut() -> bench_runner::Result<Session<T>>,
     FT: FnMut() -> bench_runner::Result<Session<T>>,
     FC: FnMut() -> bench_runner::Result<Session<T>>,
@@ -998,10 +1043,10 @@ where
         control: control_golden,
     } = goldens;
     let PairedLegs {
-        open_baseline_leg,
-        open_candidate_leg,
-        spawn_baseline,
-        spawn_timed,
+        mut open_baseline_leg,
+        mut open_candidate_leg,
+        mut spawn_baseline,
+        mut spawn_timed,
         spawn_correctness,
     } = legs;
     let PairedWindow {
@@ -1010,57 +1055,245 @@ where
         spec,
         platform,
         mut cool_gate,
+        pairs,
     } = window;
-    // A leg's ENGINE comes up before its worker and goes down before the next leg's comes up.
-    let baseline_leg = match open_baseline_leg() {
-        Ok(guard) => guard,
-        Err(e) => return paired_refusal(golden, digests, commit, e, seal, None),
-    };
-    let control_result = run_serial_control_leg(
-        control_golden,
-        residency,
-        platform,
-        spawn_baseline,
-        &mut cool_gate,
-    );
-    drop(baseline_leg);
-    let control = match control_result {
-        Ok(t) => t,
-        Err(e) => return paired_refusal(golden, digests, commit, e, seal, None),
-    };
-    let measured_leg = Some((
-        control.prefill_seconds_per_token,
-        control.decode_seconds_per_token,
-    ));
-    if let Err(e) = calibration.check_band(
-        control.prefill_seconds_per_token,
-        control.decode_seconds_per_token,
-    ) {
-        return paired_refusal(golden, digests, commit, e, seal, measured_leg);
+    if pairs == 0 {
+        return paired_refusal(
+            golden,
+            digests,
+            commit,
+            "the paired official run was asked for 0 pairs; the track fixture must declare at least 1"
+                .to_string(),
+            seal,
+            None,
+        );
     }
-    let candidate_leg = match open_candidate_leg() {
-        Ok(guard) => guard,
-        Err(e) => return paired_refusal(golden, digests, commit, e, seal, measured_leg),
+    let benchmark = match &golden.benchmark {
+        Some(b) => b,
+        None => {
+            return paired_refusal(
+                golden,
+                digests,
+                commit,
+                "benchmark golden file must contain a benchmark oracle".to_string(),
+                seal,
+                None,
+            )
+        }
     };
-    let mut payload = official_core_windowed(
-        golden,
-        control.prefill_seconds_per_token,
-        control.decode_seconds_per_token,
-        bands,
-        digests,
-        commit,
-        spawn_timed,
-        spawn_correctness,
-        residency,
-        spec,
-        platform,
-        cool_gate,
-    );
-    drop(candidate_leg);
+
+    // PAIR LOOP. Every pair is the same two legs in the same order: the serial-control leg on the
+    // reference tree, band-checked against the box calibration, then the candidate leg. A leg's
+    // ENGINE comes up before its worker and goes down before the next leg's comes up, so two
+    // residents never hold GPU memory at once. The LAST pair's candidate session is kept open on
+    // the load-once residency so the correctness gate runs over the same model residency.
+    let mut records: Vec<PairedLegRecord> = Vec::with_capacity(pairs);
+    let mut candidate_timings: Vec<TimingResult> = Vec::with_capacity(pairs);
+    let mut held_session: Option<Session<T>> = None;
+    let mut held_candidate_leg: Option<L> = None;
+    for pair in 1..=pairs {
+        let baseline_leg = match open_baseline_leg() {
+            Ok(guard) => guard,
+            Err(e) => {
+                return paired_refusal_with_records(golden, digests, commit, e, seal, None, records)
+            }
+        };
+        let control_result = run_serial_control_leg(
+            control_golden,
+            residency,
+            platform,
+            &mut spawn_baseline,
+            &mut cool_gate,
+        );
+        drop(baseline_leg);
+        let control = match control_result {
+            Ok(t) => t,
+            Err(e) => {
+                return paired_refusal_with_records(golden, digests, commit, e, seal, None, records)
+            }
+        };
+        let measured_leg = Some((
+            control.prefill_seconds_per_token,
+            control.decode_seconds_per_token,
+        ));
+        if let Err(e) = calibration.check_band(
+            control.prefill_seconds_per_token,
+            control.decode_seconds_per_token,
+        ) {
+            let e = if pairs > 1 {
+                format!("pair {pair} of {pairs}: {e}")
+            } else {
+                e
+            };
+            return paired_refusal_with_records(
+                golden,
+                digests,
+                commit,
+                e,
+                seal,
+                measured_leg,
+                records,
+            );
+        }
+        let candidate_leg = match open_candidate_leg() {
+            Ok(guard) => guard,
+            Err(e) => {
+                return paired_refusal_with_records(
+                    golden,
+                    digests,
+                    commit,
+                    e,
+                    seal,
+                    measured_leg,
+                    records,
+                )
+            }
+        };
+        let (timing, session) = match measure_candidate_window(
+            golden,
+            benchmark,
+            control.prefill_seconds_per_token,
+            control.decode_seconds_per_token,
+            digests,
+            commit,
+            &mut spawn_timed,
+            residency,
+            spec.clone(),
+            platform,
+            &mut cool_gate,
+        ) {
+            Ok(measured) => measured,
+            Err(payload) => {
+                let mut payload = *payload;
+                drop(candidate_leg);
+                let mut seal = seal;
+                seal.band_passed = true;
+                seal.leg = measured_leg;
+                seal_paired_baseline(&mut payload.metrics, &seal);
+                payload.metrics.paired_legs = records;
+                return payload;
+            }
+        };
+        records.push(PairedLegRecord {
+            pair: pair as i64,
+            control_prefill_seconds_per_token: control.prefill_seconds_per_token,
+            control_decode_seconds_per_token: control.decode_seconds_per_token,
+            candidate_prefill_seconds_per_token: timing.prefill_seconds_per_token,
+            candidate_decode_seconds_per_token: timing.decode_seconds_per_token,
+        });
+        candidate_timings.push(timing);
+        if pair < pairs {
+            drop(session);
+            drop(candidate_leg);
+        } else {
+            held_session = session;
+            held_candidate_leg = Some(candidate_leg);
+        }
+    }
+
+    // AGGREGATE (the track fixture's formula, applied per leg role): the elapsed per-token time of
+    // a role is summed over the pairs, and the ratio of the two sums is the gain — i.e. the mean
+    // per-token time of the control legs over the mean per-token time of the candidate legs, per
+    // component. With ONE pair this is exactly the single-pair ratio.
+    let (control_prefill, control_decode) = aggregate_control(&records);
+    let candidate = aggregate_candidate(&candidate_timings);
+
+    let mut payload = match residency {
+        WorkerResidency::FreshPerPhase => finish_official(
+            golden,
+            (control_prefill, control_decode),
+            bands,
+            digests,
+            commit,
+            &candidate,
+            spawn_correctness,
+        ),
+        WorkerResidency::PersistentWindow => {
+            let mut held = held_session;
+            finish_official(
+                golden,
+                (control_prefill, control_decode),
+                bands,
+                digests,
+                commit,
+                &candidate,
+                move || {
+                    held.take().ok_or_else(|| {
+                        RunnerError::Protocol(
+                            "persistent-window correctness requested but the resident session was \
+                             already consumed"
+                                .to_string(),
+                        )
+                    })
+                },
+            )
+        }
+    };
+    drop(held_candidate_leg);
     let mut seal = seal;
     seal.band_passed = true;
-    seal.leg = measured_leg;
+    seal.leg = Some((control_prefill, control_decode));
     seal_paired_baseline(&mut payload.metrics, &seal);
+    payload.metrics.paired_legs = records;
+    payload
+}
+
+/// One pair's two legs, as measured, sealed for the audit trail (`metrics.paired_legs`).
+pub use crate::score::PairedLegRecord;
+
+/// The control legs' aggregate: mean per-token time per component over the pairs (= the ratio of
+/// the summed per-token times, the fixture's aggregate rule).
+fn aggregate_control(records: &[PairedLegRecord]) -> (f64, f64) {
+    let n = records.len() as f64;
+    let prefill = records
+        .iter()
+        .map(|r| r.control_prefill_seconds_per_token)
+        .sum::<f64>()
+        / n;
+    let decode = records
+        .iter()
+        .map(|r| r.control_decode_seconds_per_token)
+        .sum::<f64>()
+        / n;
+    (prefill, decode)
+}
+
+/// The candidate legs' aggregate: the LAST pair's timing (its spec audit and diagnostics) with the
+/// per-token times replaced by the per-component means over the pairs and the elapsed seconds
+/// summed, so `timed_benchmark_seconds` still reads as the total timed candidate work.
+fn aggregate_candidate(timings: &[TimingResult]) -> TimingResult {
+    let n = timings.len() as f64;
+    let mut agg = timings
+        .last()
+        .cloned()
+        .expect("aggregate_candidate is called with at least one pair");
+    agg.prefill_seconds_per_token = timings
+        .iter()
+        .map(|t| t.prefill_seconds_per_token)
+        .sum::<f64>()
+        / n;
+    agg.decode_seconds_per_token = timings
+        .iter()
+        .map(|t| t.decode_seconds_per_token)
+        .sum::<f64>()
+        / n;
+    agg.prefill_elapsed_seconds = timings.iter().map(|t| t.prefill_elapsed_seconds).sum();
+    agg.decode_elapsed_seconds = timings.iter().map(|t| t.decode_elapsed_seconds).sum();
+    agg
+}
+
+/// [`paired_refusal`] that also seals the pairs already measured before the refusal.
+fn paired_refusal_with_records(
+    golden: &GoldenFixture,
+    digests: RunDigests<'_>,
+    commit: &str,
+    error: String,
+    seal: PairedBaselineSeal<'_>,
+    measured_leg: Option<(f64, f64)>,
+    records: Vec<PairedLegRecord>,
+) -> ScorePayload {
+    let mut payload = paired_refusal(golden, digests, commit, error, seal, measured_leg);
+    payload.metrics.paired_legs = records;
     payload
 }
 
@@ -4091,6 +4324,7 @@ mod tests {
             spec: None,
             platform: Platform::Mlx,
             cool_gate,
+            pairs: 1,
         }
     }
 
@@ -4217,6 +4451,203 @@ mod tests {
             m.candidate_leg_decode_seconds_per_token,
             Some(m.decode_seconds_per_token)
         );
+    }
+
+    /// TWO PAIRS (David 2026-09-09): the same two legs, in the same order, TWICE — control, then
+    /// candidate, engine up and down around each leg — and the enforced denominator / numerator
+    /// are the per-role MEANS over the pairs, with both pairs sealed as measured.
+    #[test]
+    fn two_pairs_run_both_legs_twice_and_score_on_the_per_role_means() {
+        use std::rc::Rc;
+        let golden = official_golden(None);
+        let calibration = wide_calibration();
+        let baseline_spawns = Cell::new(0usize);
+        let candidate_spawns = Cell::new(0usize);
+        let events: Rc<std::cell::RefCell<Vec<&'static str>>> =
+            Rc::new(std::cell::RefCell::new(Vec::new()));
+        struct LegGuard {
+            events: Rc<std::cell::RefCell<Vec<&'static str>>>,
+            label: &'static str,
+        }
+        impl Drop for LegGuard {
+            fn drop(&mut self) {
+                self.events.borrow_mut().push(self.label);
+            }
+        }
+        let mut window = paired_window_for_test(|_phase: &str| Ok(()));
+        window.pairs = 2;
+
+        let payload = official_core_paired(
+            PairedGoldens {
+                candidate: &golden,
+                control: &golden,
+            },
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: || {
+                    events.borrow_mut().push("baseline-engine-up");
+                    Ok(LegGuard {
+                        events: Rc::clone(&events),
+                        label: "baseline-engine-down",
+                    })
+                },
+                open_candidate_leg: || {
+                    events.borrow_mut().push("candidate-engine-up");
+                    Ok(LegGuard {
+                        events: Rc::clone(&events),
+                        label: "candidate-engine-down",
+                    })
+                },
+                spawn_baseline: || {
+                    baseline_spawns.set(baseline_spawns.get() + 1);
+                    Session::connect(conformant_engine()).map(|(s, _)| s)
+                },
+                spawn_timed: || {
+                    candidate_spawns.set(candidate_spawns.get() + 1);
+                    Session::connect(conformant_engine()).map(|(s, _)| s)
+                },
+                spawn_correctness: || Session::connect(conformant_engine()).map(|(s, _)| s),
+            },
+            window,
+        );
+
+        assert_eq!(baseline_spawns.get(), 2, "one control worker per pair");
+        assert_eq!(candidate_spawns.get(), 2, "one candidate worker per pair");
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                "baseline-engine-up",
+                "baseline-engine-down",
+                "candidate-engine-up",
+                "candidate-engine-down",
+                "baseline-engine-up",
+                "baseline-engine-down",
+                "candidate-engine-up",
+                "candidate-engine-down",
+            ],
+            "each pair is control then candidate, engines strictly sequential"
+        );
+
+        let m = &payload.metrics;
+        assert_eq!(m.paired_legs.len(), 2, "both pairs are sealed as measured");
+        assert_eq!(m.paired_legs[0].pair, 1);
+        assert_eq!(m.paired_legs[1].pair, 2);
+        for r in &m.paired_legs {
+            assert!(
+                r.control_prefill_seconds_per_token.is_finite()
+                    && r.control_prefill_seconds_per_token > 0.0
+            );
+            assert!(
+                r.control_decode_seconds_per_token.is_finite()
+                    && r.control_decode_seconds_per_token > 0.0
+            );
+            assert!(
+                r.candidate_prefill_seconds_per_token.is_finite()
+                    && r.candidate_prefill_seconds_per_token > 0.0
+            );
+            assert!(
+                r.candidate_decode_seconds_per_token.is_finite()
+                    && r.candidate_decode_seconds_per_token > 0.0
+            );
+        }
+        let mean = |f: fn(&PairedLegRecord) -> f64| {
+            m.paired_legs.iter().map(f).sum::<f64>() / m.paired_legs.len() as f64
+        };
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * a.abs().max(b.abs()).max(1.0);
+        // The ENFORCED denominator is the mean of the control legs, on both names that carry it.
+        let control_prefill = mean(|r| r.control_prefill_seconds_per_token);
+        let control_decode = mean(|r| r.control_decode_seconds_per_token);
+        assert!(close(
+            m.baseline_leg_prefill_seconds_per_token.unwrap(),
+            control_prefill
+        ));
+        assert!(close(
+            m.baseline_leg_decode_seconds_per_token.unwrap(),
+            control_decode
+        ));
+        assert!(close(m.baseline_prefill_seconds_per_token, control_prefill));
+        assert!(close(m.baseline_decode_seconds_per_token, control_decode));
+        // The ENFORCED numerator is the mean of the candidate legs.
+        assert!(close(
+            m.prefill_seconds_per_token,
+            mean(|r| r.candidate_prefill_seconds_per_token)
+        ));
+        assert!(close(
+            m.decode_seconds_per_token,
+            mean(|r| r.candidate_decode_seconds_per_token)
+        ));
+        assert_eq!(m.baseline_band_passed, Some(true));
+        assert_eq!(m.baseline_source.as_deref(), Some("serial-control-leg"));
+    }
+
+    /// A FAULT IN PAIR 2 ends the run by name, seals no score, and keeps pair 1's measurement in
+    /// the audit trail — nothing measured is thrown away, nothing unmeasured is invented.
+    #[test]
+    fn a_fault_in_the_second_pair_refuses_and_seals_the_first_pair() {
+        let golden = official_golden(None);
+        let calibration = wide_calibration();
+        let candidate_spawns = Cell::new(0usize);
+        let gates = Cell::new(0usize);
+        let mut window = paired_window_for_test(|_phase: &str| {
+            // Gate calls: pair 1 control (prefill, decode), pair 1 candidate (prefill, decode),
+            // then pair 2's control prefill gate — which is refused.
+            gates.set(gates.get() + 1);
+            if gates.get() == 5 {
+                Err(RunnerError::Protocol(
+                    "GPU never cooled for pair 2".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        window.pairs = 2;
+
+        let payload = official_core_paired(
+            PairedGoldens {
+                candidate: &golden,
+                control: &golden,
+            },
+            &calibration,
+            paired_seal_for_test(&calibration),
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            PairedLegs {
+                open_baseline_leg: || Ok(()),
+                open_candidate_leg: || Ok(()),
+                spawn_baseline: || Session::connect(conformant_engine()).map(|(s, _)| s),
+                spawn_timed: || {
+                    candidate_spawns.set(candidate_spawns.get() + 1);
+                    Session::connect(conformant_engine()).map(|(s, _)| s)
+                },
+                spawn_correctness: || Session::connect(conformant_engine()).map(|(s, _)| s),
+            },
+            window,
+        );
+
+        assert!(!payload.passed, "a faulted pair seals no score");
+        assert!(payload.score.is_none());
+        assert!(
+            payload
+                .metrics
+                .error
+                .contains("GPU never cooled for pair 2"),
+            "the run dies by name: {}",
+            payload.metrics.error
+        );
+        assert_eq!(
+            candidate_spawns.get(),
+            1,
+            "pair 2's candidate leg never opens"
+        );
+        assert_eq!(
+            payload.metrics.paired_legs.len(),
+            1,
+            "pair 1 stays in the audit trail"
+        );
+        assert_eq!(payload.metrics.paired_legs[0].pair, 1);
     }
 
     /// LEG 1 OUTSIDE THE BAND: the run dies BY NAME, seals no score, and leg 2 never opens — not

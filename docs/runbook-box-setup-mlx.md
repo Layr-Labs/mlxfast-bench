@@ -63,13 +63,22 @@ not match its manifest refuses to run.
 
 ## 5. Goldens
 
-The ranked job reads the eight pool goldens from the checked-out repository,
-directory `correctness_prompts/<track id>/`. The workflow sets
-`MLXFAST_QWEN38_GOLDEN_DIR` to that directory. The preflight verifies each
-file against the sha256 and byte pins in the track fixture and refuses on a
-mismatch or on an extra `.json` file. Re-authoring the goldens is an engine
-pull request that changes the files and the fixture pins together. The
-hidden correctness golden is not part of the ranked job.
+The goldens are organizer material. They are in R2, under the object keys that
+`r2_path` names in the track fixture. They are never in git, and the ranked job
+holds no credential, so the box stages them one time, out of band.
+
+Stage them with the `goldens` converge unit in `m5-machine-scripts`. Run
+`converge --check --unit goldens` to see what is missing. Then run
+`converge --apply --unit goldens` to place the pinned files. The unit writes
+each file read-only, refuses a file that does not match its pin, and deletes
+nothing.
+
+Set `MLXFAST_QWEN38_GOLDEN_DIR` to that directory in the runner service
+environment (section 6). The workflow refuses to start when the variable is
+missing. Before every ranked run, `tools/ranked-box-preflight.sh` compares the
+byte count and the sha256 of each staged file with the fixture pin. It also
+refuses the directory when the directory holds one more `*.json`, because the
+job passes every `*.json` there as a golden.
 
 ## 6. Runner registration and service
 
@@ -81,6 +90,8 @@ hidden correctness golden is not part of the ranked job.
 - The runner environment file (`.env` in the runner directory, one
   `NAME=value` per line; restart the service after a change) must carry:
   - `BENCHD_BIN_DIR`: the directory with the staged pair (section 4).
+  - `MLXFAST_QWEN38_GOLDEN_DIR`: the directory with the staged goldens
+    (section 5).
   - `MLXFAST_REFERENCE_DIR`: the reference checkpoint directory itself. The
     first job verifies the full checkpoint hash once and writes a trusted
     stamp in that directory; later jobs skip the hash while the stamp is

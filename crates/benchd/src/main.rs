@@ -3937,9 +3937,14 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
     // measure-job keyed on `!--local-dev`. --capture-baseline returns below without a score, but it
     // is local-iterate-only (refused on official at parse), so it never bypasses this gate. This is
     // the one call site that covers the whole scored chain now that flow B is gone.
-    if args.mode == Mode::Official {
-        enforce_official_arm_gate(args.contract.as_deref(), track_id_env.as_deref())?;
-    }
+    let official_contract = if args.mode == Mode::Official {
+        Some(enforce_official_arm_gate(
+            args.contract.as_deref(),
+            track_id_env.as_deref(),
+        )?)
+    } else {
+        None
+    };
     // THE RANKED PAIRED PATH's fences, PRE-GPU (David 2026-09-08). A live-control-leg track
     // measures its own denominator, so every STORED-pair door is closed before anything spawns:
     // the trusted env override, the `--baseline-*` flags, and a golden that still declares a pair.
@@ -4147,6 +4152,26 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
             args.box_name.as_deref(),
             std::env::var(baseline::RUNNER_NAME_ENV).ok().as_deref(),
         )?;
+        // PAIR COUNT (David 2026-09-09): the pinned track fixture is the only source on the ranked
+        // path. The arm gate above already parsed it for `--mode official`. A LOCAL paired run
+        // (both per-box inputs present, no scoring seal) takes the count from --contract when one
+        // is given and otherwise runs one pair: local numbers are directional, and the ranked
+        // count is pinned where the ranked run reads it.
+        let pairs = match (official_contract.as_ref(), args.contract.as_deref()) {
+            (Some(contract), _) => contract::official_pairs(contract, &track_id)?,
+            (None, Some(path)) => {
+                let bytes = std::fs::read(path)
+                    .map_err(|e| format!("--contract read failed ({}): {e}", path.display()))?;
+                contract::official_pairs(&contract::Contract::parse(&bytes)?, &track_id)?
+            }
+            (None, None) => {
+                eprintln!(
+                    "benchd iterate: local paired run without --contract runs 1 pair (the ranked \
+                     path takes official_pairs from the track fixture)"
+                );
+                1
+            }
+        };
         // The prompt the run MEASURES, named from the golden it was given — the same name the
         // calibrator recorded from the golden it measured.
         let prompt = baseline::golden_prompt_name(&args.golden).ok_or_else(|| {
@@ -4384,9 +4409,10 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
             }
         };
         eprintln!(
-            "benchd iterate: paired official run on box {box_name:?} — leg 1 is the serial-control \
-             leg on the reference tree {}, leg 2 the candidate; the score is the live ratio of the \
-             two (calibration {} is the band on leg 1, never a denominator)",
+            "benchd iterate: paired official run on box {box_name:?}, {pairs} pair(s) — in each pair \
+             leg 1 is the serial-control leg on the reference tree {}, leg 2 the candidate; the \
+             score is the live ratio of the two legs' per-token times summed over the pairs \
+             (calibration {} is the band on every leg 1, never a denominator)",
             workspace.display(),
             calibration.path.display(),
         );
@@ -4426,6 +4452,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                 spec: args.spec.clone(),
                 platform,
                 cool_gate: official_cool_gate,
+                pairs,
             },
         );
         if let Some(hello) = timed_hello.borrow().as_ref() {
@@ -4801,7 +4828,7 @@ fn iterate_platform(env_track_id: Option<&str>) -> Result<bench_core::constants:
 fn enforce_official_arm_gate(
     contract: Option<&Path>,
     env_track_id: Option<&str>,
-) -> Result<(), String> {
+) -> Result<contract::Contract, String> {
     let contract_path = contract.ok_or_else(|| {
         "--mode official requires --contract <track-fixture.json> for the arm gate".to_string()
     })?;
@@ -4815,7 +4842,8 @@ fn enforce_official_arm_gate(
         .filter(|s| !s.is_empty())
         .or(contract.track_id.as_deref())
         .unwrap_or("<unset>");
-    contract::enforce_official_scoring_enabled(true, contract.official_scoring_enabled, track_id)
+    contract::enforce_official_scoring_enabled(true, contract.official_scoring_enabled, track_id)?;
+    Ok(contract)
 }
 
 /// THE TABLE-ARM PREDICATE — which resolution arm a declared `track_id` takes.

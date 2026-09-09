@@ -378,6 +378,32 @@ pub struct ScoreMetrics {
         skip_serializing_if = "Option::is_none"
     )]
     pub candidate_leg_decode_seconds_per_token: Option<f64>,
+    /// PAIRED PATH audit trail (David 2026-09-09, `official_pairs` in the track fixture): every
+    /// pair this run measured, in order, both legs' per-token times as measured. The enforced
+    /// `baseline_leg_*` / `candidate_leg_*` fields above are the per-role means over these rows.
+    /// OMITTED when empty so the single-leg and local payloads keep their key set.
+    #[serde(
+        rename = "paired_legs",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub paired_legs: Vec<PairedLegRecord>,
+}
+
+/// One measured pair of the paired official run: the serial-control leg and the candidate leg on
+/// the same box and prompt, as measured (never coarsened — this is the audit trail).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PairedLegRecord {
+    #[serde(rename = "pair")]
+    pub pair: i64,
+    #[serde(rename = "control_prefill_seconds_per_token")]
+    pub control_prefill_seconds_per_token: f64,
+    #[serde(rename = "control_decode_seconds_per_token")]
+    pub control_decode_seconds_per_token: f64,
+    #[serde(rename = "candidate_prefill_seconds_per_token")]
+    pub candidate_prefill_seconds_per_token: f64,
+    #[serde(rename = "candidate_decode_seconds_per_token")]
+    pub candidate_decode_seconds_per_token: f64,
 }
 
 /// One timed prompt's board-facing record, sealed in [`ScoreMetrics::per_prompt`].
@@ -558,6 +584,7 @@ impl ScoreMetrics {
             baseline_leg_decode_seconds_per_token: self.baseline_leg_decode_seconds_per_token,
             candidate_leg_prefill_seconds_per_token: self.candidate_leg_prefill_seconds_per_token,
             candidate_leg_decode_seconds_per_token: self.candidate_leg_decode_seconds_per_token,
+            paired_legs: self.paired_legs.clone(),
         }
     }
 }
@@ -752,6 +779,7 @@ mod tests {
             baseline_leg_decode_seconds_per_token: None,
             candidate_leg_prefill_seconds_per_token: None,
             candidate_leg_decode_seconds_per_token: None,
+            paired_legs: Vec::new(),
         }
     }
 

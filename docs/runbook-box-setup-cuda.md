@@ -218,9 +218,9 @@ ssh <box> "mkdir -p ~/actions-runner-qwen38-cuda && cd ~/actions-runner-qwen38-c
   && curl -sS -L -o rn.tar.gz https://github.com/actions/runner/releases/download/v$V/actions-runner-linux-arm64-$V.tar.gz \
   && tar xzf rn.tar.gz && rm rn.tar.gz"
 ssh <box> 'cd ~/actions-runner-qwen38-cuda && ./config.sh --unattended \
-  --url https://github.com/Layr-Labs/cudafast-qwen38-125b-a6b-engine \
+  --url https://github.com/Layr-Labs/cudafast-qwen38-125b-a6b-engine-dev \
   --token "$(cat)" --name <box> --labels qwen3.8-125b-a6b-cuda-v1 --work _work --replace' \
-  <<< "$(gh api -X POST repos/Layr-Labs/cudafast-qwen38-125b-a6b-engine/actions/runners/registration-token --jq .token)"
+  <<< "$(gh api -X POST repos/Layr-Labs/cudafast-qwen38-125b-a6b-engine-dev/actions/runners/registration-token --jq .token)"
 ```
 
 The fleet posture is a persistent registration under the operator account,
@@ -234,10 +234,11 @@ the runner flaps offline.
 
 `.env` in the runner root holds values only. The listener reads it when it
 starts. `config.sh` has already written the file with a `LANG` line. Append
-these three lines:
+these four lines:
 
 ```
 MLXFAST_TARGET_SNAPSHOT_DIR=<root>/weights/gguf-unsloth-q4
+MLXFAST_QWEN38_GOLDEN_DIR=<root>/goldens/qwen3.8-125b-a6b-cuda-v1
 BENCHD_BIN_DIR=<root>/benchd-bin
 PATH=/home/<op>/.cargo/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ```
@@ -253,10 +254,23 @@ edit it, then restart the service (`sudo ./svc.sh stop && sudo ./svc.sh start`).
 
 ## 8. Goldens
 
-Stage nothing. The ranked job reads the timed-pool goldens and the
-per-depth oracles from its own checkout (`correctness_prompts/<track>/`).
-It verifies them against the fixture pins. The pool directory must hold
-only pinned goldens. The preflight refuses any other `*.json` there.
+The timed-pool goldens and the per-depth oracles are organizer material.
+They are in R2, under the object keys that `r2_path` names in the track
+fixture. They are never in git, and the ranked job holds no credential, so
+the operator stages them one time, out of band.
+
+Download each pinned object with the organizer's credentialed download.
+Put the files in `<root>/goldens/qwen3.8-125b-a6b-cuda-v1`, one file per
+pin, named by the last part of its `r2_path`. Put nothing else there. Then
+run `tools/ranked-box-preflight.sh` from the engine checkout to verify the
+directory.
+
+Set `MLXFAST_QWEN38_GOLDEN_DIR` to that directory in the runner environment
+file (section 7). The workflow refuses to start when the variable is
+missing. Before every ranked run, the preflight compares the byte count and
+the sha256 of each staged file with the fixture pin. It also refuses the
+directory when the directory holds one more `*.json`, because the job passes
+every `*.json` there as a golden.
 
 ## 9. The measurement topology
 
@@ -333,7 +347,7 @@ This is the ranked job's own measurement.
 
 ```bash
 flock /tmp/mtplx-gpu-exclusive.lock -c '
-  MLXFAST_QWEN38_GOLDEN_DIR=correctness_prompts/qwen3.8-125b-a6b-cuda-v1 \
+  MLXFAST_QWEN38_GOLDEN_DIR=<root>/goldens/qwen3.8-125b-a6b-cuda-v1 \
   BENCHD_BIN=<root>/benchd-bin/benchd \
   SERVE_UP_WEIGHTS_DIR="$MLXFAST_TARGET_SNAPSHOT_DIR" \
   tools/serve-up.sh tools/qwen38-125b-a6b-measure-and-score.sh'
@@ -359,7 +373,7 @@ Make sure that exactly one `Runner.Listener` runs and that the runner shows
 online:
 
 ```bash
-gh api repos/Layr-Labs/cudafast-qwen38-125b-a6b-engine/actions/runners --jq '.runners[] | "\(.name) \(.status)"'
+gh api repos/Layr-Labs/cudafast-qwen38-125b-a6b-engine-dev/actions/runners --jq '.runners[] | "\(.name) \(.status)"'
 ```
 
 ## 12. Dispatch and receipt
@@ -471,7 +485,7 @@ pinned golden within 1.7% of the pinned constants on 2026-09-05.
 | `qwen4exp-calibrate.sh` exits 2: declared spec is not serial | the checkout declares a depth | calibrate on a checkout of `main` (step 13) |
 | `qwen4exp-calibrate.sh` exits 4: `CALIBRATION-CV-EXCEEDED` | one golden's four legs differed by more than 1% | a result, not a fault; a second run is a new run |
 | runner offline; log says a session already exists | a second listener started by hand | stop it; let the service's listener reconnect |
-| preflight refuses an unpinned `*.json` in the pool directory | a non-pool golden placed beside the pool | move it out of `correctness_prompts/<track>/` |
+| preflight refuses an unpinned `*.json` in the pool directory | a non-pool golden placed beside the pool | move it out of the directory that `MLXFAST_QWEN38_GOLDEN_DIR` names |
 | a window stalls, GPU idle, two worker processes | a second connection waiting on the one-connection resident | one attached worker per window (benchd does this when `DS4_RESIDENT_SOCKET` is set) |
 | speculative candidate misses the prefill band while serial passes | the engine re-uploaded the draft head on first use inside the timed prefill | fixed at ds4 pin 5f36517; the head stays resident from load |
 | `nvidia-smi --query-gpu=memory.total` prints `[N/A]` | GB10 unified memory | read `/proc/meminfo`; `serve-up.sh` does (107 GiB available, 91 GiB required) |

@@ -57,7 +57,7 @@ case "${TARGET_TRIPLE}" in
   *) echo "build-dist-linux.sh: unsupported BENCHD_DIST_TARGET '${TARGET_TRIPLE}' (aarch64-unknown-linux-gnu or x86_64-unknown-linux-gnu)" >&2; exit 1 ;;
 esac
 OUT_DIR="${BENCHD_DIST_OUT:-${REPO_ROOT}/dist/${DIST_SUBDIR}}"
-BENCH_REPO="${BENCHD_DIST_REPO:-https://github.com/Layr-Labs/mlxfast-bench.git}"
+BENCH_REPO="${BENCHD_DIST_REPO:-https://github.com/Layr-Labs/mlxfast-bench-dev.git}"
 
 die() {
   echo "build-dist-linux.sh: $*" >&2

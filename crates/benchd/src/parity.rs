@@ -593,6 +593,7 @@ mod tests {
         "engine_device",
         "engine_protocol_version",
         "head_provenance_sha256",
+        "paired_legs",
         "per_prompt",
         "resident_load_epoch",
         "resident_pid",
@@ -649,6 +650,13 @@ mod tests {
             baseline_leg_decode_seconds_per_token: Some(0.032),
             candidate_leg_prefill_seconds_per_token: Some(0.0006),
             candidate_leg_decode_seconds_per_token: Some(0.016),
+            paired_legs: vec![crate::score::PairedLegRecord {
+                pair: 1,
+                control_prefill_seconds_per_token: 0.0006,
+                control_decode_seconds_per_token: 0.032,
+                candidate_prefill_seconds_per_token: 0.0006,
+                candidate_decode_seconds_per_token: 0.016,
+            }],
             ..Default::default()
         };
         let v = serde_json::to_value(&populated).unwrap();

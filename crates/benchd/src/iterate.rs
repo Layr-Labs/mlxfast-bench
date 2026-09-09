@@ -1927,6 +1927,7 @@ pub(crate) fn base_metrics(
         baseline_leg_decode_seconds_per_token: None,
         candidate_leg_prefill_seconds_per_token: None,
         candidate_leg_decode_seconds_per_token: None,
+        paired_legs: Vec::new(),
     }
 }
 

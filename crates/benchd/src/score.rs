@@ -27,6 +27,39 @@ pub struct ScorePayload {
     pub metrics: ScoreMetrics,
 }
 
+/// Outcome of a local phase; a later failure does not erase an earlier result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PhaseStatus {
+    #[default]
+    NotRun,
+    Passed,
+    Failed,
+}
+
+/// Local diagnostics separate the untimed correctness gate from checked timing.
+/// These fields never participate in scoring or replace the legacy Swift audit fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocalPhases {
+    pub correctness: PhaseStatus,
+    /// Actual conformance steps, not the legacy timed `metrics.checked_steps` count.
+    /// Null when the gate started but returned no report (e.g. a transport error).
+    pub correctness_checked_steps: Option<i64>,
+    /// Passed only after both timed phases complete. NotRun means the first timing
+    /// gate was never cleared; Failed includes an interrupted/partial measurement.
+    pub timing: PhaseStatus,
+}
+
+impl Default for LocalPhases {
+    fn default() -> Self {
+        Self {
+            correctness: PhaseStatus::NotRun,
+            correctness_checked_steps: Some(0),
+            timing: PhaseStatus::NotRun,
+        }
+    }
+}
+
 /// Port of Swift `ScoreMetrics`. JSON keys match the Swift `CodingKeys`.
 ///
 /// The output is emitted sorted-key + pretty (see [`ScorePayload::to_sealed_json`]),
@@ -46,6 +79,9 @@ pub struct ScorePayload {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ScoreMetrics {
+    /// Additive local-only diagnostics. Absent on official paths and old artifacts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_phases: Option<LocalPhases>,
     #[serde(rename = "peak_ram_gb")]
     pub peak_ram_gb: f64,
     #[serde(rename = "bandwidth_gb_per_token")]
@@ -488,6 +524,7 @@ impl ScoreMetrics {
         let rounded_ttft_max = r(self.gpqa_ttft_max_seconds).max(rounded_p50);
 
         ScoreMetrics {
+            local_phases: self.local_phases.clone(),
             peak_ram_gb: r(self.peak_ram_gb),
             bandwidth_gb_per_token: r(self.bandwidth_gb_per_token),
             decode_seconds_per_token: self.decode_seconds_per_token,
@@ -691,6 +728,7 @@ mod tests {
     /// A zeroed metrics block used across tests.
     pub(crate) fn zero_metrics() -> ScoreMetrics {
         ScoreMetrics {
+            local_phases: None,
             peak_ram_gb: 0.0,
             bandwidth_gb_per_token: 0.0,
             decode_seconds_per_token: 0.0,

@@ -37,7 +37,7 @@ use bench_runner::{
 use bench_runner::Hello;
 use sha2::{Digest, Sha256};
 
-use crate::score::{ScoreMetrics, ScorePayload, ScorePerPrompt};
+use crate::score::{LocalPhases, PhaseStatus, ScoreMetrics, ScorePayload, ScorePerPrompt};
 
 /// Swift `QwenRuntime.bandwidthSource` for the RAM-resident dense runtime.
 const BANDWIDTH_SOURCE: &str = "ram_resident_model";
@@ -777,6 +777,55 @@ where
 /// seconds-per-token formulas); only where the timed worker lives differs.
 #[allow(clippy::too_many_arguments)]
 pub fn iterate_flow_windowed<T, F, G>(
+    session: Option<&mut Session<T>>,
+    golden: &GoldenFixture,
+    baseline_prefill_spt: f64,
+    baseline_decode_spt: f64,
+    mode: Mode,
+    strict: bool,
+    timed_only: bool,
+    digests: RunDigests<'_>,
+    spawn_timed: F,
+    mut cool_gate: G,
+    residency: WorkerResidency,
+    spec: Option<SpecConfig>,
+) -> ScorePayload
+where
+    T: LineTransport,
+    F: FnMut() -> bench_runner::Result<Session<T>>,
+    G: FnMut(&str) -> bench_runner::Result<()>,
+{
+    let mut phases = LocalPhases::default();
+    let timing_status = std::cell::Cell::new(PhaseStatus::NotRun);
+    // Observe the existing gate without changing its threshold, retries, or timing.
+    let observed_cool_gate = |phase: &str| {
+        cool_gate(phase)?;
+        timing_status.set(PhaseStatus::Failed);
+        Ok(())
+    };
+    let mut payload = iterate_flow_with_phase_status(
+        session,
+        golden,
+        baseline_prefill_spt,
+        baseline_decode_spt,
+        mode,
+        strict,
+        timed_only,
+        digests,
+        spawn_timed,
+        observed_cool_gate,
+        residency,
+        spec,
+        &mut phases,
+        &timing_status,
+    );
+    phases.timing = timing_status.get();
+    payload.metrics.local_phases = Some(phases);
+    payload
+}
+
+#[allow(clippy::too_many_arguments)]
+fn iterate_flow_with_phase_status<T, F, G>(
     mut session: Option<&mut Session<T>>,
     golden: &GoldenFixture,
     baseline_prefill_spt: f64,
@@ -789,6 +838,8 @@ pub fn iterate_flow_windowed<T, F, G>(
     mut cool_gate: G,
     residency: WorkerResidency,
     spec: Option<SpecConfig>,
+    phases: &mut LocalPhases,
+    timing_status: &std::cell::Cell<PhaseStatus>,
 ) -> ScorePayload
 where
     T: LineTransport,
@@ -831,6 +882,8 @@ where
     } else {
         CorrectnessScope::Full
     };
+    phases.correctness = PhaseStatus::Failed;
+    phases.correctness_checked_steps = None;
     let report = {
         let mut adapter = SessionEngine {
             session: &mut *sess,
@@ -857,6 +910,12 @@ where
             }
         }
     };
+    phases.correctness = if report.passed {
+        PhaseStatus::Passed
+    } else {
+        PhaseStatus::Failed
+    };
+    phases.correctness_checked_steps = Some(report.checked_steps());
     // #132(b) FINAL: the fail-path case count used to be computed here (the golden's TOTAL
     // correctness case count) and threaded into every blanked failure payload. Under
     // MIRROR-BLANK-STRICTLY it is zero on every one of those paths, so the binding is gone rather
@@ -872,7 +931,7 @@ where
     if let Err(e) = sess.close_phase() {
         return failed_payload(
             mode,
-            FailureReport::message(format!("{e}"), true),
+            FailureReport::message(format!("{e}"), report.passed),
             golden,
             digests,
             None,
@@ -967,6 +1026,7 @@ where
                     };
                     match timeonly_result {
                         Ok(timing) => {
+                            timing_status.set(PhaseStatus::Passed);
                             return failed_with_real_timing_payload(
                                 mode,
                                 failure_report,
@@ -1044,7 +1104,7 @@ where
                 Err(e) => {
                     return failed_payload(
                         mode,
-                        FailureReport::message(e, true),
+                        FailureReport::message(e, !timed_only),
                         golden,
                         digests,
                         None,
@@ -1106,11 +1166,14 @@ where
         }
     };
     let timing = match timing_result {
-        Ok(t) => t,
+        Ok(t) => {
+            timing_status.set(PhaseStatus::Passed);
+            t
+        }
         Err(e) => {
             return failed_payload(
                 mode,
-                FailureReport::message(format!("{e}"), true),
+                FailureReport::message(format!("{e}"), !timed_only),
                 golden,
                 digests,
                 None,
@@ -1681,7 +1744,7 @@ pub fn preflight_failed_payload(
     // EVERY local failure path (#132(b), FINAL), and `base_metrics` seals the caller's resolved
     // official baseline pair on every one (#132(a)) — the pair the caller obtained from
     // `bench_core::constants::official_baseline()`, which refuses by name while pending.
-    failed_payload(
+    let mut payload = failed_payload(
         mode,
         FailureReport::message(error, false),
         golden,
@@ -1689,7 +1752,11 @@ pub fn preflight_failed_payload(
         None,
         None,
         (baseline_prefill_spt, baseline_decode_spt),
-    )
+    );
+    if mode.is_local_checked_timing() {
+        payload.metrics.local_phases = Some(LocalPhases::default());
+    }
+    payload
 }
 
 /// A failed payload (`score = null`, `passed = false`) for a local failure on which the
@@ -1861,6 +1928,7 @@ pub(crate) fn base_metrics(
         semantic_gpqa_model: String::new(),
         process_resident_memory_gb: 0.0,
         passed_correctness: false,
+        local_phases: None,
         num_layers: digests.model.num_hidden_layers,
         checked_steps: 0,
         case_count: 0,
@@ -3037,13 +3105,14 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         let metrics_obj = value.get("metrics").unwrap().as_object().unwrap();
         // 56 SWIFT-PARITY keys + the ADDITIVE seals a timed local-iterate leg now records: the
-        // board's `per_prompt` array and the run's `effective_spec_mode`/`effective_spec_depth`.
+        // board's `per_prompt` array, the run's `effective_spec_mode`/`effective_spec_depth`,
+        // and the additive `local_phases` diagnostics.
         // This leg requests NO spec, so it seals `serial` / `0` and NONE of the drafting counters
         // (nothing drafted), and it runs against a mock with no head provenance, so no engine
         // identity key appears either.
         assert_eq!(
             metrics_obj.len(),
-            59,
+            60,
             "all ScoreMetrics fields must be present"
         );
         assert_eq!(
@@ -4489,7 +4558,8 @@ mod tests {
     /// 48 and the sentinel baseline fields are NOT a capture of any Swift source (its
     /// `source_commit` says UNVERIFIED); it pins benchd's record SHAPE until a re-capture lands.
     ///
-    /// The comparison is over the WHOLE sealed document, not a field sample: the fixture's
+    /// The additive local phase diagnostic is asserted separately, then the comparison covers
+    /// the WHOLE legacy sealed document, not a field sample: the fixture's
     /// `nondeterministic_or_runner_identity` list is the only escape hatch (wall-clock fields
     /// that have no fixed value on either side, plus the `commit`/`harness_hash`/`runtime`
     /// labels graded as environmental / runner-identity fields), the test substitutes exactly those
@@ -4522,8 +4592,14 @@ mod tests {
             TEST_BASELINE.prefill_seconds_per_token,
             TEST_BASELINE.decode_seconds_per_token,
         );
-        let actual: serde_json::Value =
+        let mut actual: serde_json::Value =
             serde_json::from_str(&actual.to_sealed_json().unwrap()).unwrap();
+        assert_eq!(
+            actual["metrics"].as_object_mut().unwrap().remove("local_phases"),
+            Some(serde_json::json!({
+                "correctness": "not_run", "correctness_checked_steps": 0, "timing": "not_run"
+            })),
+        );
 
         let mut expected = capture["record"].clone();
         let substituted: Vec<&str> = capture["nondeterministic_or_runner_identity"]
@@ -4886,6 +4962,14 @@ mod tests {
             no_cool_gate,
         );
         assert!(!payload.metrics.passed_correctness, "site :431 signature");
+        assert_eq!(
+            payload.metrics.local_phases,
+            Some(LocalPhases {
+                correctness: PhaseStatus::Failed,
+                correctness_checked_steps: None,
+                timing: PhaseStatus::NotRun,
+            }),
+        );
         assert!(
             payload.metrics.error.contains("engine exploded"),
             "site :431 signature — reached a different exit: {:?}",
@@ -5096,6 +5180,157 @@ mod tests {
         );
         assert_reference_baselines(&payload, "iterate.rs:581 window too short");
         assert_ruled_blank_seal(&payload, "iterate.rs:581 window too short");
+    }
+
+    #[test]
+    fn local_phases_report_gate_pass_before_a_thermal_abort() {
+        for abort_phase in ["prefill", "decode"] {
+            let golden = TestGolden::new().steps(LI_EXPECTED).fixture();
+            let (mut session, hello) =
+                Session::connect(MockEngine::new().teacher_forced_tokens(vec![2i64; LI_EXPECTED]))
+                    .unwrap();
+            let payload = iterate_core(
+                &mut session,
+                &hello,
+                &golden,
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+                Mode::LocalIterate,
+                false,
+                RunDigests::for_test(&DirDigest::empty()),
+                || {
+                    Session::connect(MockEngine::new().free_run_capable().oracle_tokens(
+                        5,
+                        6,
+                        vec![7i64; LI_STEPS],
+                    ))
+                    .map(|(s, _)| s)
+                },
+                |phase| {
+                    if phase == abort_phase {
+                        Err(RunnerError::GateRejected {
+                            phase: phase.to_string(),
+                            reason: "GPU is hot and not cooling down".into(),
+                        })
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(!payload.passed);
+            assert!(payload.score.is_none());
+            assert!(
+                payload
+                    .metrics
+                    .error
+                    .contains("GPU is hot and not cooling down"),
+                "{}",
+                payload.metrics.error
+            );
+            assert!(
+                payload.metrics.passed_correctness,
+                "the untimed gate really passed"
+            );
+            assert_ruled_blank_seal(&payload, "thermal abort");
+            let phases = payload.metrics.local_phases.as_ref().unwrap();
+            assert_eq!(phases.correctness, PhaseStatus::Passed);
+            assert!(phases.correctness_checked_steps.unwrap() > 0);
+            assert_eq!(
+                phases.timing,
+                if abort_phase == "prefill" {
+                    PhaseStatus::NotRun
+                } else {
+                    PhaseStatus::Failed
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn local_phases_preserve_failed_correctness_on_phase_close_error() {
+        let golden = TestGolden::new()
+            .steps(LI_EXPECTED)
+            .corrupt_expected_beyond_budget(3, 999)
+            .fixture();
+        let (mut session, hello) = Session::connect(
+            MockEngine::new()
+                .teacher_forced_tokens(vec![2i64; LI_EXPECTED])
+                .cache_memory(4096),
+        )
+        .unwrap();
+        let payload = iterate_core(
+            &mut session,
+            &hello,
+            &golden,
+            TEST_BASELINE.prefill_seconds_per_token,
+            TEST_BASELINE.decode_seconds_per_token,
+            Mode::LocalIterate,
+            false,
+            RunDigests::for_test(&DirDigest::empty()),
+            failing_spawner,
+            no_cool_gate,
+        );
+        assert!(!payload.metrics.passed_correctness);
+        assert!(payload
+            .metrics
+            .error
+            .contains("clear the MLX allocator cache"));
+        let phases = payload.metrics.local_phases.unwrap();
+        assert_eq!(phases.correctness, PhaseStatus::Failed);
+        assert!(phases.correctness_checked_steps.unwrap() > 0);
+        assert_eq!(phases.timing, PhaseStatus::NotRun);
+    }
+
+    #[test]
+    fn local_phases_mark_both_phases_passed_on_success() {
+        let golden = TestGolden::new().steps(LI_EXPECTED).fixture();
+        let (mut session, hello) =
+            Session::connect(MockEngine::new().teacher_forced_tokens(vec![2i64; LI_EXPECTED])).unwrap();
+        let payload = iterate_core(
+            &mut session,
+            &hello,
+            &golden,
+            TEST_BASELINE.prefill_seconds_per_token,
+            TEST_BASELINE.decode_seconds_per_token,
+            Mode::LocalIterate,
+            false,
+            RunDigests::for_test(&DirDigest::empty()),
+            || {
+                Session::connect(MockEngine::new().free_run_capable().oracle_tokens(
+                    5,
+                    6,
+                    vec![7i64; LI_STEPS],
+                ))
+                .map(|(s, _)| s)
+            },
+            no_cool_gate,
+        );
+        assert!(payload.metrics.passed_correctness);
+        let phases = payload.metrics.local_phases.unwrap();
+        assert_eq!(phases.correctness, PhaseStatus::Passed);
+        assert!(phases.correctness_checked_steps.unwrap() > 0);
+        assert_eq!(phases.timing, PhaseStatus::Passed);
+    }
+
+    #[test]
+    fn local_phases_timed_only_failure_does_not_claim_correctness() {
+        let golden = TestGolden::new().steps(LI_EXPECTED).fixture();
+        let payload = iterate_flow_windowed::<MockEngine, _, _>(
+            None,
+            &golden,
+            TEST_BASELINE.prefill_seconds_per_token,
+            TEST_BASELINE.decode_seconds_per_token,
+            Mode::LocalIterate,
+            false,
+            true,
+            RunDigests::for_test(&DirDigest::empty()),
+            failing_spawner,
+            no_cool_gate,
+            WorkerResidency::PersistentWindow,
+            None,
+        );
+        assert!(!payload.metrics.passed_correctness);
+        assert_eq!(payload.metrics.local_phases, Some(LocalPhases::default()));
     }
 
     #[test]

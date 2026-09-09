@@ -62,17 +62,34 @@ pub enum CoolGateOutcome {
 /// the GB10 idle (40–43 C) does not refuse forever against a 40 C gate. It is a per-platform
 /// value, NOT a contract/candidate input: the loop still ABORTS a genuinely hot GPU above
 /// `gate_temp` — re-siting the threshold does not defang the gate.
+#[cfg(test)]
 pub fn cool_gate_loop<R, S>(
     gate_temp: f64,
-    mut read_temp: R,
-    mut sleep: S,
+    read_temp: R,
+    sleep: S,
 ) -> Result<CoolGateOutcome, String>
 where
     R: FnMut() -> Option<f64>,
     S: FnMut(u64),
 {
+    cool_gate_loop_with_progress(gate_temp, read_temp, sleep, |_, _, _| {})
+}
+
+/// The same gate with an observation-only callback, called on every usable sample.
+fn cool_gate_loop_with_progress<R, S, P>(
+    gate_temp: f64,
+    mut read_temp: R,
+    mut sleep: S,
+    mut progress: P,
+) -> Result<CoolGateOutcome, String>
+where
+    R: FnMut() -> Option<f64>,
+    S: FnMut(u64),
+    P: FnMut(u64, f64, f64),
+{
     let mut waited: u64 = 0;
     let mut min_temp: Option<f64> = None;
+    let mut observed_min: Option<f64> = None;
     let mut last_progress_waited: u64 = 0;
     let mut bad_samples: u32 = 0;
 
@@ -91,6 +108,9 @@ where
             }
         };
         bad_samples = 0;
+        let min_seen = observed_min.map_or(temp, |min| min.min(temp));
+        observed_min = Some(min_seen);
+        progress(waited, temp, min_seen);
 
         if temp <= gate_temp {
             return Ok(CoolGateOutcome::Passed { waited });
@@ -375,10 +395,17 @@ pub fn cool_gate_report(phase: &str, platform: Platform) -> Result<GateState, Ru
         platform.key(),
         reader.source_label()
     );
-    match cool_gate_loop(
+    let started = std::time::Instant::now();
+    match cool_gate_loop_with_progress(
         gate_temp,
         || read_temp(&reader),
         |secs| std::thread::sleep(Duration::from_secs(secs)),
+        |waited, temp, min_temp| {
+            eprintln!(
+                "benchd: {phase} cooling: GPU {temp:.1}C, min {min_temp:.1}C, target <={gate_temp:.0}C, elapsed {:.0}s (gate wait {waited}s)",
+                started.elapsed().as_secs_f64()
+            );
+        },
     ) {
         Ok(CoolGateOutcome::Passed { waited }) => {
             eprintln!(
@@ -436,6 +463,36 @@ mod tests {
     }
     fn cuda() -> f64 {
         Platform::Cuda.cool_gate_temp_c() // 50 C
+    }
+
+    #[test]
+    fn progress_reports_samples_without_changing_the_gate() {
+        let mut samples = Vec::new();
+        let temperatures = vec![Some(50.0), Some(45.0), Some(46.0), Some(40.0)];
+        let result = cool_gate_loop_with_progress(
+            mlx(),
+            seq(temperatures.clone()),
+            |_| {},
+            |waited, temp, min| samples.push((waited, temp, min)),
+        );
+        assert_eq!(result, cool_gate_loop(mlx(), seq(temperatures), |_| {}));
+        assert_eq!(
+            samples,
+            vec![(0, 50.0, 50.0), (10, 45.0, 45.0), (20, 46.0, 45.0), (30, 40.0, 40.0)],
+        );
+    }
+
+    #[test]
+    fn progress_reports_the_final_hot_sample_before_stall_abort() {
+        let mut samples = Vec::new();
+        let result = cool_gate_loop_with_progress(
+            mlx(),
+            seq(vec![Some(50.0)]),
+            |_| {},
+            |waited, temp, _| samples.push((waited, temp)),
+        );
+        assert!(result.unwrap_err().contains("not cooling down"));
+        assert_eq!(samples.last(), Some(&(180, 50.0)));
     }
 
     #[test]

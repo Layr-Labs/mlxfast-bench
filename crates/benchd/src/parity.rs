@@ -593,6 +593,7 @@ mod tests {
         "engine_device",
         "engine_protocol_version",
         "head_provenance_sha256",
+        "local_phases",
         "paired_legs",
         "per_prompt",
         "resident_load_epoch",
@@ -618,6 +619,7 @@ mod tests {
     #[test]
     fn only_the_sanctioned_additive_keys_are_unrostered() {
         let populated = ScoreMetrics {
+            local_phases: Some(crate::score::LocalPhases::default()),
             per_prompt: vec![crate::score::ScorePerPrompt::default()],
             effective_spec_mode: Some("mtp".to_string()),
             effective_spec_depth: Some(1),

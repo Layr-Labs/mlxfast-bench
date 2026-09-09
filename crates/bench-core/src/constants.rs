@@ -29,9 +29,16 @@ pub const SCORE_DECODE_WEIGHT: f64 = 0.75;
 /// `MLXFastConstants.scorePrefillWeight`
 pub const SCORE_PREFILL_WEIGHT: f64 = 0.25;
 
-/// `MLXFastConstants.scoreDecodeSpeedupFloor`
+/// `MLXFastConstants.scoreDecodeSpeedupFloor`.
+///
+/// THE NO-CONTRACT DEFAULT ONLY (David ruling 2026-09-09: 0.95 decode AND 0.95 prefill, enforced,
+/// configurable per project). A SCORED run takes its floors from the `--contract` track fixture
+/// (`decode_speedup_floor` / `prefill_speedup_floor`) and refuses a fixture that declares none, so
+/// this constant is reachable only from a local run with no fixture — see
+/// [`crate::score::SpeedupFloors::DEFAULT`].
 pub const SCORE_DECODE_SPEEDUP_FLOOR: f64 = 0.95;
-/// `MLXFastConstants.scorePrefillSpeedupFloor`
+/// `MLXFastConstants.scorePrefillSpeedupFloor`. The no-contract default only, exactly as
+/// [`SCORE_DECODE_SPEEDUP_FLOOR`].
 pub const SCORE_PREFILL_SPEEDUP_FLOOR: f64 = 0.95;
 
 // --- qwen-mtp-paired-decode-only scoring (track qwen3.8-27b-mtp-v1) ---

@@ -17,7 +17,9 @@ This page covers the track. Do it once per track. A ranked run is paired, and th
 The fixture names the rest: `live_golden` is the one scored prompt, `live_golden_speculative` holds
 one tape for each depth, `baseline_reference_commit` is the commit the reference tree must sit at,
 `official_pairs` is the number of pairs one ranked run measures (2 on both platforms, David ruling
-2026-09-09), and every golden is pinned there by sha256 and bytes. No golden holds a baseline pair, and no
+2026-09-09), `decode_speedup_floor` and `prefill_speedup_floor` are the two speedup floors the
+scored run must clear (0.95 and 0.95, same ruling), and every golden is pinned there by sha256 and
+bytes. No golden holds a baseline pair, and no
 fixture or constant holds one either. benchd refuses a golden that carries
 `benchmark.baseline_*_seconds_per_token` on the ranked path.
 
@@ -37,8 +39,18 @@ the reference tree, with no speculation: benchd verifies its tokens against the 
 outside. Leg 2 is the **candidate leg**, on the submission tree at its declared draft depth,
 verified against that depth's tape. Each leg boots its own engine and loads the model once. benchd
 sums each role's per-token times over the pairs, and the score is the live ratio of the sums:
-`(ref_prefill / cand_prefill)^0.25 * (ref_decode / cand_decode)^0.75`. A fixture without
-`official_pairs` refuses the ranked run; benchd never guesses the count.
+`(ref_prefill / cand_prefill)^0.25 * (ref_decode / cand_decode)^0.75`.
+
+Two gates then apply to that ratio. The decode speedup must be at or above
+`decode_speedup_floor`, and the prefill speedup must be at or above
+`prefill_speedup_floor`. Each axis has its own floor, and each floor fails the run on its own.
+benchd seals the two floors it used in `metrics.decode_speedup_floor` and
+`metrics.prefill_speedup_floor`, so the artifact states the gate it passed.
+
+The fixture is the only source of these three values. A fixture without `official_pairs`, without
+`decode_speedup_floor` or without `prefill_speedup_floor` refuses the ranked run. There is no flag,
+no environment variable and no default: benchd never guesses a pair count or a floor. A local run
+with no `--contract` uses 1 pair and the 0.95 / 0.95 defaults, and says so in its log.
 
 ```mermaid
 flowchart LR

@@ -1,12 +1,12 @@
 {
   "version": "0.0.0",
   "branch": "qwen3.8-125b-a6b-v1",
-  "source_commit": "9da7da05f3a1a5b5ec8f08d75e30b536fff78ded",
+  "source_commit": "769196e1f96d2ffdba9646dba5da77a7c319e6d1",
   "target_triple": "x86_64-unknown-linux-gnu",
-  "sha256": "8b185c1beca03e7923a6dbdf194702607d7c074b3d319c463fd4b392888e3a69",
-  "bytes": 3642264,
+  "sha256": "0973db66afd01c6f476433724a716118feb1f543bf8ea0a60ae148a21852032b",
+  "bytes": 3612392,
   "binaries": {
-    "benchd": {"sha256": "8b185c1beca03e7923a6dbdf194702607d7c074b3d319c463fd4b392888e3a69", "bytes": 3642264},
+    "benchd": {"sha256": "0973db66afd01c6f476433724a716118feb1f543bf8ea0a60ae148a21852032b", "bytes": 3612392},
     "record-correctness-golden": {"sha256": "0e7078ed676315438f75025c1539c79433719f568814a9d5edffb74bd13ced40", "bytes": 1610112}
   }
 }

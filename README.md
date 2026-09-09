@@ -20,8 +20,8 @@ The two entry points:
   Protocol v1, engine-consistency layers (MLX ↔ CUDA), the privilege/ring security
   model, and six red/green teaming cycles.
 - [docs/track-release-branches.md](docs/track-release-branches.md) — how model tracks
-  bind to this repo: the release branch is the project, the track id is the platform
-  namespace and the R2 key prefix, and how an engine repo resolves benchd.
+  bind to this repo: benchd is developed and published from `main`, the track id is the
+  platform namespace and the R2 key prefix, and how an engine repo resolves benchd.
 
 Superseded planning material lives under [docs/history/](docs/history/) and is retained
 as a record, not as guidance.
@@ -62,12 +62,15 @@ Implemented: `iterate` (engine end-to-end → sealed `score.json`, with the
 `measure-job` (Option-A seam 2: paired ranked timing → `results.json`) and
 `overlay-timing` (Option-A seam 3, LOCAL merge).
 
-Three scored paths coexist. The **single-leg** `iterate --mode official` is the
-sole scored path of the Qwen 3.8 125B-A6B tracks (MTP on the timed leg, scored
-against the pinned per-platform baseline). The **paired** `measure-job` →
-`overlay-timing` seam is the flow the earlier tracks score through; the 125B
-tracks never enter it. Both resolve their denominator from the ONE per-track
-table in `crates/bench-core/src/constants.rs`.
+Two scored paths coexist. `iterate --mode official` is the ranked path of the
+Qwen 3.8 125B-A6B tracks. It is **paired and per box**: one run measures
+`official_pairs` pairs — 2 on both platforms — on one box in one job, and each
+pair is a serial-control leg on the organizer-staged reference tree followed by
+the candidate leg. The score is the live ratio, `prefill_gain ^ 0.25 *
+decode_gain ^ 0.75`, at batch size 1 on one stream. These tracks read no stored
+baseline pair. The `measure-job` → `overlay-timing` seam is the flow the earlier
+tracks score through; it resolves its denominator from the per-track table in
+`crates/bench-core/src/constants.rs`, and the 125B tracks never enter it.
 
 Declared but **not implemented**: `transform`, `submit`. Both print
 "not implemented in this wave".
@@ -81,11 +84,12 @@ bundles will go — **today it holds only a README**; those values still live in
 ## Status
 
 Shipped and driving live ranked windows — ~44.9k lines of Rust across the seven crates.
-**Measurement and scoring live here, not in the engine repo**: `benchd measure-job`
-runs the paired timing and seals `results.json`, and the A-3 overlay computes the
-published score over it. An engine reports raw profiling only. `scripts/benchmark.sh` is
-the harness root the engine repo's `benchmark.json` invokes, and its hash is
-load-bearing.
+**Measurement and scoring live here, not in the engine repo.** On the Qwen 3.8
+125B-A6B tracks `benchd iterate --mode official` measures the pairs and seals
+`score.json`; on the earlier tracks `benchd measure-job` seals `results.json` and
+the A-3 overlay computes the published score over it. An engine reports raw
+profiling only. `scripts/benchmark.sh` is the harness root the engine repo's
+`benchmark.json` invokes, and its hash is load-bearing.
 
 Known incomplete surfaces, stated plainly:
 

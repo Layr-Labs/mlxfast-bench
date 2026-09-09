@@ -21,9 +21,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use bench_core::conformance::{
     run_conformance, AnchorOutput, ConformanceReport, CorrectnessScope, EngineHandle, TopLogit,
 };
-use bench_core::constants::{SCORE_DECODE_SPEEDUP_FLOOR, SCORE_PREFILL_SPEEDUP_FLOOR};
 use bench_core::golden::{BenchmarkGolden, GoldenFixture, Token};
-use bench_core::score::{score_default_weights, speedup};
+use bench_core::score::{score_default_weights, speedup, SpeedupFloors};
 use bench_core::BenchError;
 use bench_protocol::SpecConfig;
 use bench_runner::{
@@ -158,6 +157,43 @@ pub struct RunDigests<'a> {
     pub weights: &'a DirDigest,
     pub harness: &'a HarnessIdentity,
     pub model: bench_core::constants::TrackModelIdentity,
+}
+
+/// WHAT ONE RUN IS SCORED AGAINST: the baseline pair its speedups divide by, and the speedup
+/// FLOORS those speedups must clear (David ruling 2026-09-09: 0.95 decode AND 0.95 prefill,
+/// enforced, configurable per project).
+///
+/// The two travel together because a payload must never disagree with itself: the floors sealed in
+/// `metrics.decode_speedup_floor` / `metrics.prefill_speedup_floor` are the SAME value
+/// [`apply_timing_metrics`] decides `passed_*_speedup_floor` with and
+/// [`bench_core::score::evaluate_timed_run`] gates the official run with. One value in, one value
+/// enforced, one value sealed.
+///
+/// The floors come from the `--contract` track fixture on every scored run
+/// (`contract::speedup_floors`, which refuses a fixture that declares none);
+/// [`SpeedupFloors::DEFAULT`] is the local, no-contract default only.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScoringInputs {
+    pub baseline_prefill_spt: f64,
+    pub baseline_decode_spt: f64,
+    pub floors: SpeedupFloors,
+}
+
+impl ScoringInputs {
+    /// The pair as the payload builders write it: `(prefill, decode)`.
+    pub fn baselines(&self) -> (f64, f64) {
+        (self.baseline_prefill_spt, self.baseline_decode_spt)
+    }
+
+    /// A local run's inputs: the caller's pair against the no-contract default floors. NEVER
+    /// reachable from a scored run — the official path resolves its floors from the fixture.
+    pub fn local(baseline_prefill_spt: f64, baseline_decode_spt: f64) -> ScoringInputs {
+        ScoringInputs {
+            baseline_prefill_spt,
+            baseline_decode_spt,
+            floors: SpeedupFloors::DEFAULT,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -745,8 +781,9 @@ where
     iterate_flow_windowed(
         session,
         golden,
-        baseline_prefill_spt,
-        baseline_decode_spt,
+        // TEST-ONLY wrapper: a local run's floors are the no-contract default. The scored path
+        // resolves its own from the track fixture and never reaches here.
+        ScoringInputs::local(baseline_prefill_spt, baseline_decode_spt),
         mode,
         strict,
         timed_only,
@@ -779,8 +816,7 @@ where
 pub fn iterate_flow_windowed<T, F, G>(
     mut session: Option<&mut Session<T>>,
     golden: &GoldenFixture,
-    baseline_prefill_spt: f64,
-    baseline_decode_spt: f64,
+    scoring: ScoringInputs,
     mode: Mode,
     strict: bool,
     timed_only: bool,
@@ -852,7 +888,7 @@ where
                     digests,
                     None,
                     None,
-                    (baseline_prefill_spt, baseline_decode_spt),
+                    scoring,
                 )
             }
         }
@@ -877,7 +913,7 @@ where
             digests,
             None,
             None,
-            (baseline_prefill_spt, baseline_decode_spt),
+            scoring,
         );
     }
 
@@ -938,7 +974,7 @@ where
                         digests,
                         None,
                         None,
-                        (baseline_prefill_spt, baseline_decode_spt),
+                        scoring,
                     );
                 }
                 Ok(params) => {
@@ -973,8 +1009,7 @@ where
                                 golden,
                                 digests,
                                 &timing,
-                                baseline_prefill_spt,
-                                baseline_decode_spt,
+                                scoring,
                             );
                         }
                         // The time-only timing pass itself failed (protocol / thermal abort /
@@ -989,7 +1024,7 @@ where
                                 digests,
                                 None,
                                 None,
-                                (baseline_prefill_spt, baseline_decode_spt),
+                                scoring,
                             );
                         }
                     }
@@ -1014,7 +1049,7 @@ where
             digests,
             None,
             None,
-            (baseline_prefill_spt, baseline_decode_spt),
+            scoring,
         );
     }
     } // end `if !timed_only` — capture-timed-only drops straight to the timing phase below.
@@ -1049,7 +1084,7 @@ where
                         digests,
                         None,
                         None,
-                        (baseline_prefill_spt, baseline_decode_spt),
+                        scoring,
                     )
                 }
             }
@@ -1115,20 +1150,13 @@ where
                 digests,
                 None,
                 None,
-                (baseline_prefill_spt, baseline_decode_spt),
+                scoring,
             )
         }
     };
 
     // 3. Assemble the local estimated score.
-    local_iterate_score(
-        mode,
-        &timing,
-        baseline_prefill_spt,
-        baseline_decode_spt,
-        golden,
-        digests,
-    )
+    local_iterate_score(mode, &timing, scoring, golden, digests)
 }
 
 /// Run N capture passes over ONE persistent residency — the minimal a8 "Option-A capture
@@ -1199,8 +1227,9 @@ where
         let payload = iterate_flow_windowed(
             Some(&mut *session),
             golden,
-            baseline_prefill_spt,
-            baseline_decode_spt,
+            // CALIBRATION is a local, UNSCORED path (it writes a capture record, never a score),
+            // so it takes the no-contract default floors.
+            ScoringInputs::local(baseline_prefill_spt, baseline_decode_spt),
             mode,
             strict,
             true, // timed_only: GATELESS — no TF gate on any pass, including pass 0
@@ -1310,9 +1339,9 @@ fn cases0_timing_params(
 pub(crate) fn apply_timing_metrics(
     metrics: &mut ScoreMetrics,
     timing: &TimingResult,
-    baseline_prefill_spt: f64,
-    baseline_decode_spt: f64,
+    scoring: ScoringInputs,
 ) {
+    let (baseline_prefill_spt, baseline_decode_spt) = scoring.baselines();
     metrics.peak_ram_gb = finite_nonneg(timing.peak_ram_gb);
     metrics.bandwidth_gb_per_token = 0.0;
     metrics.bandwidth_source = BANDWIDTH_SOURCE.to_string();
@@ -1324,8 +1353,11 @@ pub(crate) fn apply_timing_metrics(
     let prefill_speedup = speedup(baseline_prefill_spt, timing.prefill_seconds_per_token);
     metrics.decode_speedup = decode_speedup;
     metrics.prefill_speedup = prefill_speedup;
-    metrics.passed_decode_speedup_floor = decode_speedup >= SCORE_DECODE_SPEEDUP_FLOOR;
-    metrics.passed_prefill_speedup_floor = prefill_speedup >= SCORE_PREFILL_SPEEDUP_FLOOR;
+    // THE FLOORS THIS RUN WAS GIVEN, never a constant: `base_metrics` sealed the same
+    // `scoring.floors` into `metrics.{decode,prefill}_speedup_floor`, so the flag and the floor it
+    // was decided against can never disagree (David 2026-09-09).
+    metrics.passed_decode_speedup_floor = decode_speedup >= scoring.floors.decode;
+    metrics.passed_prefill_speedup_floor = prefill_speedup >= scoring.floors.prefill;
     let timed = timing.prefill_elapsed_seconds + timing.decode_elapsed_seconds;
     metrics.timed_benchmark_seconds = finite_nonneg(timed);
     metrics.benchmark_wall_seconds = finite_nonneg(timed);
@@ -1343,22 +1375,10 @@ fn failed_with_real_timing_payload(
     golden: &GoldenFixture,
     digests: RunDigests<'_>,
     timing: &TimingResult,
-    baseline_prefill_spt: f64,
-    baseline_decode_spt: f64,
+    scoring: ScoringInputs,
 ) -> ScorePayload {
-    let mut metrics = base_metrics(
-        mode,
-        golden,
-        digests,
-        baseline_prefill_spt,
-        baseline_decode_spt,
-    );
-    apply_timing_metrics(
-        &mut metrics,
-        timing,
-        baseline_prefill_spt,
-        baseline_decode_spt,
-    );
+    let mut metrics = base_metrics(mode, golden, digests, scoring);
+    apply_timing_metrics(&mut metrics, timing, scoring);
     // The timed surface a local run retains carries the SAME additive board record + spec seal an
     // official run's does: this builder exists because a correctness failure must keep the real
     // measured surface, and `per_prompt` / `effective_spec_*` describe exactly that surface.
@@ -1411,11 +1431,11 @@ pub const INVALID_LOCAL_SCORE_ERROR: &str =
 pub fn local_iterate_score(
     mode: Mode,
     timing: &TimingResult,
-    baseline_prefill_spt: f64,
-    baseline_decode_spt: f64,
+    scoring: ScoringInputs,
     golden: &GoldenFixture,
     digests: RunDigests<'_>,
 ) -> ScorePayload {
+    let (baseline_prefill_spt, baseline_decode_spt) = scoring.baselines();
     let decode_spt = timing.decode_seconds_per_token;
     let prefill_spt = timing.prefill_seconds_per_token;
     let est = score_default_weights(
@@ -1436,21 +1456,10 @@ pub fn local_iterate_score(
         && est.is_finite()
         && est > 0.0;
 
-    let mut metrics = base_metrics(
-        mode,
-        golden,
-        digests,
-        baseline_prefill_spt,
-        baseline_decode_spt,
-    );
+    let mut metrics = base_metrics(mode, golden, digests, scoring);
     // Shared timing→metrics body (decode/prefill spt, baselines, speedups, floor flags) —
     // identical to the correctness-FAILURE builder, so a fail retains the same real surface.
-    apply_timing_metrics(
-        &mut metrics,
-        timing,
-        baseline_prefill_spt,
-        baseline_decode_spt,
-    );
+    apply_timing_metrics(&mut metrics, timing, scoring);
     // The board record + speculative-decode seal for the ONE prompt this leg timed. Previously
     // sealed ONLY on the official path, which left every local-iterate/local-submit score with an
     // empty `per_prompt` and no statement of what speculated — the local modes measure a timed
@@ -1674,8 +1683,7 @@ pub fn preflight_failed_payload(
     golden: &GoldenFixture,
     digests: RunDigests<'_>,
     error: String,
-    baseline_prefill_spt: f64,
-    baseline_decode_spt: f64,
+    scoring: ScoringInputs,
 ) -> ScorePayload {
     // The blank seal needs no local override: `failed_payload` blanks `golden_hash`/counts on
     // EVERY local failure path (#132(b), FINAL), and `base_metrics` seals the caller's resolved
@@ -1688,7 +1696,7 @@ pub fn preflight_failed_payload(
         digests,
         None,
         None,
-        (baseline_prefill_spt, baseline_decode_spt),
+        scoring,
     )
 }
 
@@ -1730,16 +1738,9 @@ fn failed_payload(
     digests: RunDigests<'_>,
     decode_spt: Option<f64>,
     prefill_spt: Option<f64>,
-    baselines: (f64, f64),
+    scoring: ScoringInputs,
 ) -> ScorePayload {
-    let (baseline_prefill_spt, baseline_decode_spt) = baselines;
-    let mut metrics = base_metrics(
-        mode,
-        golden,
-        digests,
-        baseline_prefill_spt,
-        baseline_decode_spt,
-    );
+    let mut metrics = base_metrics(mode, golden, digests, scoring);
     metrics.passed_correctness = failure.passed_correctness;
     // #134 — SEAL BOUNDARY. `failure.error` is engine-controlled text (a `RunnerError` Display,
     // which since #134 carries the worker's own stderr tail). Scrub secrets and cap it here, at
@@ -1828,9 +1829,9 @@ pub(crate) fn base_metrics(
     mode: Mode,
     golden: &GoldenFixture,
     digests: RunDigests<'_>,
-    baseline_prefill_spt: f64,
-    baseline_decode_spt: f64,
+    scoring: ScoringInputs,
 ) -> ScoreMetrics {
+    let (baseline_prefill_spt, baseline_decode_spt) = scoring.baselines();
     ScoreMetrics {
         peak_ram_gb: 0.0,
         bandwidth_gb_per_token: 0.0,
@@ -1840,8 +1841,11 @@ pub(crate) fn base_metrics(
         baseline_prefill_seconds_per_token: baseline_prefill_spt,
         decode_speedup: 0.0,
         prefill_speedup: 0.0,
-        decode_speedup_floor: SCORE_DECODE_SPEEDUP_FLOOR,
-        prefill_speedup_floor: SCORE_PREFILL_SPEEDUP_FLOOR,
+        // SEALED = ENFORCED (David 2026-09-09): the floors this run resolved — from the
+        // `--contract` track fixture on a scored run — are the floors every gate on this payload
+        // used. Nothing here reads a constant.
+        decode_speedup_floor: scoring.floors.decode,
+        prefill_speedup_floor: scoring.floors.prefill,
         passed_decode_speedup_floor: false,
         passed_prefill_speedup_floor: false,
         benchmark_wall_seconds: 0.0,
@@ -2198,7 +2202,7 @@ mod tests {
             RunDigests::for_test(&weights),
             None,
             None,
-            (
+            ScoringInputs::local(
                 TEST_BASELINE.prefill_seconds_per_token,
                 TEST_BASELINE.decode_seconds_per_token,
             ),
@@ -2706,8 +2710,7 @@ mod tests {
         let single = iterate_flow_windowed(
             Some(&mut ref_session),
             &golden,
-            0.0,
-            0.0,
+            ScoringInputs::local(0.0, 0.0),
             Mode::LocalIterate,
             false,
             true, // timed-only, exactly what a standalone A/B capture pass runs
@@ -3118,8 +3121,7 @@ mod tests {
         let payload = local_iterate_score(
             Mode::LocalIterate,
             &timing,
-            baseline_prefill,
-            baseline_decode,
+            ScoringInputs::local(baseline_prefill, baseline_decode),
             &golden,
             RunDigests::for_test(&weights),
         );
@@ -3135,6 +3137,7 @@ mod tests {
             baseline_decode,
             baseline_prefill,
             TEST_BASELINE.bands,
+            SpeedupFloors::DEFAULT,
         );
         assert!(!eval.decode_band.passed);
         assert!(eval.prefill_band.passed);
@@ -3163,8 +3166,10 @@ mod tests {
         let payload = local_iterate_score(
             Mode::LocalIterate,
             &timing,
-            TEST_BASELINE.prefill_seconds_per_token,
-            TEST_BASELINE.decode_seconds_per_token,
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
             &golden,
             RunDigests::for_test(&weights),
         );
@@ -3210,8 +3215,7 @@ mod tests {
             let payload = local_iterate_score(
                 mode,
                 &timing,
-                baseline_prefill,
-                baseline_decode,
+                ScoringInputs::local(baseline_prefill, baseline_decode),
                 &golden,
                 RunDigests::for_test(&weights),
             );
@@ -4519,8 +4523,10 @@ mod tests {
             &golden,
             RunDigests::for_test(&weights),
             inputs["error"].as_str().unwrap().to_string(),
-            TEST_BASELINE.prefill_seconds_per_token,
-            TEST_BASELINE.decode_seconds_per_token,
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
         );
         let actual: serde_json::Value =
             serde_json::from_str(&actual.to_sealed_json().unwrap()).unwrap();
@@ -4623,8 +4629,10 @@ mod tests {
             &golden,
             RunDigests::for_test(&DirDigest::empty()),
             missing_paired_baselines_error(Mode::LocalIterate),
-            TEST_BASELINE.prefill_seconds_per_token,
-            TEST_BASELINE.decode_seconds_per_token,
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
         );
 
         // Both are failures with no score — the verdict is the same; only the SEAL differs.
@@ -5151,8 +5159,10 @@ mod tests {
                 mode,
                 &golden,
                 RunDigests::for_test(&weights),
-                TEST_BASELINE.prefill_seconds_per_token,
-                TEST_BASELINE.decode_seconds_per_token,
+                ScoringInputs::local(
+                    TEST_BASELINE.prefill_seconds_per_token,
+                    TEST_BASELINE.decode_seconds_per_token,
+                ),
             );
             assert!(
                 !metrics.harness_hash.is_empty(),
@@ -5192,8 +5202,10 @@ mod tests {
             &golden,
             RunDigests::for_test(&weights),
             "no baselines".to_string(),
-            TEST_BASELINE.prefill_seconds_per_token,
-            TEST_BASELINE.decode_seconds_per_token,
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
         );
         assert_eq!(preflight.metrics.harness_hash, HarnessIdentity::TEST_HASH);
         // The blank-seal surface is untouched by F1 — proving this is the identity field only.
@@ -5207,7 +5219,7 @@ mod tests {
             RunDigests::for_test(&weights),
             None,
             None,
-            (
+            ScoringInputs::local(
                 TEST_BASELINE.prefill_seconds_per_token,
                 TEST_BASELINE.decode_seconds_per_token,
             ),

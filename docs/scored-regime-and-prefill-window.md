@@ -2,9 +2,16 @@
 
 This page has three parts. Part 1 tells you how a track declares WHAT it scores. Part 2 tells you
 what benchd does with the prefill half of the timed window, and when it enforces anything on it.
-Part 3 is a normative limit on part 1: no track may declare a nonzero prefill exponent yet.
+Part 3 is a normative limit on part 1 for the tracks that declare their regime in the constants
+table: none of them may declare a nonzero prefill exponent yet.
 
 Parts 1 and 2 are one mechanism. The declaration decides whether the certification is armed.
+
+**Scope.** This page governs the `measure-job` paired flow and the tracks whose regime lives in
+`SCORED_REGIMES_BY_TRACK`. The Qwen 3.8 125B-A6B tracks declare their regime in their own track
+fixture, and they score on the paired per-box path — see
+[`track-release-branches.md`](track-release-branches.md) and
+[`single-stream-prefill-window.md`](single-stream-prefill-window.md).
 
 ## 1. The scored regime
 
@@ -22,16 +29,16 @@ The composite is:
 composite = prefill_gain ^ prefill_gain_exponent * decode_gain ^ decode_gain_exponent
 ```
 
-> **DECLARED, NOT YET COMPUTED.** `bench_core::score::composite_score` has NO production call site.
-> Nothing in a run computes a composite today, and no `prefill_gain` or `decode_gain` is derived
-> from the sealed windows. The published figure still comes from `score_paired_decode_only` — the
-> even-n median of the per-prompt raw decode ratios — exactly as before this page existed.
+> **DECLARED, NOT YET COMPUTED ON THIS PATH.** `bench_core::score::composite_score` has no call
+> site in the `measure-job` flow. Nothing there computes a composite from the sealed windows: the
+> published figure comes from `score_paired_decode_only` — the even-n median of the per-prompt raw
+> decode ratios.
 >
-> The declaration says what a track scores. Computing it is a later change, and it is gated on the
-> work-placement invariant in part 2.
+> The declaration says what a track scores. Computing it here is a later change, and it is gated on
+> the work-placement invariant in part 3.
 
 The regimes are in a per-track table in `crates/bench-core/src/constants.rs`, beside the per-track
-official baseline table. The branch names its own track in `TRACK_ID` in the same file.
+official baseline table. `TRACK_ID` in the same file names the tree's own track.
 
 Read the table with `scored_regime(track_id)`. It is the only accessor. A track that is not in the
 table has no regime. That state is `SCORED_REGIME_PENDING`. The accessor refuses such a track, and
@@ -41,13 +48,18 @@ read the table in any other way.
 A track that is absent has no entry. It does not have a placeholder entry. There is no exponent
 pair for a new track to inherit by accident.
 
-### What this branch's track declares
+### What the table declares
 
 | track | `scored_batch_size` | `prefill_gain_exponent` | `decode_gain_exponent` |
 |---|---|---|---|
 | `qwen3.8-27b-mtp-v1` | 1 | 0.0 | 1.0 |
 
 This RECORDS what the track already does. It does not change it.
+
+The two Qwen 3.8 125B-A6B tracks are NOT in the table. They declare
+`scored_batch_size: 1` and `scored_exponents` `{0.25, 0.75}` in their own track fixture, and they
+resolve their denominator from the live control leg, so `resolves_through_the_track_table` sends
+them down the other arm and this fence never sees them.
 
 The track scores the single-stream paired point, decode only. The published figure is the even-n
 median of the per-prompt raw decode ratios. There is no separately scored prefill phase: the seed
@@ -207,7 +219,7 @@ prefill_gain = sum(serial_prefill_window_seconds) / sum(candidate_prefill_window
 decode_gain  = sum(serial_decode_window_seconds)  / sum(candidate_decode_window_seconds)
 ```
 
-### On this branch
+### On the declared track
 
 `qwen3.8-27b-mtp-v1` declares `prefill_gain_exponent: 0.0`. Certification is not armed. Every pair
 seals `certified: false` and `cross_check: "not-observed"`, no scored value reads the window, and the `prefill-window-uncertified`
@@ -215,7 +227,7 @@ class is unreachable. The test
 `measure_job::tests::prefill_certification_is_report_only_on_this_branchs_track` proves this end to
 end, from the mock engine through the runner's clock split to the sealed pair record.
 
-## 3. NORMATIVE: no track may declare a nonzero prefill exponent yet
+## 3. NORMATIVE: no table-declared track may raise its prefill exponent yet
 
 Certification binds the SUM of the two halves. It does not bind WHERE THE WORK SITS inside them.
 
@@ -230,8 +242,8 @@ What changes is the ratio. The prefill half shrinks toward the round-trip cost o
 `prefill_gain` grows without bound while `decode_gain` absorbs the moved work. A composite that
 weights prefill at all therefore rewards deferral, and certification cannot see it.
 
-**Therefore: no track may declare a nonzero `prefill_gain_exponent` on `main` until a
-WORK-PLACEMENT INVARIANT exists.** Either of these closes it; neither is built:
+**Therefore: no track in `SCORED_REGIMES_BY_TRACK` may declare a nonzero `prefill_gain_exponent`
+until a WORK-PLACEMENT INVARIANT exists.** Either of these closes it; neither is built:
 
 1. a per-token FLOOR on the prefill half, from a calibrated reference measured on the track's own
    hardware — a seed prefill cannot be faster than the reference by more than the calibration band;
@@ -245,4 +257,7 @@ reply with whatever it computes and move the remaining forward work past the bou
 prompts raise the cost of the attack; they do not make the measurement sound.
 
 The `0.0` exponent on `qwen3.8-27b-mtp-v1` is what makes this a future concern rather than a live
-one. It is not a placeholder to be raised casually.
+one for that track. It is not a placeholder to be raised casually.
+
+The Qwen 3.8 125B-A6B tracks DO score prefill, at exponent `0.25`, by the David ruling of
+2026-08-27. They are not in this table, and this limit does not govern them.

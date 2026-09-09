@@ -11,12 +11,11 @@ bench side implement it from this page.
 - No new message. No new field on the wire. The single-stream free-run verbs
   stay `free_decode_begin` and `free_decode_run`.
 - benchd splits its own parent clock at the boundary between the two verbs.
-  This is the same split the batched verbs already use.
 - The engine does not emit a timing. The engine must do all seed-prefill work
   inside `free_decode_begin`.
 - The track fixture declares `scored_batch_size: 1` and `scored_exponents`
-  `{prefill_gain_exponent: 0.25, decode_gain_exponent: 0.75}`. benchd
-  certifies both and seals the composite on the paired single-stream series.
+  `{prefill_gain_exponent: 0.25, decode_gain_exponent: 0.75}`. Those are the
+  exponents benchd raises the two gains to.
 
 ## 2. The two windows
 
@@ -63,48 +62,27 @@ the decode exponent (0.75) is larger than the prefill exponent (0.25).
 
 ## 4. What benchd seals
 
-In `results.json`, per accepted pair (field name unchanged from the batched
-series; the shape is the B=1 point of the same type):
+The ranked path of these tracks is `benchd iterate --mode official`, and it seals
+`score.json`. Per role it seals the per-token times of the legs
+(`baseline_prefill_seconds_per_token`, `baseline_decode_seconds_per_token`,
+`prefill_seconds_per_token`, `decode_seconds_per_token`), the two gains
+(`prefill_speedup`, `decode_speedup`) and the composite as the run's `score`.
+`metrics.paired_legs` carries one row for each measured pair.
+
+The gains are ratios of the summed per-token times over the pairs the fixture
+declares in `official_pairs`:
 
 ```
-pairs[].cohort_phase_windows = {
-  serial_prefill_window_seconds, candidate_prefill_window_seconds,
-  serial_decode_window_seconds,  candidate_decode_window_seconds,
-  prefill_token_total, decode_token_total
-}
-```
-
-At the top level of `results.json`, when the fixture declares the B=1 point:
-
-```
-composite_scored_exponents = { prefill_gain_exponent: 0.25, decode_gain_exponent: 0.75 }
-composite = { prefill_gain, decode_gain, composite_score,
-              composite_speedup_floor, composite_speedup_floor_met }
-composite_absent_reason = <string>     # present only when composite is absent
-```
-
-Exactly one of `composite` and `composite_absent_reason` is present.
-
-The gains are ratios of sums over the accepted pairs of the whole pinned pool:
-
-```
-prefill_gain = sum(serial_prefill_window_seconds) / sum(candidate_prefill_window_seconds)
-decode_gain  = sum(serial_decode_window_seconds)  / sum(candidate_decode_window_seconds)
+prefill_gain = sum(control prefill s/tok) / sum(candidate prefill s/tok)
+decode_gain  = sum(control decode s/tok)  / sum(candidate decode s/tok)
 composite    = prefill_gain ^ 0.25 * decode_gain ^ 0.75
 ```
 
-A serial candidate (`teacher_forced_v1` series, the calibration path) opens
-no prefill window on either leg. benchd then seals `composite_absent_reason`
-(naming the series) and no `composite`; the record stays valid. A single-stream
-free-run leg that carries no phase window is refused before the pair is
-accepted. A teacher-forced leg that carries a phase window is
-refused. The B=8 batched series keeps its meaning: its windows and its
-composite are unchanged.
+The window split of section 2 is what makes the two gains separable. Without it
+there is one whole-window number and no prefill half to score.
 
 ## 5. What does not change
 
 - `free_decode_begin` / `free_decode_run` request and response fields.
 - The captured engine-wire fixture (`ENGINE_WIRE_V1_SHA256`). No re-pin.
-- The serial band, the decode-only median, the floor (0.90) and the ceiling
-  (5.0) on the single-stream series.
-- The batched series (`scored_batch_size: 8`).
+- The whole window and its `seconds_per_token`. The split cannot move them.

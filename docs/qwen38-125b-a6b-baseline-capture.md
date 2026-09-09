@@ -13,23 +13,28 @@ These tracks store NO baseline pair. There is no pair in the constants, no pair
 in the track fixture, and no pair in a golden. A ranked run measures its own
 denominator (David ruling, 2026-09-08).
 
-A ranked run measures TWO legs on ONE box in ONE job, on the one fixed prompt
-the fixture's live golden carries:
+A ranked run measures the number of PAIRS the track fixture declares in
+`official_pairs` — 2 on both platforms (David ruling, 2026-09-09) — on ONE box
+in ONE job, on the one fixed prompt the fixture's live golden carries. Every
+pair is the same two legs in the same order:
 
 1. The SERIAL-CONTROL leg, on the organizer-staged reference tree. No
    speculation.
 2. The CANDIDATE leg, on the submission tree, at its declared draft depth.
 
-The score is the live ratio of the two:
+The two engines are strictly sequential and each leg loads the model once.
+benchd sums each role's per-token times over the pairs, and the aggregate is
+what the score, the floors and the bands read. Every control leg is band-checked
+on its own. The score is the live ratio of those aggregates:
 
 ```
 (ref_prefill_spt / cand_prefill_spt)^0.25 * (ref_decode_spt / cand_decode_spt)^0.75
 ```
 
-The speedup floors and the acceptance bands do not change. The band shape stays
-the MTP single-leg shape: prefill +/-5 % symmetric, decode +2 % up, decode down
-band DISABLED. What changed is the reference the shape is applied to. It is a
-live measurement, not a stored pair.
+The speedup floors and the acceptance bands do not change. The band shape is
+prefill +/-5 % symmetric, decode +2 % up, with the decode down band DISABLED.
+What changed is the reference the shape is applied to. It is a live measurement,
+not a stored pair.
 
 Leg 1 runs the reference tree's OWN engine and the reference tree's OWN weights.
 benchd finds both by re-rooting the candidate's own root-relative path into the
@@ -286,6 +291,15 @@ A ranked paired run seals these fields in `score.json` `metrics`:
   both platforms, David ruling 2026-09-09). A run that stops early keeps the
   pairs it measured in this list and seals no score.
 
+- `decode_speedup_floor`, `prefill_speedup_floor` — the two floors this run
+  enforced, from the track fixture's `decode_speedup_floor` and
+  `prefill_speedup_floor` (0.95 and 0.95, David ruling 2026-09-09). The
+  fixture is the only source: a fixture that declares neither refuses the run.
+- `passed_decode_speedup_floor`, `passed_prefill_speedup_floor` — whether each
+  live speedup reached its own floor. The floor beside each flag is the floor
+  the flag was decided against.
+
 `baseline_prefill_seconds_per_token` and `baseline_decode_seconds_per_token`
 carry the serial-control mean values, so the board reads them unchanged.
-`prefill_speedup`, `decode_speedup` and the score are the live ratios.
+`prefill_speedup`, `decode_speedup` and the score are the live ratios. A run
+that misses either floor seals no score.

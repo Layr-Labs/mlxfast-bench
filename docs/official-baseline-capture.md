@@ -1,9 +1,14 @@
 # Official baseline capture
 
-Class: runbook.
+Class: runbook. **Stored-pair tracks only.**
 
-This page tells you how to capture a track's official baseline pair. The pair is the serial
-prefill and decode seconds-per-token that the track scores against.
+This page tells you how to capture a STORED-PAIR track's official baseline pair. The pair is the
+serial prefill and decode seconds-per-token that such a track scores against.
+
+The Qwen 3.8 125B-A6B tracks store no pair. They measure their denominator live, on the box, in
+the same job, and they refuse `--capture-baseline` by name
+(`CAPTURE-RETIRED-FOR-LIVE-CONTROL-LEG`). What their boxes calibrate instead is a health band —
+see [`qwen38-125b-a6b-baseline-capture.md`](qwen38-125b-a6b-baseline-capture.md).
 
 Read [`track-release-branches.md`](track-release-branches.md) first. It gives the rules for the
 per-track baseline table. This page gives the procedure.
@@ -35,7 +40,7 @@ properties. Together they make sure that it cannot become a way to score without
 1. Run this procedure on the track's own benchmark hardware. Do not run it on a laptop.
 2. Merge the engine change first. Then verify it independently. Record the merged head SHA.
    A capture from an unmerged engine or an unverified engine is void.
-3. Build benchd from the track's release branch. Record its commit SHA.
+3. Build benchd from `main`. Record its commit SHA.
 4. Confirm that the track is pending in `crates/bench-core/src/constants.rs`.
 5. Stage the correctness golden and the transformed weights on the box.
 

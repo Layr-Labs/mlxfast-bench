@@ -7,6 +7,7 @@
 //! fixture key exactly as before (no `deny_unknown_fields`), so the real track fixtures — which
 //! still carry `timed_prompt_pool`, `allowed_modes`, `calibration`, … — parse unchanged.
 
+use bench_core::score::SpeedupFloors;
 use serde::Deserialize;
 
 /// The parsed `--contract` track fixture. Only the fields the official scored path consumes are
@@ -36,6 +37,53 @@ pub struct Contract {
     /// pairs than the track declares.
     #[serde(default)]
     pub official_pairs: Option<u32>,
+    /// THE DECODE SPEEDUP FLOOR this project's scored run must clear (David 2026-09-09: 0.95).
+    /// The fixture is the ONLY source on the scoring path — no flag, no environment, no default —
+    /// so a track cannot be scored against a floor it never declared, and each project sets its
+    /// own. See [`speedup_floors`].
+    #[serde(default)]
+    pub decode_speedup_floor: Option<f64>,
+    /// THE PREFILL SPEEDUP FLOOR this project's scored run must clear (David 2026-09-09: 0.95).
+    /// Declared and enforced exactly as [`Contract::decode_speedup_floor`]; the prefill axis is a
+    /// floor of its own, not a decode side effect.
+    #[serde(default)]
+    pub prefill_speedup_floor: Option<f64>,
+}
+
+/// The scored run's speedup floors, or the refusal naming what the fixture must declare.
+///
+/// Both floors are REQUIRED and each is refused on its own: an absent floor is not 0.95, and a
+/// fixture that declares one axis has still not declared the other. A declared value must be
+/// finite and positive — a floor of 0, NaN or a negative number gates nothing.
+pub fn speedup_floors(contract: &Contract, track_id: &str) -> Result<SpeedupFloors, String> {
+    Ok(SpeedupFloors {
+        decode: one_floor(
+            contract.decode_speedup_floor,
+            "decode_speedup_floor",
+            track_id,
+        )?,
+        prefill: one_floor(
+            contract.prefill_speedup_floor,
+            "prefill_speedup_floor",
+            track_id,
+        )?,
+    })
+}
+
+/// One axis of [`speedup_floors`].
+fn one_floor(declared: Option<f64>, field: &str, track_id: &str) -> Result<f64, String> {
+    match declared {
+        Some(v) if v.is_finite() && v > 0.0 => Ok(v),
+        Some(v) => Err(format!(
+            "the --contract track fixture for {track_id:?} declares {field}: {v}; a speedup floor \
+             must be finite and greater than 0 (David 2026-09-09 ruled 0.95/0.95)"
+        )),
+        None => Err(format!(
+            "the --contract track fixture for {track_id:?} declares no {field}; the official \
+             scored run refuses to guess a speedup floor (David 2026-09-09 ruled 0.95/0.95, \
+             configurable per project) — pin it in the fixture"
+        )),
+    }
 }
 
 /// The paired path's pair count, or the refusal naming what the fixture must declare.
@@ -228,5 +276,72 @@ mod official_pairs_tests {
             Contract::parse(br#"{"official_scoring_enabled": true, "official_pairs": 0}"#).unwrap();
         let err = official_pairs(&zero, "t").unwrap_err();
         assert!(err.contains("official_pairs: 0"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod speedup_floor_tests {
+    use super::*;
+
+    /// The floors come from the FIXTURE alone, one axis at a time, and an absent or unusable
+    /// value is a refusal that names the field and the track — never a silent 0.95.
+    #[test]
+    fn the_floors_come_from_the_fixture_alone() {
+        let ruled = Contract::parse(
+            br#"{"official_scoring_enabled": true, "official_pairs": 2,
+                 "decode_speedup_floor": 0.95, "prefill_speedup_floor": 0.95}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            speedup_floors(&ruled, "t"),
+            Ok(SpeedupFloors {
+                decode: 0.95,
+                prefill: 0.95
+            })
+        );
+
+        // A project may declare its own pair; benchd enforces what the fixture says.
+        let per_project =
+            Contract::parse(br#"{"decode_speedup_floor": 0.90, "prefill_speedup_floor": 0.80}"#)
+                .unwrap();
+        assert_eq!(
+            speedup_floors(&per_project, "t"),
+            Ok(SpeedupFloors {
+                decode: 0.90,
+                prefill: 0.80
+            })
+        );
+
+        // BOTH are required, and each refusal names its own field.
+        let decode_only = Contract::parse(br#"{"decode_speedup_floor": 0.95}"#).unwrap();
+        let err = speedup_floors(&decode_only, "qwen3.8-125b-a6b-cuda-v1").unwrap_err();
+        assert!(err.contains("declares no prefill_speedup_floor"), "{err}");
+        assert!(err.contains("qwen3.8-125b-a6b-cuda-v1"), "{err}");
+
+        let neither = Contract::parse(br#"{"official_scoring_enabled": true}"#).unwrap();
+        let err = speedup_floors(&neither, "t").unwrap_err();
+        assert!(err.contains("declares no decode_speedup_floor"), "{err}");
+        assert!(err.contains("David 2026-09-09"), "{err}");
+
+        // Non-finite / non-positive declarations gate nothing, so they are refused too.
+        for body in [
+            &br#"{"decode_speedup_floor": 0.0, "prefill_speedup_floor": 0.95}"#[..],
+            &br#"{"decode_speedup_floor": -0.5, "prefill_speedup_floor": 0.95}"#[..],
+        ] {
+            let c = Contract::parse(body).unwrap();
+            let err = speedup_floors(&c, "t").unwrap_err();
+            assert!(err.contains("finite and greater than 0"), "{err}");
+        }
+        // JSON has no NaN literal; a non-finite value reaches the resolver only as a struct.
+        let nan = Contract {
+            track_id: None,
+            official_scoring_enabled: None,
+            official_pairs: None,
+            decode_speedup_floor: Some(f64::NAN),
+            prefill_speedup_floor: Some(0.95),
+        };
+        assert!(speedup_floors(&nan, "t")
+            .unwrap_err()
+            .contains("finite and greater than 0"));
     }
 }

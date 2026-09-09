@@ -1,5 +1,9 @@
 # Parity completion gate — goal, instrument, and the frozen corpus
 
+**Track: `qwen3.8-27b-mtp-v1`, against the Qwen 3.6 27B corpus it was cut from.** This is a signed,
+frozen record of that program. Its corpora, prompt pools, token counts and track ids describe those
+tracks and no other. Do not read any figure here as a fact about the Qwen 3.8 125B-A6B tracks.
+
 > # ✅ SIGNED — this is the frozen gate definition
 >
 > **Signed by David, 2026-08-20**, via the structured Q-block interview recorded as

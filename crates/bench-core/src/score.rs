@@ -74,6 +74,32 @@ pub fn score_default_weights(
     )
 }
 
+/// THE TWO SPEEDUP FLOORS one scored run enforces and seals (David ruling 2026-09-09: 0.95 decode
+/// AND 0.95 prefill, properly enforced, configurable per project).
+///
+/// PER PROJECT: the `--contract` track fixture declares them (`decode_speedup_floor`,
+/// `prefill_speedup_floor`) and the official path REFUSES a fixture that does not — see
+/// `benchd::contract::speedup_floors`. One value carries the pair from that fixture to BOTH the
+/// gate ([`evaluate_timed_run`]) and the seal (`metrics.decode_speedup_floor` /
+/// `metrics.prefill_speedup_floor`), so what a run seals is what it enforced.
+///
+/// [`SpeedupFloors::DEFAULT`] — the [`SCORE_DECODE_SPEEDUP_FLOOR`] /
+/// [`SCORE_PREFILL_SPEEDUP_FLOOR`] constants — is the LOCAL (no `--contract`) default and nothing
+/// else. No scored run may reach it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpeedupFloors {
+    pub decode: f64,
+    pub prefill: f64,
+}
+
+impl SpeedupFloors {
+    /// The floors a LOCAL run (no `--contract`) uses: the ruled 0.95 / 0.95 constants.
+    pub const DEFAULT: SpeedupFloors = SpeedupFloors {
+        decode: SCORE_DECODE_SPEEDUP_FLOOR,
+        prefill: SCORE_PREFILL_SPEEDUP_FLOOR,
+    };
+}
+
 /// `BenchmarkScore.passesSpeedupFloors`: false if anything is non-finite, else both
 /// speedups must clear their floor.
 pub fn passes_speedup_floors(
@@ -196,6 +222,9 @@ pub struct TimedRunScoreEvaluation {
     pub decode_speedup: f64,
     pub prefill_speedup: f64,
     pub passes_floors: bool,
+    /// The floors `passes_floors` was decided against, carried so the failure message names the
+    /// floors the run actually enforced (never a constant it did not).
+    pub floors: SpeedupFloors,
     pub prefill_band: AcceptanceBandResult,
     pub decode_band: AcceptanceBandResult,
 }
@@ -220,8 +249,8 @@ impl TimedRunScoreEvaluation {
             return Some(speedup_floor_failure_message(
                 self.decode_speedup,
                 self.prefill_speedup,
-                SCORE_DECODE_SPEEDUP_FLOOR,
-                SCORE_PREFILL_SPEEDUP_FLOOR,
+                self.floors.decode,
+                self.floors.prefill,
             ));
         }
         if !self.passes_acceptance_bands() {
@@ -237,13 +266,16 @@ impl TimedRunScoreEvaluation {
 }
 
 /// `BenchmarkScore.evaluateTimedRun`. Prefill band uses the prefill up/down tolerances;
-/// decode band uses the decode up/down tolerances (all from `constants`).
+/// decode band uses the decode up/down tolerances (all from `constants`). `floors` is the run's
+/// resolved [`SpeedupFloors`] — the track fixture's pair on a scored run — and the evaluation
+/// carries it back, so the caller seals the floors this gate enforced.
 pub fn evaluate_timed_run(
     decode_spt: f64,
     prefill_spt: f64,
     baseline_decode_spt: f64,
     baseline_prefill_spt: f64,
     bands: AcceptanceBands,
+    floors: SpeedupFloors,
 ) -> TimedRunScoreEvaluation {
     let s = score_default_weights(
         decode_spt,
@@ -279,9 +311,10 @@ pub fn evaluate_timed_run(
         passes_floors: passes_speedup_floors(
             decode_speedup,
             prefill_speedup,
-            SCORE_DECODE_SPEEDUP_FLOOR,
-            SCORE_PREFILL_SPEEDUP_FLOOR,
+            floors.decode,
+            floors.prefill,
         ),
+        floors,
         prefill_band,
         decode_band,
     }
@@ -718,6 +751,7 @@ prefill_speedup=0.800000 floor=0.950000"
             0.1336139485703125,
             0.010605031949609375,
             TEST_BANDS,
+            SpeedupFloors::DEFAULT,
         );
         assert!((e.score - 1.0).abs() < 1e-12);
         assert!(e.passes_floors);
@@ -735,6 +769,7 @@ prefill_speedup=0.800000 floor=0.950000"
             0.1336139485703125,
             0.010605031949609375,
             TEST_BANDS,
+            SpeedupFloors::DEFAULT,
         );
         assert!(!e.passes_floors);
         let reason = e.first_failure_reason().unwrap();
@@ -743,11 +778,57 @@ prefill_speedup=0.800000 floor=0.950000"
 
     #[test]
     fn evaluate_timed_run_nonfinite_score_first() {
-        let e = evaluate_timed_run(0.1, 0.2, 0.0, 0.2, TEST_BANDS);
+        let e = evaluate_timed_run(0.1, 0.2, 0.0, 0.2, TEST_BANDS, SpeedupFloors::DEFAULT);
         assert!(!e.has_finite_score());
         assert_eq!(
             e.first_failure_reason().as_deref(),
             Some("computed score was not finite")
         );
+    }
+
+    /// THE FLOORS ARE THE RUN'S OWN (David 2026-09-09, per-project fixture floors): the gate is
+    /// decided against the floors the caller passed, the evaluation CARRIES them, and the failure
+    /// message names them — no constant is consulted anywhere in between.
+    ///
+    /// REVERT-PROOF: put `SCORE_*_SPEEDUP_FLOOR` back into `passes_speedup_floors` or into
+    /// `first_failure_reason` and the 0.90 arms below go red.
+    #[test]
+    fn evaluate_timed_run_enforces_the_floors_it_is_given() {
+        // A decode speedup of exactly 0.949 against the ruled 0.95 floor: refused, and the
+        // message names 0.950000.
+        let below = evaluate_timed_run(1.0, 1.0, 0.949, 1.0, TEST_BANDS, SpeedupFloors::DEFAULT);
+        assert!(!below.passes_floors);
+        assert!(below
+            .first_failure_reason()
+            .unwrap()
+            .contains("decode_speedup=0.949000 floor=0.950000"));
+        // Exactly AT the floor passes (>=, not >).
+        let at = evaluate_timed_run(1.0, 1.0, 0.95, 1.0, TEST_BANDS, SpeedupFloors::DEFAULT);
+        assert!(at.passes_floors);
+        // The SAME 0.949 decode passes a project whose fixture declares 0.90 — the floors are the
+        // fixture's, not the constants'.
+        let looser = SpeedupFloors {
+            decode: 0.90,
+            prefill: 0.90,
+        };
+        let e = evaluate_timed_run(1.0, 1.0, 0.949, 1.0, TEST_BANDS, looser);
+        assert!(e.passes_floors);
+        assert_eq!(e.floors, looser);
+        // Prefill is gated on its own axis, against its own floor.
+        let prefill_below =
+            evaluate_timed_run(1.0, 1.0, 1.0, 0.949, TEST_BANDS, SpeedupFloors::DEFAULT);
+        assert!(!prefill_below.passes_floors);
+        assert!(prefill_below
+            .first_failure_reason()
+            .unwrap()
+            .contains("prefill_speedup=0.949000 floor=0.950000"));
+        assert!(evaluate_timed_run(1.0, 1.0, 1.0, 0.949, TEST_BANDS, looser).passes_floors);
+    }
+
+    /// The no-contract default is the ruled pair, and it is the ONLY place the constants enter.
+    #[test]
+    fn default_floors_are_the_ruled_pair() {
+        assert_eq!(SpeedupFloors::DEFAULT.decode, 0.95);
+        assert_eq!(SpeedupFloors::DEFAULT.prefill, 0.95);
     }
 }

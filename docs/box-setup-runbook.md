@@ -2,9 +2,8 @@
 
 **Class:** runbook. Follow it as written.
 
-This document is the overview: what both box types share, the calibration of
-the official baseline pair, the differences at a glance, and the faults seen
-in practice. The step-by-step procedure per platform, each with a readiness
+This document is the overview: what both box types share, the box
+calibration, the differences at a glance, and the faults seen in practice. The step-by-step procedure per platform, each with a readiness
 checklist, is in its own runbook:
 
 - [`runbook-box-setup-cuda.md`](runbook-box-setup-cuda.md) for a DGX Spark
@@ -25,10 +24,12 @@ track rather than once per box, is [`runbook-new-engine.md`](runbook-new-engine.
 
 ## 2. Calibration: this box's health band
 
-Both Qwen 3.8 125B-A6B tracks measure their own denominator. A ranked run runs a
-SERIAL-CONTROL leg on the organizer-staged reference tree and a CANDIDATE leg on
-the submission tree, on this box, in the same job, and scores the live ratio.
-Nothing is pinned in the constants.
+Both Qwen 3.8 125B-A6B tracks measure their own denominator. A ranked run
+measures the pairs the track fixture declares in `official_pairs` — 2 on both
+platforms — on this box, in the same job. Every pair is a SERIAL-CONTROL leg on
+the organizer-staged reference tree and then a CANDIDATE leg on the submission
+tree, and the score is the live ratio of the summed per-token times. Nothing is
+pinned in the constants.
 
 What the box needs is its own HEALTH BAND for that control leg. Write it once
 per box with:
@@ -55,8 +56,9 @@ The ranked job then names both inputs: `MLXFAST_BASELINE_WORKSPACE` and
 `MLXFAST_BASELINE_CALIBRATION`.
 
 See [`qwen38-125b-a6b-baseline-capture.md`](qwen38-125b-a6b-baseline-capture.md)
-for the full procedure, and `docs/official-baseline-capture.md` for the
-stored-pair capture the legacy tracks still use.
+for the full procedure, and
+[`official-baseline-capture.md`](official-baseline-capture.md) for the
+stored-pair capture the earlier tracks still use.
 
 ## 3. Differences at a glance
 

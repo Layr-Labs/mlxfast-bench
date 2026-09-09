@@ -48,7 +48,7 @@ use bench_runner::{
 
 use crate::iterate::{
     dir_digest, dir_digest_weights, iterate_flow_windowed, DirDigest, HarnessIdentity, Mode,
-    RunDigests,
+    RunDigests, ScoringInputs,
 };
 use crate::score::{sha256_hex, ScorePayload};
 
@@ -57,6 +57,7 @@ use crate::score::{sha256_hex, ScorePayload};
 /// this file resolves it from the run's track id rather than reading a compile-time constant. An
 /// undeclared track refuses BY NAME before any golden is trusted.
 use bench_core::constants::{model_identity, TrackModelIdentity};
+use bench_core::score::SpeedupFloors;
 
 /// The benchd→worker spawn flag (`--speculative-protocol v1.1`) that opts the engine into
 /// advertising the v1.1 speculative surface, so its unsolicited hello carries the
@@ -3441,8 +3442,7 @@ fn run_local_iterate(
     args: &IterateArgs,
     golden: &GoldenFixture,
     digests: RunDigests<'_>,
-    baseline_prefill: f64,
-    baseline_decode: f64,
+    scoring: ScoringInputs,
     timed_only: bool,
     residency: WorkerResidency,
 ) -> Result<ScorePayload, String> {
@@ -3506,8 +3506,7 @@ fn run_local_iterate(
         iterate_flow_windowed(
             None,
             golden,
-            baseline_prefill,
-            baseline_decode,
+            scoring,
             args.mode,
             args.strict,
             true,
@@ -3537,8 +3536,7 @@ fn run_local_iterate(
         iterate_flow_windowed(
             Some(&mut session),
             golden,
-            baseline_prefill,
-            baseline_decode,
+            scoring,
             args.mode,
             args.strict,
             false,
@@ -3945,6 +3943,31 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
     } else {
         None
     };
+    // SPEEDUP FLOORS (David 2026-09-09: 0.95 decode AND 0.95 prefill, enforced, configurable per
+    // project). The pinned track fixture is the ONLY source on the scored path — no flag, no
+    // environment, no default — so a track cannot be scored against a floor it never declared. The
+    // arm gate above already parsed the fixture for `--mode official`. A LOCAL run takes the floors
+    // from --contract when one is given, and otherwise runs against the constants and says so:
+    // local numbers are directional, and the scored floors are pinned where the scored run reads
+    // them. ONE value from here reaches every gate and every seal of this run.
+    let floors = match (official_contract.as_ref(), args.contract.as_deref()) {
+        (Some(contract), _) => contract::speedup_floors(contract, &track_id)?,
+        (None, Some(path)) => {
+            let bytes = std::fs::read(path)
+                .map_err(|e| format!("--contract read failed ({}): {e}", path.display()))?;
+            contract::speedup_floors(&contract::Contract::parse(&bytes)?, &track_id)?
+        }
+        (None, None) => {
+            eprintln!(
+                "benchd iterate: local run without --contract uses the default speedup floors \
+                 (decode {}, prefill {}); the scored path takes decode_speedup_floor and \
+                 prefill_speedup_floor from the track fixture",
+                SpeedupFloors::DEFAULT.decode,
+                SpeedupFloors::DEFAULT.prefill
+            );
+            SpeedupFloors::DEFAULT
+        }
+    };
     // THE RANKED PAIRED PATH's fences, PRE-GPU (David 2026-09-08). A live-control-leg track
     // measures its own denominator, so every STORED-pair door is closed before anything spawns:
     // the trusted env override, the `--baseline-*` flags, and a golden that still declares a pair.
@@ -4052,8 +4075,11 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
             args,
             &golden,
             digests,
-            0.0,
-            0.0,
+            ScoringInputs {
+                baseline_prefill_spt: 0.0,
+                baseline_decode_spt: 0.0,
+                floors,
+            },
             args.capture_timed_only,
             residency,
         )?;
@@ -4121,7 +4147,11 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
             gates_only_baselines(track_id_env.as_deref(), effective_override, &golden)?;
         official::official_gates_only(
             &golden,
-            (baseline_prefill, baseline_decode),
+            ScoringInputs {
+                baseline_prefill_spt: baseline_prefill,
+                baseline_decode_spt: baseline_decode,
+                floors,
+            },
             digests,
             &commit,
             spawn_correctness,
@@ -4453,6 +4483,7 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                 platform,
                 cool_gate: official_cool_gate,
                 pairs,
+                floors,
             },
         );
         if let Some(hello) = timed_hello.borrow().as_ref() {
@@ -4480,7 +4511,18 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
             );
         }
         // The non-capture local path is never timed-only: it always runs the correctness gate.
-        run_local_iterate(args, &golden, digests, prefill, decode, false, residency)?
+        run_local_iterate(
+            args,
+            &golden,
+            digests,
+            ScoringInputs {
+                baseline_prefill_spt: prefill,
+                baseline_decode_spt: decode,
+                floors,
+            },
+            false,
+            residency,
+        )?
     } else if baseline_decision == RunBaselines::Unscored {
         // THE UNSCORED LOCAL RUN (David 2026-09-08). This track measures its denominator on the
         // ranked box against the organizer's reference tree, and this box has no reference tree,
@@ -4492,7 +4534,18 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
         // The `(0.0, 0.0)` pair IS the "no denominator" statement, and `seal_local_unscored`
         // finishes it: `score` stays null, `baseline_source` says why, and the placeholder
         // "score is not finite" text is cleared for a run whose correctness passed.
-        let mut payload = run_local_iterate(args, &golden, digests, 0.0, 0.0, false, residency)?;
+        let mut payload = run_local_iterate(
+            args,
+            &golden,
+            digests,
+            ScoringInputs {
+                baseline_prefill_spt: 0.0,
+                baseline_decode_spt: 0.0,
+                floors,
+            },
+            false,
+            residency,
+        )?;
         iterate::seal_local_unscored(&mut payload);
         let m = &payload.metrics;
         eprintln!(
@@ -4545,8 +4598,11 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                 &golden,
                 digests,
                 iterate::missing_paired_baselines_error(args.mode),
-                official.prefill_seconds_per_token,
-                official.decode_seconds_per_token,
+                ScoringInputs {
+                    baseline_prefill_spt: official.prefill_seconds_per_token,
+                    baseline_decode_spt: official.decode_seconds_per_token,
+                    floors,
+                },
             ),
             // B-2 OFFICIAL: timed-first, three fresh SANDBOXED workers, full correctness set,
             // benchmark-oracle checks, official floor/band/finite gating, and a stamped commit.
@@ -4626,8 +4682,11 @@ fn execute_iterate(args: &IterateArgs) -> Result<bool, String> {
                 };
                 let mut payload = official::official_core_windowed(
                     &golden,
-                    baseline_prefill,
-                    baseline_decode,
+                    ScoringInputs {
+                        baseline_prefill_spt: baseline_prefill,
+                        baseline_decode_spt: baseline_decode,
+                        floors,
+                    },
                     official.bands,
                     digests,
                     &commit,
@@ -6473,8 +6532,10 @@ mod tests {
             &golden,
             RunDigests::for_test(&weights),
             "local-iterate requires external Qwen benchmark baselines".to_string(),
-            crate::testgolden::TEST_BASELINE.prefill_seconds_per_token,
-            crate::testgolden::TEST_BASELINE.decode_seconds_per_token,
+            ScoringInputs::local(
+                crate::testgolden::TEST_BASELINE.prefill_seconds_per_token,
+                crate::testgolden::TEST_BASELINE.decode_seconds_per_token,
+            ),
         );
         assert!(!failing.passed, "precondition: this is a FAILING payload");
         assert!(
@@ -6982,8 +7043,7 @@ mod tests {
         let mut payload = iterate::local_iterate_score(
             Mode::LocalIterate,
             &timing,
-            0.0,
-            0.0,
+            ScoringInputs::local(0.0, 0.0),
             &golden,
             iterate::RunDigests::for_test(&DirDigest::empty()),
         );
@@ -7033,8 +7093,7 @@ mod tests {
         let mut failed = iterate::local_iterate_score(
             Mode::LocalIterate,
             &timing,
-            0.0,
-            0.0,
+            ScoringInputs::local(0.0, 0.0),
             &golden,
             iterate::RunDigests::for_test(&DirDigest::empty()),
         );
@@ -7864,8 +7923,10 @@ mod tests {
             &golden,
             RunDigests::for_test(&DirDigest::empty()),
             err.clone(),
-            crate::testgolden::TEST_BASELINE.prefill_seconds_per_token,
-            crate::testgolden::TEST_BASELINE.decode_seconds_per_token,
+            ScoringInputs::local(
+                crate::testgolden::TEST_BASELINE.prefill_seconds_per_token,
+                crate::testgolden::TEST_BASELINE.decode_seconds_per_token,
+            ),
         );
         assert!(!p.passed);
         assert!(p.score.is_none());
@@ -8102,6 +8163,50 @@ mod tests {
 
         // MISSING --contract — fail-closed usage refusal.
         assert!(enforce_official_arm_gate(None, track).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DAVID 2026-09-09 — THE SCORED PATH TAKES ITS SPEEDUP FLOORS FROM THE TRACK FIXTURE, and an
+    /// ARMED fixture that declares none REFUSES. This drives the exact pair of calls
+    /// `execute_iterate` makes on `--mode official`: the arm gate parses the fixture, and
+    /// `contract::speedup_floors` resolves the floors out of that same parsed contract. Reds if a
+    /// default (0.95 or anything else) is ever substituted for an undeclared floor.
+    #[test]
+    fn official_refuses_a_fixture_that_declares_no_speedup_floors() {
+        let dir = std::env::temp_dir().join(format!("floors-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        let track = Some("qwen3.8-125b-a6b-mlx-v1");
+
+        // ARMED, but silent about the floors: the run refuses rather than guessing one.
+        let silent = write(
+            "silent.json",
+            r#"{"track_id":"qwen3.8-125b-a6b-mlx-v1","official_scoring_enabled":true,"official_pairs":2}"#,
+        );
+        let contract = enforce_official_arm_gate(Some(&silent), track).expect("armed");
+        let err = contract::speedup_floors(&contract, "qwen3.8-125b-a6b-mlx-v1")
+            .expect_err("an armed fixture with no floors must refuse");
+        assert!(err.contains("declares no decode_speedup_floor"), "{err}");
+        assert!(err.contains("qwen3.8-125b-a6b-mlx-v1"), "{err}");
+
+        // DECLARED — the ruled pair is what the run enforces and seals.
+        let declared = write(
+            "declared.json",
+            r#"{"track_id":"qwen3.8-125b-a6b-mlx-v1","official_scoring_enabled":true,
+                "official_pairs":2,"decode_speedup_floor":0.95,"prefill_speedup_floor":0.95}"#,
+        );
+        let contract = enforce_official_arm_gate(Some(&declared), track).expect("armed");
+        assert_eq!(
+            contract::speedup_floors(&contract, "qwen3.8-125b-a6b-mlx-v1"),
+            Ok(SpeedupFloors {
+                decode: 0.95,
+                prefill: 0.95
+            })
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1,7 +1,8 @@
-# Track release branches
+# How a track binds to this repo
 
-How model tracks bind to this repo. Ruled 2026-08-22 (engine fork = new repo per track family;
-bench side = a release branch here — no per-track bench forks).
+benchd is developed and published from `main`. There is no per-track development branch and no
+per-track bench fork (David ruling, 2026-09-07). A track's engine repo pins ONE benchd commit, and
+it reads the bytes of that commit from a published channel.
 
 ## Two names, two jobs
 
@@ -9,55 +10,43 @@ A track uses two names. Do not treat them as one name.
 
 | name | what it identifies | where it is used |
 |---|---|---|
-| **release branch** | the PROJECT — one model generation's measurement work in this repo | the branch in this repo; the `.gitmodules` tracking hint; the dist channel |
-| **`track_id`** | the PLATFORM — one model generation on one hardware platform | the sealed `track_id` field; the R2 key prefix; the ranked-board row |
+| **`track_id`** | the PLATFORM — one model generation on one hardware platform | the sealed `track_id` field; the R2 key prefix; the runner label; the ranked-board row |
+| **channel branch** | the PROJECT — the branch that carries the published `dist/` for one model generation | the `branch` field of `benchd.manifest.json`; the engine's `BENCHD_DIST_BRANCH` |
 
-A release branch can serve more than one platform. The MLX track and the CUDA track of the same
-model generation measure the same way, so they CAN share one branch and one benchd. Sharing is a
-choice, not a rule: the two qwen 3.8 27B tracks in the table below each took their own branch.
-Platforms that share a branch still do not share a `track_id`. Each platform keeps its own
-`track_id`, its own R2 key prefix, and its own goldens. This is why the two names are separate.
+One channel branch serves every platform of one model generation. The Qwen 3.8 125B-A6B project
+publishes on `qwen3.8-125b-a6b-v1`, and both the MLX and the CUDA engine read it. The branch holds
+merges of `main` plus the republished `dist/` directories and nothing else, so the bytes it
+publishes always name a commit on `main` in `source_commit`.
 
-Every track in the table below currently serves ONE platform. Where such a track also cut its own
-branch, the two names came out as the same string. The rule is the same rule; the two names simply
-agree here. The grandfathered `main` track shows that they do not always agree, even for one
-platform.
+Platforms that share a channel do not share a `track_id`. Each platform keeps its own `track_id`,
+its own R2 key prefix and its own goldens.
 
 ## Name construction
 
-Build both names the same way:
+Build a `track_id` this way:
 
 ```
 {model}{ver}-{params}-{platform}-v{N}
 ```
 
-Names are **decoder-neutral**. Never put a spec-decoder kind (`mtp`, `dflash`, `dspark`) in a
-branch name or a track name. A version bump (`-v{N+1}`) is a new track generation: a new branch, a
-new R2 key namespace, and re-authored goldens.
+Names are **decoder-neutral**. Never put a spec-decoder kind (`mtp`, `dflash`, `dspark`) in a track
+name. A version bump (`-v{N+1}`) is a new track generation: a new R2 key namespace and re-authored
+goldens.
 
-When one branch serves two platforms, name the branch for the platform that cut it. The second
-platform then adds its own `track_id` on that same branch. The branch name does not change.
+| Track | `track_id` | channel branch |
+|---|---|---|
+| qwen 3.8 125B-A6B MLX | `qwen3.8-125b-a6b-mlx-v1` | `qwen3.8-125b-a6b-v1` |
+| qwen 3.8 125B-A6B CUDA | `qwen3.8-125b-a6b-cuda-v1` | `qwen3.8-125b-a6b-v1` |
+| qwen 3.8 27B MLX | `qwen3.8-27b-mtp-v1` | `main` |
+| gemma 4 26B A4B MLX | `gemma4-26b-a4b-mlx-v1` | `gemma4-26b-a4b-mlx-v1` |
 
-| Track | Release branch | `track_id` | Engine repo |
-|---|---|---|---|
-| qwen 3.8 27B MLX | `main` (grandfathered) | `qwen3.8-27b-mtp-v1` | `mlxfast-qwen-38-27b-mtp-engine` (rename pending) |
-| qwen 3.8 27B CUDA | `qwen3.8-27b-cuda-v1` | `qwen3.8-27b-cuda-v1` | `cudafast-engine` family |
-| gemma 4 26B A4B MLX | `gemma4-26b-a4b-mlx-v1` | `gemma4-26b-a4b-mlx-v1` | `mlxfast-gemma4-26b-a4b-engine` |
+Each engine repo is named `{mlxfast|cudafast}-{model}{ver}-{params}-engine`.
 
-Read the first row: the grandfathered qwen 3.8 27B MLX track runs on branch `main` but seals
-`track_id` `qwen3.8-27b-mtp-v1`. The two names already differ on a live track today. That track
-also predates the decoder-neutral rule, which is why its `track_id` still carries `mtp`.
+`qwen3.8-27b-mtp-v1` predates the decoder-neutral rule, which is why its name still carries `mtp`.
+It is also the value of `TRACK_ID` in `crates/bench-core/src/constants.rs`.
 
-## Branch lifecycle
-
-1. **Cut** from current `main` at the track's re-baseline step — a deliberate, reviewed baseline
-   choice made once, when the track's engine repo advances its benchd gitlink off the pin it
-   inherited from its seed.
-2. **Carries** the track's measurement work: measure modes and their series tags, the track's
-   wire-crosscheck fixture, calibration entries. Calibration series tags encode the measurement
-   regime (and, for batched tracks, the batch size) — the series fence refuses cross-series
-   comparison, so a tag change is a semantic act.
-3. **Consumed** by the track's engine repo through one of the two channels below.
+The steps that stand up a new track are in
+[`runbook-new-engine.md`](runbook-new-engine.md).
 
 ## How an engine repo resolves this repo
 
@@ -65,9 +54,8 @@ An engine repo gets benchd through ONE of two channels. Both channels resolve to
 Neither channel lets the engine repo choose a different benchd at run time.
 
 **Channel 1 — SHA-pinned submodule.** The engine repo carries this repo as a submodule. The
-gitlink IS the pin. `.gitmodules` names the release branch as the tracking hint only; the hint
-does not select the commit. Advance the pin in a deliberate two-verdict PR on the engine side.
-Verify containment with a remote-tracking branch:
+gitlink IS the pin. Advance the pin in a deliberate two-verdict PR on the engine side. Verify
+containment with a remote-tracking branch:
 
 ```
 git -C benchd branch -r --contains $(git rev-parse HEAD:benchd)
@@ -84,17 +72,17 @@ came from:
 |---|---|---|
 | `sha256` | the digest of the published bytes | integrity |
 | `bytes` | the byte count of the published bytes | integrity |
-| `branch` | which release branch published this benchd | provenance |
-| `source_commit` | which commit on that branch the build came from | provenance |
+| `branch` | which channel branch published this benchd | provenance |
+| `source_commit` | which commit the build came from | provenance |
 
 `sha256` and `bytes` together are the integrity pin. Verify both before use. Refuse a manifest
 whose `sha256` or `bytes` does not agree with the published bytes. Do not fall back to an
 unverified benchd.
 
 `branch` and `source_commit` are provenance. They are not checks, and they cannot be verified
-against the bytes. They record which release branch published the benchd, and which commit the
-build came from, so a reader can find the source. Keep them correct: a wrong value here does not
-stop a run, but it sends the next reader to the wrong source.
+against the bytes. They record which channel published the benchd, and which commit the build came
+from, so a reader can find the source. Keep them correct: a wrong value here does not stop a run,
+but it sends the next reader to the wrong source.
 
 The channel publishes more than one binary from that one `source_commit`. The four fields above
 describe `benchd`. A fifth field, `binaries`, gives the same integrity pair — `sha256` and
@@ -127,12 +115,20 @@ A track scores against a baseline in ONE of two ways. The two never mix.
 ### Live-control-leg tracks
 
 Ruled by David on 2026-09-08. Each ranked box has its own baseline, and the
-baseline is a MEASUREMENT, not a pin. A ranked run measures TWO legs on ONE box
-in ONE job, on the one fixed prompt the fixture's live golden carries:
+baseline is a MEASUREMENT, not a pin. A ranked run measures the number of PAIRS
+the track fixture declares in `official_pairs` — 2 on both platforms — on ONE
+box in ONE job, on the one fixed prompt the fixture's live golden carries. Every
+pair is the same two legs in the same order:
 
 1. the SERIAL-CONTROL leg on the organizer-staged reference tree
    (`MLXFAST_BASELINE_WORKSPACE`), with no speculation;
 2. the CANDIDATE leg on the submission tree, at its declared draft depth.
+
+The two engines are strictly sequential and each leg loads the model once. benchd
+sums each role's per-token times over the pairs, and the floors and the bands
+apply to that aggregate. Every control leg is band-checked on its own. A fixture
+that declares no `official_pairs` refuses the ranked run; benchd never guesses
+the count.
 
 Leg 1 runs the reference tree's OWN engine and the reference tree's OWN weights.
 Both are found by re-rooting the candidate's own root-relative path into the
@@ -140,8 +136,9 @@ reference tree, so the two legs differ by their tree and by nothing else. The
 transform that produces the weights is participant-editable, so the control leg
 must never load the candidate's transform output.
 
-The score is `(ref_prefill / cand_prefill)^0.25 * (ref_decode / cand_decode)^0.75`.
-The floors and the band shape do not change.
+The score is the live ratio of the aggregates,
+`(ref_prefill / cand_prefill)^0.25 * (ref_decode / cand_decode)^0.75`, at batch
+size 1 on one stream.
 
 These tracks store NO pair. There is none in the constants, none in the fixture
 and none in a golden, and every door a stored pair could come through is shut BY
@@ -302,6 +299,6 @@ Track goldens are authored on the track's designated benchmark hardware, A≡B d
 R2 under `{track_id}/{sha256}.json` once the track is stable and ready for testing — with
 GET + sha + bytes round-trip verification after upload.
 
-The R2 key prefix is the **`track_id`**, not the branch name. Two platforms that share one release
-branch therefore keep two separate golden namespaces. Each platform authors its goldens on its own
+The R2 key prefix is the **`track_id`**, not a branch name. Two platforms of one model generation
+therefore keep two separate golden namespaces. Each platform authors its goldens on its own
 hardware, so the two namespaces must not be merged.

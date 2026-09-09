@@ -96,6 +96,10 @@ job passes every `*.json` there as a golden.
     first job verifies the full checkpoint hash once and writes a trusted
     stamp in that directory; later jobs skip the hash while the stamp is
     present.
+  - `MLXFAST_BASELINE_WORKSPACE`: the organizer-staged reference tree, built
+    (section 7).
+  - `MLXFAST_BASELINE_CALIBRATION`: this box's `baseline-calibration.json`
+    (section 7).
   - `MLXFAST_MACMON_BIN`: the `macmon` binary when it is not at
     `/opt/homebrew/bin/macmon`.
   - `MLXFAST_FORK_MIRROR`: a bare mirror of the engine fork repository,
@@ -114,7 +118,33 @@ job passes every `*.json` there as a golden.
   the runner user's `~/.cache/mlxfast-engine-build`. A box with a staged
   engine checkout can seed the cache with `tools/build-cache.sh save`.
 
-## 7. The measurement topology
+## 7. The reference tree and this box's health band
+
+The track pins no serial pair. A ranked run measures the pairs the track fixture
+declares in `official_pairs` — 2 on both platforms — and every pair times a
+serial-control leg on the reference tree and then the candidate leg. The score
+is the live ratio.
+
+So the box carries the organizer-staged reference tree, built, and its own
+calibration file. Write the file once on the box, and again whenever the
+organizer moves the reference tree:
+
+```bash
+flock /tmp/mtplx-gpu-exclusive.lock -c '
+  benchd calibrate-baseline \
+    --baseline-workspace "$REFERENCE_WORKSPACE" \
+    --engine .build/release/bench-worker \
+    --golden "$LIVE_GOLDEN" \
+    --passes 4 \
+    --out "$REFERENCE_WORKSPACE/baseline-calibration.json"'
+```
+
+The file is a health band for the control leg, never a denominator. The verb
+refuses by name (`CALIBRATION-CV-EXCEEDED`) when the box is too noisy for a mean
+to describe it. The full procedure is in
+[`qwen38-125b-a6b-baseline-capture.md`](qwen38-125b-a6b-baseline-capture.md).
+
+## 8. The measurement topology
 
 The engine's `bench-worker` runs as a resident that every phase attaches to, so
 the model loads once. Three concurrent fresh workers would need about 190 GiB,
@@ -127,13 +157,12 @@ which is what the resident prevents. WHO starts it depends on the path:
   this path: a single resident serves the candidate tree's weights, and the
   reference leg's worker refuses them by name. An inherited
   `BENCH_WORKER_RESIDENT_SOCKET` is refused (`LEG-SERVE-INHERITED-SOCKET`).
-- **A single-leg run** (a LOCAL UNSCORED run) has one tree and one leg, so the
-  measure script's own `tools/resident-up.sh` wrap is exactly right and is
-  untouched.
+- **A LOCAL UNSCORED run** has one tree and one leg, so the measure script's
+  own `tools/resident-up.sh` wrap is exactly right and is untouched.
 
 The GPU lock is held by the outermost process for the whole window either way.
 
-## 8. Local checks
+## 9. Local checks
 
 ```bash
 MLXFAST_ENGINE_BIN=.build/release/mlxfast-runtime-worker \
@@ -144,18 +173,20 @@ MLXFAST_CORRECTNESS_GOLDEN_PATH=correctness_prompts/public_longcopy_gate_english
 The local test has no default golden; the variable must be set. Do not pass
 `--golden`, `--weights` or `--score-path`; the script rejects them.
 
-## 9. Dispatch and receipt
+## 10. Dispatch and receipt
 
 ```bash
-gh workflow run benchmark.yml --ref <release branch>
+gh workflow run benchmark.yml --ref <engine branch>
 ```
 
 The box job runs the preflight, fetches the pair, runs `setup.sh` (toolchain
 check, Swift build, `mlx.metallib`, checkpoint download and verification),
-waits for quiescence, and measures. A passing serial run near 1.0 against the
-track's pinned baseline pair is the readiness receipt.
+waits for quiescence, and measures. The run is paired: it measures the pairs the
+track fixture declares, and each pair times the reference tree and then the
+submission tree. A serial declaration puts two serial legs against each other,
+so the readiness receipt is a passing run that scores near 1.00.
 
-## 10. Readiness checklist
+## 11. Readiness checklist
 
 - [ ] macOS 14+, Swift 6, full `Xcode.app` selected, license accepted, `xcrun -sdk macosx metal -v` runs
 - [ ] CMake, Git, and `macmon` at `/opt/homebrew/bin/macmon`
@@ -167,5 +198,6 @@ track's pinned baseline pair is the readiness receipt.
 - [ ] iogpu wired limit pinned by the boot daemon (`sysctl iogpu.wired_limit_mb`)
 - [ ] `./setup.sh` completes: toolchain, Metal kernels, checkpoint verified, `weights/` transformed
 - [ ] local `benchmark.sh --local-iterate` passes correctness on the public golden
+- [ ] reference tree built and calibrated; `MLXFAST_BASELINE_WORKSPACE` and `MLXFAST_BASELINE_CALIBRATION` in the runner `.env`
 - [ ] one `workflow_dispatch` of `benchmark.yml` passes end to end
-- [ ] sealed serial score near 1.0 against the pinned baseline pair
+- [ ] sealed serial score near 1.00 on the paired run

@@ -150,17 +150,17 @@ The engine repository is internal. The box holds no GitHub credential. The
 ranked job does not need one: Actions supplies its own token to the
 checkout. The operator checkout for the local checks (step 10) comes from a
 bundle. Make the bundle on a machine that has access, at the tip to be
-dispatched (the release branch):
+dispatched (the engine branch):
 
 ```bash
 # on the machine with access
 git -C <engine clone> fetch origin
-git -C <engine clone> bundle create engine-<sha>.bundle <release branch>
+git -C <engine clone> bundle create engine-<sha>.bundle <engine branch>
 shasum -a 256 engine-<sha>.bundle
 scp engine-<sha>.bundle <box>:~/
 # on the box
 sha256sum ~/engine-<sha>.bundle
-git clone ~/engine-<sha>.bundle -b <release branch> <root>/engine
+git clone ~/engine-<sha>.bundle -b <engine branch> <root>/engine
 ```
 
 Make sure that the two sha256 values are equal before the clone. A truncated
@@ -310,7 +310,7 @@ export SERVE_UP_SPEC_DRAFT_LEN="$(./tools/spec-declaration.sh draft-len)"
 ./tools/spec-declaration.sh describe
 ```
 
-The last command prints `serial` or the declared depth. The release branch
+The last command prints `serial` or the declared depth. The engine branch
 prints `mtp1` since the depth-1 promotion of 2026-09-04.
 
 ### 10a. The correctness check
@@ -325,10 +325,9 @@ jq '.metrics.passed_correctness, .passed, .score' score.local-iterate.json
 ```
 
 The receipt is exit code 0 and `passed_correctness` true in
-`score.local-iterate.json`. The flag is under `.metrics`. The score is not
-a readiness figure. The public golden has no baseline of its own, so
-benchd scores this 1024-token prompt against the pool baseline. Healthy
-boxes read 0.95 on a serial declaration and 1.16 to 1.19 on `mtp1`.
+`score.local-iterate.json`. The flag is under `.metrics`. The score is not a
+readiness figure: a local run with no reference tree measures the candidate leg
+only and seals `score: null`. Read `passed_correctness`, not the score.
 
 Time: three to six minutes. The weights digest of 114 GB takes 85 seconds.
 The gate then waits for the GPU to cool.
@@ -354,10 +353,11 @@ flock /tmp/mtplx-gpu-exclusive.lock -c '
 jq '.passed, .score, .metrics.effective_spec_depth' score.json
 ```
 
-The receipt is `passed: true` in `score.json`. The score depends on the
-declaration. On a serial declaration it is 1.008 (two boxes, 2026-09-04).
-On `mtp1` it is 1.07 to 1.09 (seven fleet boxes, 2026-09-05). Time: two to
-three minutes once the engine is built.
+The receipt is `passed: true` in `score.json`. The run is paired, so the score
+is the live ratio of the reference legs to the candidate legs: a serial
+declaration puts two serial legs against each other and scores near 1.00, and a
+depth declaration scores above it. Time: two to three minutes once the engine is
+built.
 
 Both files are gitignored. The tree stays clean.
 
@@ -379,94 +379,67 @@ gh api repos/Layr-Labs/cudafast-qwen38-125b-a6b-engine-dev/actions/runners --jq 
 ## 12. Dispatch and receipt
 
 ```bash
-gh workflow run benchmark.yml --ref <release branch>
+gh workflow run benchmark.yml --ref <engine branch>
 ```
 
 The box job checks the runner environment, runs the preflight, verifies the
 pair, builds the engine, and measures under the lock. The build takes 90
 seconds from cold. A content-keyed cache skips it when the tree is
-unchanged. A passing run in the score band of step 10b is the readiness
-receipt. One dispatch per fleet is sufficient. GitHub assigns the job to
-any idle runner with the label.
+unchanged. A passing run of step 10b is the readiness receipt. One dispatch
+per fleet is sufficient. GitHub assigns the job to any idle runner with the
+label.
 
-## 13. Baseline calibration on a fleet box
+## 13. The reference tree and this box's health band
 
-RETIRED for this track (David 2026-09-08). The CUDA track no longer pins a
-serial pair: a ranked run measures a SERIAL-CONTROL leg on the reference tree
-and scores the live ratio against it. What a box carries instead is its own
-health band, written once by `benchd calibrate-baseline`. Follow
-[`qwen38-125b-a6b-baseline-capture.md`](qwen38-125b-a6b-baseline-capture.md).
+The CUDA track pins no serial pair. A ranked run measures the pairs the track
+fixture declares in `official_pairs` — 2 on both platforms — and every pair
+times a SERIAL-CONTROL leg on the reference tree and then the candidate leg. The
+score is the live ratio.
 
-The rest of this section describes the retired stored-pair capture. It is kept
-for the legacy tracks that still pin a pair, and for readers of older runs.
+So the box carries two things instead of a pinned pair:
 
-`tools/qwen4exp-calibrate.sh` in the engine repository measured the pair on a
-box. The driver applied nothing. It wrote `calibration.json` and a constants
-patch into its run directory. Pinning was a reviewed PR against benchd.
+| name | what it holds |
+|---|---|
+| `MLXFAST_BASELINE_WORKSPACE` | the organizer-staged reference tree, built |
+| `MLXFAST_BASELINE_CALIBRATION` | this box's `baseline-calibration.json` |
 
-The driver had two preconditions that a ranked box does not meet:
-
-- The declared spec must be `serial`. The release branch declares a depth.
-  Use a checkout of `main`, whose manifest is serial.
-- The benchd pair must be capture-armed: a build whose track row is absent from
-  `OFFICIAL_BASELINES_BY_TRACK`. A pinned pair
-  refuses `--capture-baseline`. Build the pair from the bench repository at
-  the commit before the pin (`0ca32e2` for this track) with
-  `cargo build --release -p benchd --bin benchd --bin record-correctness-golden`.
-  Put it in its own directory with a `benchd.manifest.json` in the
-  channel's layout: one top-level key per line, and each `binaries` entry
-  on one line. `fetch-benchd.sh` parses the manifest with `sed`, not `jq`.
-  A multi-line entry fails with "manifest sha256 is not 64 lowercase hex
-  characters".
-
-The seed box serves both from `~/fleet-share` on port 8766, the same way
-as the weights. Stage them on the box. Then run the driver detached:
+Write the calibration file once on the box, and again whenever the organizer
+moves the reference tree:
 
 ```bash
-C=$HOME/fleet-calib; mkdir -p "$C"; cd "$C"
-curl -sSf -O http://<peer LAN address>:8766/engine-main-<sha>.bundle
-curl -sSf -O http://<peer LAN address>:8766/engine-main-<sha>.bundle.sha256
-sha256sum -c --quiet engine-main-<sha>.bundle.sha256
-git clone -q engine-main-<sha>.bundle -b main engine
-mkdir -p benchd-pair-0ca32e2 && cd benchd-pair-0ca32e2
-for f in benchd record-correctness-golden benchd.manifest.json SHA256SUMS; do curl -sSf -O "http://<peer LAN address>:8766/benchd-pair-0ca32e2/$f"; done
-sha256sum -c --quiet SHA256SUMS && chmod +x benchd record-correctness-golden
-cd "$C/engine"
-export PATH=$HOME/.cargo/bin:/usr/local/cuda/bin:$PATH
-export BENCHD_BIN_DIR=$C/benchd-pair-0ca32e2 MLXFAST_TARGET_SNAPSHOT_DIR=<root>/weights/gguf-unsloth-q4
-./tools/spec-declaration.sh describe                       # must print: serial
-./setup.sh
-nohup tools/qwen4exp-calibrate.sh --weights "$MLXFAST_TARGET_SNAPSHOT_DIR" --lock-wait 7200 > "$C/calibrate.log" 2>&1 </dev/null &
+flock /tmp/mtplx-gpu-exclusive.lock -c '
+  benchd calibrate-baseline \
+    --baseline-workspace "$REFERENCE_WORKSPACE" \
+    --engine "$ENGINE_RELATIVE_PATH" \
+    --golden "$LIVE_GOLDEN" \
+    --passes 4 \
+    --out "$REFERENCE_WORKSPACE/baseline-calibration.json"'
 ```
 
-The driver takes the GPU lock itself and holds it for the whole run. A
-ranked job that lands during the run waits on the lock. The run takes 10
-to 12 minutes on a fleet box. It boots one resident and digests the
-weights once. It then runs five legs per golden (one warm-up, four timed)
-for the eight pool goldens.
-Exit code 0 means the report is written. Exit code 4 means the CV gate
-refused: a golden's four legs differed by more than 1%. The refusal names
-the record, for example `beagle.json has decode sample CV 4.877`. Two of
-six fleet boxes refused on the first golden captured on the first run. A
-second run is a new run; report both.
+`--engine` is the path the candidate uses, relative to its own root: on this
+platform the adapter that `tools/stage-cuda-engine.sh` stages under
+`.build/release/`. benchd re-roots that same path into the reference tree.
 
-The report is `.build/calibration-runs/<timestamp>-calib/calibration.json`.
-`pinned_record` names the golden whose pair becomes the constant.
-`records[]` carries each golden's pair and CV. Six fleet boxes measured the
-pinned golden within 1.7% of the pinned constants on 2026-09-05.
+The verb runs the ranked path's own control leg four times and refuses by name
+(`CALIBRATION-CV-EXCEEDED`) when the box is too noisy for a mean to describe it.
+The file is a health band for the control leg, never a denominator.
+
+Export both names in the runner service environment. The full procedure, the
+refusal names and the file format are in
+[`qwen38-125b-a6b-baseline-capture.md`](qwen38-125b-a6b-baseline-capture.md).
 
 ## 14. Readiness checklist
 
 - [ ] CUDA 13 (`nvcc`), `cargo`, `cc`, `git`, `jq`, `python3`, `curl`, `sha256sum`, `nvidia-smi` on the runner's PATH
 - [ ] operator account in group `bench`; GPU lock root-owned, group `bench`, mode 0660, tmpfiles rule in place
 - [ ] five pinned snapshot files staged flat; `./setup.sh` verified them by bytes and sha256
-- [ ] operator engine checkout at the release-branch tip, from a bundle with a matching sha256, clean tree
+- [ ] operator engine checkout at the engine branch tip, from a bundle with a matching sha256, clean tree
 - [ ] benchd pair installed by `tools/fetch-benchd.sh` for `aarch64-unknown-linux-gnu`, manifest beside it
 - [ ] runner registered with label `<track id>` (the runner adds `self-hosted, Linux, ARM64`)
-- [ ] runner `.env` carries `MLXFAST_TARGET_SNAPSHOT_DIR`, `BENCHD_BIN_DIR`, the toolchain `PATH`, no `DS4_*` and no `MLXFAST_LOCAL_COOL_GATE`
+- [ ] runner `.env` carries `MLXFAST_TARGET_SNAPSHOT_DIR`, `BENCHD_BIN_DIR`, `MLXFAST_BASELINE_WORKSPACE`, `MLXFAST_BASELINE_CALIBRATION`, the toolchain `PATH`, no `DS4_*` and no `MLXFAST_LOCAL_COOL_GATE`
 - [ ] serve values derived from `tools/spec-declaration.sh`, not written by hand
 - [ ] correctness check under the lock: exit 0, `.metrics.passed_correctness` true
-- [ ] score check under the lock: `passed: true`, score in the band for the declaration (1.008 serial, 1.07 to 1.09 `mtp1`)
+- [ ] score check under the lock: `passed: true`; a serial declaration scores near 1.00, a depth declaration above it
 - [ ] runner service started after the checks; exactly one `Runner.Listener`; runner online
 - [ ] one `workflow_dispatch` of `benchmark.yml` passes end to end (one per fleet)
 
@@ -481,9 +454,8 @@ pinned golden within 1.7% of the pinned constants on 2026-09-05.
 | correctness check: `gate rejected (prefill): GPU is hot and not cooling down` with nothing else on the GPU | the loaded resident holds the die above the 50 C local gate on this box | `MLXFAST_LOCAL_COOL_GATE=0` for that local check only (step 10a); never in the runner `.env` |
 | `git clone` of the bundle: `fatal: early EOF` or `index-pack died` | the bundle was truncated in transit; `scp` over a relayed link can return 0 on a partial file | compare sha256 on both ends; copy again with `rsync --partial` or in chunks |
 | `git ls-remote` of the engine repository fails on the box | the box has no GitHub credential | expected; the operator checkout comes from a bundle; the ranked job uses the Actions token |
-| `fetch-benchd.sh`: "manifest sha256 is not 64 lowercase hex characters" | a hand-made `benchd.manifest.json` with a `binaries` entry split over lines | one entry per line, the channel's layout (step 13) |
-| `qwen4exp-calibrate.sh` exits 2: declared spec is not serial | the checkout declares a depth | calibrate on a checkout of `main` (step 13) |
-| `qwen4exp-calibrate.sh` exits 4: `CALIBRATION-CV-EXCEEDED` | one golden's four legs differed by more than 1% | a result, not a fault; a second run is a new run |
+| `fetch-benchd.sh`: "manifest sha256 is not 64 lowercase hex characters" | a hand-made `benchd.manifest.json` with a `binaries` entry split over lines | one entry per line, the channel's layout |
+| `benchd calibrate-baseline` refuses with `CALIBRATION-CV-EXCEEDED` | the four passes differed by more than 1% on one axis | a result, not a fault; find out why the box is noisy, then calibrate again |
 | runner offline; log says a session already exists | a second listener started by hand | stop it; let the service's listener reconnect |
 | preflight refuses an unpinned `*.json` in the pool directory | a non-pool golden placed beside the pool | move it out of the directory that `MLXFAST_QWEN38_GOLDEN_DIR` names |
 | a window stalls, GPU idle, two worker processes | a second connection waiting on the one-connection resident | one attached worker per window (benchd does this when `DS4_RESIDENT_SOCKET` is set) |

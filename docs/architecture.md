@@ -172,7 +172,7 @@ local-path override in `Package.swift` — the hard blocker), and split
 A new protocol server in a CUDA base image. Because the protocol is eight message
 kinds over stdio, the *reference* engine's stack is unconstrained — candle/Rust,
 C++, or a Python runtime are all legal; recommend starting with whatever reaches
-Qwen3.6 parity fastest and treating the container as the unit of pinning. Runs with
+parity with the MLX engine fastest and treating the container as the unit of pinning. Runs with
 `--network none`, read-only rootfs, weights as a read-only mount, `cap-drop ALL`,
 non-root, pids/memory limits, default seccomp.
 
@@ -356,10 +356,14 @@ confinement, process cap), the runtime worker runs under Seatbelt (ring 3), and
 Everything currently scattered across `MLXFastConstants`, `benchmark.yml` env,
 fixtures, and R2 key names becomes one signed `target.toml` per (model, platform):
 
+The bundle is a SKETCH. `targets/` holds only a README today, and the values below still live in
+`crates/bench-core/src/constants.rs` and the track fixtures. The model line is an illustration, not
+a live track.
+
 ```toml
-# qwen36-27b.m5.toml — sketch
-[model]      id = "mlx-community/Qwen3.6-27B-4bit"  revision = "c000ac2c…"
-             tensors = 1847  manifest = "sha256/reference_qwen3_6_27b_4bit.sha256"
+# a target bundle — sketch
+[model]      id = "<hf repo>"  revision = "<40 hex>"
+             tensors = <count>  manifest = "sha256/<reference manifest>"
 [engine]     kind = "tcp"  addr = "host.docker.internal:7331"   # or kind = "spawn"
              pin = { binary = "sha256:…", metallib = "sha256:…" }
 [baselines]  prefill_spt = …  decode_spt = …        # per-platform, recalibrated
@@ -370,8 +374,8 @@ fixtures, and R2 key names becomes one signed `target.toml` per (model, platform
 ```
 
 The CUDA target is the same schema with `provider = "nvml"` and its own recalibrated
-baselines. This also cleanly resolves the current Gemma/Qwen tangle: model identity,
-baselines, golden identity, and R2 keys travel together or not at all.
+baselines. Model identity, baselines, golden identity, and R2 keys then travel
+together or not at all.
 
 ---
 
@@ -560,9 +564,9 @@ changed the architecture; 5–6 confirmed it holds.
 > **STATUS: CLOSED as a live list.** Each item below has since been reconstructed,
 > ruled, or superseded — the operator contract was reconstructed and is now normative in
 > code (`crates/benchd/src/measure_job.rs`, `crates/bench-telemetry`); per-platform
-> baselines are settled by the per-track release-branch model
-> (`docs/track-release-branches.md`), which makes cross-track comparison a refused
-> operation rather than a caveat; and the CUDA-side items are carried by the CUDA parity
+> baselines are settled per `track_id` (`docs/track-release-branches.md`) — a track either
+> measures its own denominator on the box or stores one captured pair — which makes
+> cross-track comparison a refused operation rather than a caveat; and the CUDA-side items are carried by the CUDA parity
 > program against the ruled RTX PRO 6000 Blackwell box, not DGX Spark. Kept as the record
 > of what was uncertain and why.
 

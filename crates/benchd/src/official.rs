@@ -34,7 +34,7 @@
 use bench_core::conformance::{run_conformance, ConformanceReport, CorrectnessScope};
 use bench_core::constants::{AcceptanceBands, Platform};
 use bench_core::golden::GoldenFixture;
-use bench_core::score::evaluate_timed_run;
+use bench_core::score::{evaluate_timed_run, SpeedupFloors};
 use bench_protocol::SpecConfig;
 use bench_runner::{
     run_timed_benchmark_fresh_per_phase, run_timed_benchmark_persistent_on_session,
@@ -44,7 +44,7 @@ use bench_runner::{
 
 use crate::iterate::{
     apply_timing_metrics, base_metrics, finite_nonneg, first_conformance_failure, Mode, RunDigests,
-    SessionEngine,
+    ScoringInputs, SessionEngine,
 };
 use crate::score::{ScoreMetrics, ScorePayload};
 
@@ -366,8 +366,9 @@ where
     // reached only through [`official_core_windowed`] with [`WorkerResidency::PersistentWindow`].
     official_core_windowed(
         golden,
-        baseline_prefill_spt,
-        baseline_decode_spt,
+        // TEST-ONLY wrapper: the historical entry point scores against the no-contract default
+        // floors. The ranked entry points (main.rs) resolve theirs from the track fixture.
+        ScoringInputs::local(baseline_prefill_spt, baseline_decode_spt),
         bands,
         digests,
         commit,
@@ -566,8 +567,7 @@ where
 fn measure_candidate_window<T, FT, G>(
     golden: &GoldenFixture,
     benchmark: &bench_core::golden::BenchmarkGolden,
-    baseline_prefill_spt: f64,
-    baseline_decode_spt: f64,
+    scoring: ScoringInputs,
     digests: RunDigests<'_>,
     commit: &str,
     spawn_timed: &mut FT,
@@ -609,7 +609,7 @@ where
                 None,
                 None,
                 None,
-                (baseline_prefill_spt, baseline_decode_spt),
+                scoring,
             )));
         }
         Err(TimedWindowFailure::Warmup(e)) => {
@@ -623,7 +623,7 @@ where
                 None,
                 None,
                 None,
-                (baseline_prefill_spt, baseline_decode_spt),
+                scoring,
             )));
         }
         Err(TimedWindowFailure::Timed(RunnerError::TokenMismatch { label, step, .. })) => {
@@ -669,8 +669,7 @@ where
                 commit,
                 error,
                 first_failing_step,
-                baseline_prefill_spt,
-                baseline_decode_spt,
+                scoring,
             )));
         }
         Err(TimedWindowFailure::Timed(e)) => {
@@ -686,7 +685,7 @@ where
                 None,
                 None,
                 None,
-                (baseline_prefill_spt, baseline_decode_spt),
+                scoring,
             )));
         }
     };
@@ -705,8 +704,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub fn official_core_windowed<T, FT, FC, G>(
     golden: &GoldenFixture,
-    baseline_prefill_spt: f64,
-    baseline_decode_spt: f64,
+    scoring: ScoringInputs,
     bands: AcceptanceBands,
     digests: RunDigests<'_>,
     commit: &str,
@@ -738,7 +736,7 @@ where
                 None,
                 None,
                 None,
-                (baseline_prefill_spt, baseline_decode_spt),
+                scoring,
             )
         }
     };
@@ -752,8 +750,7 @@ where
     let (measured, held_session) = match measure_candidate_window(
         golden,
         benchmark,
-        baseline_prefill_spt,
-        baseline_decode_spt,
+        scoring,
         digests,
         commit,
         &mut spawn_timed,
@@ -769,7 +766,7 @@ where
     match residency {
         WorkerResidency::FreshPerPhase => finish_official(
             golden,
-            (baseline_prefill_spt, baseline_decode_spt),
+            scoring,
             bands,
             digests,
             commit,
@@ -785,7 +782,7 @@ where
             let mut held = held_session;
             finish_official(
                 golden,
-                (baseline_prefill_spt, baseline_decode_spt),
+                scoring,
                 bands,
                 digests,
                 commit,
@@ -934,6 +931,7 @@ fn paired_refusal(
     error: String,
     seal: PairedBaselineSeal<'_>,
     leg: Option<(f64, f64)>,
+    floors: SpeedupFloors,
 ) -> ScorePayload {
     let mut payload = official_failed(
         golden,
@@ -946,8 +944,13 @@ fn paired_refusal(
         None,
         None,
         // NO denominator was established, and none is invented: the pair a paired run seals is the
-        // pair it measured.
-        (0.0, 0.0),
+        // pair it measured. The FLOORS are still the track's — a refusal states the floors the run
+        // was armed with.
+        ScoringInputs {
+            baseline_prefill_spt: 0.0,
+            baseline_decode_spt: 0.0,
+            floors,
+        },
     );
     let mut seal = seal;
     seal.band_passed = false;
@@ -995,6 +998,10 @@ pub struct PairedWindow<G> {
     /// Pairs per scored run, from the pinned track fixture (`official_pairs`; David 2026-09-09
     /// ruled 2 on both platforms). Every pair is one serial-control leg then one candidate leg.
     pub pairs: usize,
+    /// The speedup floors this run enforces and seals, from the pinned track fixture
+    /// (`decode_speedup_floor` / `prefill_speedup_floor`; David 2026-09-09 ruled 0.95 / 0.95,
+    /// configurable per project). The fixture is the only source on the scored path.
+    pub floors: SpeedupFloors,
 }
 
 /// THE RANKED PAIRED PATH (David ruling 2026-09-08): two legs on one box in one job.
@@ -1056,6 +1063,7 @@ where
         platform,
         mut cool_gate,
         pairs,
+        floors,
     } = window;
     if pairs == 0 {
         return paired_refusal(
@@ -1066,6 +1074,7 @@ where
                 .to_string(),
             seal,
             None,
+            floors,
         );
     }
     let benchmark = match &golden.benchmark {
@@ -1078,6 +1087,7 @@ where
                 "benchmark golden file must contain a benchmark oracle".to_string(),
                 seal,
                 None,
+                floors,
             )
         }
     };
@@ -1095,7 +1105,10 @@ where
         let baseline_leg = match open_baseline_leg() {
             Ok(guard) => guard,
             Err(e) => {
-                return paired_refusal_with_records(golden, digests, commit, e, seal, None, records)
+                return with_measured_pairs(
+                    paired_refusal(golden, digests, commit, e, seal, None, floors),
+                    records,
+                )
             }
         };
         let control_result = run_serial_control_leg(
@@ -1109,7 +1122,10 @@ where
         let control = match control_result {
             Ok(t) => t,
             Err(e) => {
-                return paired_refusal_with_records(golden, digests, commit, e, seal, None, records)
+                return with_measured_pairs(
+                    paired_refusal(golden, digests, commit, e, seal, None, floors),
+                    records,
+                )
             }
         };
         let measured_leg = Some((
@@ -1125,26 +1141,16 @@ where
             } else {
                 e
             };
-            return paired_refusal_with_records(
-                golden,
-                digests,
-                commit,
-                e,
-                seal,
-                measured_leg,
+            return with_measured_pairs(
+                paired_refusal(golden, digests, commit, e, seal, measured_leg, floors),
                 records,
             );
         }
         let candidate_leg = match open_candidate_leg() {
             Ok(guard) => guard,
             Err(e) => {
-                return paired_refusal_with_records(
-                    golden,
-                    digests,
-                    commit,
-                    e,
-                    seal,
-                    measured_leg,
+                return with_measured_pairs(
+                    paired_refusal(golden, digests, commit, e, seal, measured_leg, floors),
                     records,
                 )
             }
@@ -1152,8 +1158,12 @@ where
         let (timing, session) = match measure_candidate_window(
             golden,
             benchmark,
-            control.prefill_seconds_per_token,
-            control.decode_seconds_per_token,
+            // THE LIVE DENOMINATOR: this pair's own control leg, with the track's floors.
+            ScoringInputs {
+                baseline_prefill_spt: control.prefill_seconds_per_token,
+                baseline_decode_spt: control.decode_seconds_per_token,
+                floors,
+            },
             digests,
             commit,
             &mut spawn_timed,
@@ -1197,11 +1207,18 @@ where
     // component. With ONE pair this is exactly the single-pair ratio.
     let (control_prefill, control_decode) = aggregate_control(&records);
     let candidate = aggregate_candidate(&candidate_timings);
+    // The scored run's inputs: the control legs' aggregate as the denominator, the track fixture's
+    // floors as the gate. One value, so the floors this run enforces are the floors it seals.
+    let paired_scoring = ScoringInputs {
+        baseline_prefill_spt: control_prefill,
+        baseline_decode_spt: control_decode,
+        floors,
+    };
 
     let mut payload = match residency {
         WorkerResidency::FreshPerPhase => finish_official(
             golden,
-            (control_prefill, control_decode),
+            paired_scoring,
             bands,
             digests,
             commit,
@@ -1212,7 +1229,7 @@ where
             let mut held = held_session;
             finish_official(
                 golden,
-                (control_prefill, control_decode),
+                paired_scoring,
                 bands,
                 digests,
                 commit,
@@ -1282,17 +1299,8 @@ fn aggregate_candidate(timings: &[TimingResult]) -> TimingResult {
     agg
 }
 
-/// [`paired_refusal`] that also seals the pairs already measured before the refusal.
-fn paired_refusal_with_records(
-    golden: &GoldenFixture,
-    digests: RunDigests<'_>,
-    commit: &str,
-    error: String,
-    seal: PairedBaselineSeal<'_>,
-    measured_leg: Option<(f64, f64)>,
-    records: Vec<PairedLegRecord>,
-) -> ScorePayload {
-    let mut payload = paired_refusal(golden, digests, commit, error, seal, measured_leg);
+/// A refusal that also seals the pairs already measured before it (`metrics.paired_legs`).
+fn with_measured_pairs(mut payload: ScorePayload, records: Vec<PairedLegRecord>) -> ScorePayload {
     payload.metrics.paired_legs = records;
     payload
 }
@@ -1303,7 +1311,7 @@ fn paired_refusal_with_records(
 /// in-band timings) and the orchestration (with a mock timed phase) are unit-testable.
 fn finish_official<T, FC>(
     golden: &GoldenFixture,
-    baselines: (f64, f64),
+    scoring: ScoringInputs,
     bands: AcceptanceBands,
     digests: RunDigests<'_>,
     commit: &str,
@@ -1314,7 +1322,7 @@ where
     T: LineTransport,
     FC: FnMut() -> bench_runner::Result<Session<T>>,
 {
-    let (baseline_prefill_spt, baseline_decode_spt) = baselines;
+    let (baseline_prefill_spt, baseline_decode_spt) = scoring.baselines();
     // 2. Official GATING, evaluated BEFORE correctness (Swift Score.swift:50-126,
     //    QwenRuntimeBenchmark.swift:513-558): non-finite score → floors (0.95) → acceptance
     //    bands (prefill ±5%, decode +2%/−5%). The FIRST failure reason (in that priority)
@@ -1325,6 +1333,10 @@ where
         baseline_decode_spt,
         baseline_prefill_spt,
         bands,
+        // THE RUN'S OWN FLOORS (David 2026-09-09), from the `--contract` track fixture. The same
+        // value seals `metrics.{decode,prefill}_speedup_floor` on every payload below, so the
+        // artifact states the floor this gate enforced.
+        scoring.floors,
     );
     if let Some(reason) = eval.first_failure_reason() {
         // RULING 2 (trusted-core, official path): this is the TIMED-band failure — non-finite
@@ -1333,15 +1345,7 @@ where
         // BLANKS the correctness-derived audit fields (golden_hash="", case_count=0,
         // checked_steps=0) to byte-match Swift's `correctness == nil` failed score. This is
         // DISTINCT from the correctness-failure path below, which is left unchanged.
-        return official_failed_timed_band(
-            golden,
-            digests,
-            commit,
-            reason,
-            timing,
-            baseline_prefill_spt,
-            baseline_decode_spt,
-        );
+        return official_failed_timed_band(golden, digests, commit, reason, timing, scoring);
     }
 
     // 3. CORRECTNESS on the THIRD fresh worker, FULL scope.
@@ -1364,8 +1368,7 @@ where
                 commit,
                 format!("correctness worker spawn failed: {e}"),
                 timing,
-                baseline_prefill_spt,
-                baseline_decode_spt,
+                scoring,
             )
         }
     };
@@ -1389,8 +1392,7 @@ where
                     commit,
                     format!("{e}"),
                     timing,
-                    baseline_prefill_spt,
-                    baseline_decode_spt,
+                    scoring,
                 )
             }
         }
@@ -1404,8 +1406,7 @@ where
             commit,
             format!("{e}"),
             timing,
-            baseline_prefill_spt,
-            baseline_decode_spt,
+            scoring,
         );
     }
 
@@ -1417,8 +1418,7 @@ where
             commit,
             error,
             timing,
-            baseline_prefill_spt,
-            baseline_decode_spt,
+            scoring,
             case,
             step,
             // OFFICIAL correctness failure leaves expected/actual NULL (Swift failedScore reads
@@ -1436,19 +1436,8 @@ where
 
     // 4. PASSING official score: the weighted-geometric-mean score (never coarsened),
     //    real timing surface, full correctness case counts, and the resolved commit.
-    let mut metrics = base_metrics(
-        Mode::Official,
-        golden,
-        digests,
-        baseline_prefill_spt,
-        baseline_decode_spt,
-    );
-    apply_timing_metrics(
-        &mut metrics,
-        timing,
-        baseline_prefill_spt,
-        baseline_decode_spt,
-    );
+    let mut metrics = base_metrics(Mode::Official, golden, digests, scoring);
+    apply_timing_metrics(&mut metrics, timing, scoring);
     seal_official_per_prompt(&mut metrics, golden, timing);
     metrics.passed_correctness = true;
     metrics.commit = commit.to_string();
@@ -1655,7 +1644,7 @@ pub fn author_sealed_commit(
 
 pub fn official_gates_only<T, FC>(
     golden: &GoldenFixture,
-    baselines: (f64, f64),
+    scoring: ScoringInputs,
     digests: RunDigests<'_>,
     commit: &str,
     mut spawn_correctness: FC,
@@ -1681,7 +1670,7 @@ where
         Err(e) => {
             return Ok(official_gates_failed(
                 golden,
-                baselines,
+                scoring,
                 digests,
                 commit,
                 GatesFailure::message(format!("correctness worker spawn failed: {e}")),
@@ -1704,7 +1693,7 @@ where
             Err(e) => {
                 return Ok(official_gates_failed(
                     golden,
-                    baselines,
+                    scoring,
                     digests,
                     commit,
                     GatesFailure::message(format!("{e}")),
@@ -1717,7 +1706,7 @@ where
     if let Err(e) = correctness_session.close_phase() {
         return Ok(official_gates_failed(
             golden,
-            baselines,
+            scoring,
             digests,
             commit,
             GatesFailure::message(format!("{e}")),
@@ -1728,7 +1717,7 @@ where
         let (case, step, error) = official_correctness_failure(&report);
         return Ok(official_gates_failed(
             golden,
-            baselines,
+            scoring,
             digests,
             commit,
             GatesFailure {
@@ -1747,7 +1736,7 @@ where
     // the gates-only branch (`QwenRuntimeBenchmark.swift@b26f76f:442-445` then `:457`). `baselines`
     // is that resolved pair, resolved ONCE in `official_gates_only` before anything spawned, and
     // `base_metrics` seals it.
-    let mut metrics = base_metrics(Mode::Official, golden, digests, baselines.0, baselines.1);
+    let mut metrics = base_metrics(Mode::Official, golden, digests, scoring);
     metrics.passed_correctness = true;
     metrics.partial_result = true;
     metrics.commit = commit.to_string();
@@ -1789,7 +1778,7 @@ impl GatesFailure {
 /// timing is retained (the timed phase never ran).
 fn official_gates_failed(
     golden: &GoldenFixture,
-    baselines: (f64, f64),
+    scoring: ScoringInputs,
     digests: RunDigests<'_>,
     commit: &str,
     failure: GatesFailure,
@@ -1797,7 +1786,7 @@ fn official_gates_failed(
     // #132/F-2 — `baselines` is the pair `official_gates_only` resolved before it spawned
     // anything; the reference's failure records in `benchmarkWithWorker` are all reached AFTER
     // the `:442-445` overwrite, so they carry the resolved pair too.
-    let mut metrics = base_metrics(Mode::Official, golden, digests, baselines.0, baselines.1);
+    let mut metrics = base_metrics(Mode::Official, golden, digests, scoring);
     metrics.passed_correctness = false;
     metrics.partial_result = true;
     metrics.commit = commit.to_string();
@@ -1834,9 +1823,9 @@ fn official_failed(
     first_failing_step: Option<i64>,
     expected_token: Option<i64>,
     actual_token: Option<i64>,
-    baselines: (f64, f64),
+    scoring: ScoringInputs,
 ) -> ScorePayload {
-    let mut metrics = base_metrics(Mode::Official, golden, digests, baselines.0, baselines.1);
+    let mut metrics = base_metrics(Mode::Official, golden, digests, scoring);
     metrics.passed_correctness = passed_correctness;
     metrics.commit = commit.to_string();
     // #134 — SEAL BOUNDARY (see `iterate::failed_payload`). Official is the MOST exposed sink:
@@ -1867,8 +1856,7 @@ fn official_failed_with_timing(
     commit: &str,
     error: String,
     timing: &TimingResult,
-    baseline_prefill_spt: f64,
-    baseline_decode_spt: f64,
+    scoring: ScoringInputs,
 ) -> ScorePayload {
     official_failed_with_timing_and_case(
         golden,
@@ -1876,8 +1864,7 @@ fn official_failed_with_timing(
         commit,
         error,
         timing,
-        baseline_prefill_spt,
-        baseline_decode_spt,
+        scoring,
         None,
         None,
         None,
@@ -1913,22 +1900,10 @@ fn official_failed_timed_band(
     commit: &str,
     error: String,
     timing: &TimingResult,
-    baseline_prefill_spt: f64,
-    baseline_decode_spt: f64,
+    scoring: ScoringInputs,
 ) -> ScorePayload {
-    let mut metrics = base_metrics(
-        Mode::Official,
-        golden,
-        digests,
-        baseline_prefill_spt,
-        baseline_decode_spt,
-    );
-    apply_timing_metrics(
-        &mut metrics,
-        timing,
-        baseline_prefill_spt,
-        baseline_decode_spt,
-    );
+    let mut metrics = base_metrics(Mode::Official, golden, digests, scoring);
+    apply_timing_metrics(&mut metrics, timing, scoring);
     seal_official_per_prompt(&mut metrics, golden, timing);
     metrics.passed_correctness = false;
     metrics.commit = commit.to_string();
@@ -1970,16 +1945,10 @@ fn official_failed_timed_oracle(
     commit: &str,
     error: String,
     first_failing_step: Option<i64>,
-    baseline_prefill_spt: f64,
-    baseline_decode_spt: f64,
+    scoring: ScoringInputs,
 ) -> ScorePayload {
-    let mut metrics = base_metrics(
-        Mode::Official,
-        golden,
-        digests,
-        baseline_prefill_spt,
-        baseline_decode_spt,
-    );
+    let (baseline_prefill_spt, baseline_decode_spt) = scoring.baselines();
+    let mut metrics = base_metrics(Mode::Official, golden, digests, scoring);
     metrics.passed_correctness = false;
     metrics.commit = commit.to_string();
     // #134 — SEAL BOUNDARY (see `iterate::failed_payload`). Official is the MOST exposed sink:
@@ -2014,27 +1983,15 @@ fn official_failed_with_timing_and_case(
     commit: &str,
     error: String,
     timing: &TimingResult,
-    baseline_prefill_spt: f64,
-    baseline_decode_spt: f64,
+    scoring: ScoringInputs,
     first_failing_case: Option<String>,
     first_failing_step: Option<i64>,
     expected_token: Option<i64>,
     actual_token: Option<i64>,
     checked_steps: i64,
 ) -> ScorePayload {
-    let mut metrics = base_metrics(
-        Mode::Official,
-        golden,
-        digests,
-        baseline_prefill_spt,
-        baseline_decode_spt,
-    );
-    apply_timing_metrics(
-        &mut metrics,
-        timing,
-        baseline_prefill_spt,
-        baseline_decode_spt,
-    );
+    let mut metrics = base_metrics(Mode::Official, golden, digests, scoring);
+    apply_timing_metrics(&mut metrics, timing, scoring);
     seal_official_per_prompt(&mut metrics, golden, timing);
     // A floor/band failure means correctness never ran (Swift returns before it); a
     // correctness failure means it ran and failed. Either way passed_correctness = false.
@@ -2183,7 +2140,7 @@ mod tests {
             None,
             None,
             None,
-            (
+            ScoringInputs::local(
                 TEST_BASELINE.prefill_seconds_per_token,
                 TEST_BASELINE.decode_seconds_per_token,
             ),
@@ -2302,7 +2259,7 @@ mod tests {
     {
         finish_official(
             golden,
-            (
+            ScoringInputs::local(
                 TEST_BASELINE.prefill_seconds_per_token,
                 TEST_BASELINE.decode_seconds_per_token,
             ),
@@ -2464,7 +2421,7 @@ mod tests {
             ));
         official_gates_only(
             golden,
-            (prefill, decode),
+            ScoringInputs::local(prefill, decode),
             RunDigests::for_test(&DirDigest::empty()),
             "deadbeef",
             || Session::connect(correctness()).map(|(s, _)| s),
@@ -2976,8 +2933,10 @@ mod tests {
         let phases: RefCell<Vec<String>> = RefCell::new(Vec::new());
         let _ = official_core_windowed(
             &golden,
-            TEST_BASELINE.prefill_seconds_per_token,
-            TEST_BASELINE.decode_seconds_per_token,
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
             TEST_BASELINE.bands,
             RunDigests::for_test(&DirDigest::empty()),
             "deadbeef",
@@ -2994,8 +2953,10 @@ mod tests {
         assert_eq!(phases.borrow().as_slice(), ["prefill", "decode"]);
         let refused = official_core_windowed(
             &golden,
-            TEST_BASELINE.prefill_seconds_per_token,
-            TEST_BASELINE.decode_seconds_per_token,
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
             TEST_BASELINE.bands,
             RunDigests::for_test(&DirDigest::empty()),
             "deadbeef",
@@ -3027,8 +2988,10 @@ mod tests {
         let corr_spawns = Cell::new(0usize);
         let payload = official_core_windowed(
             &golden,
-            TEST_BASELINE.prefill_seconds_per_token,
-            TEST_BASELINE.decode_seconds_per_token,
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
             TEST_BASELINE.bands,
             RunDigests::for_test(&DirDigest::empty()),
             "deadbeef",
@@ -3076,8 +3039,10 @@ mod tests {
         let timed_spawns = Cell::new(0usize);
         let payload = official_core_windowed(
             &golden,
-            TEST_BASELINE.prefill_seconds_per_token,
-            TEST_BASELINE.decode_seconds_per_token,
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
             TEST_BASELINE.bands,
             RunDigests::for_test(&DirDigest::empty()),
             "deadbeef",
@@ -3109,8 +3074,10 @@ mod tests {
         let spawn_n = Cell::new(0usize);
         let payload = official_core_windowed(
             &golden,
-            TEST_BASELINE.prefill_seconds_per_token,
-            TEST_BASELINE.decode_seconds_per_token,
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
             TEST_BASELINE.bands,
             RunDigests::for_test(&DirDigest::empty()),
             "deadbeef",
@@ -3153,8 +3120,10 @@ mod tests {
         let timed_spawns = Cell::new(0usize);
         let payload = official_core_windowed(
             &golden,
-            TEST_BASELINE.prefill_seconds_per_token,
-            TEST_BASELINE.decode_seconds_per_token,
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
             TEST_BASELINE.bands,
             RunDigests::for_test(&DirDigest::empty()),
             "deadbeef",
@@ -3369,7 +3338,7 @@ mod tests {
         timing.decode_seconds_per_token = TEST_BASELINE.decode_seconds_per_token * 1.10;
         let payload = finish_official(
             &golden,
-            (
+            ScoringInputs::local(
                 TEST_BASELINE.prefill_seconds_per_token,
                 TEST_BASELINE.decode_seconds_per_token,
             ),
@@ -3393,6 +3362,137 @@ mod tests {
         // Real timing retained (not blanked): the measured decode spt is carried through.
         assert!(payload.metrics.decode_seconds_per_token > 0.0);
         assert!(!payload.metrics.passed_correctness, "correctness never ran");
+    }
+
+    /// FLOOR-ONLY GATING BANDS: tolerances wide enough that no acceptance band can fail the run,
+    /// so a boundary run reads the SPEEDUP FLOOR and nothing else.
+    const FLOOR_ONLY_BANDS: AcceptanceBands = AcceptanceBands {
+        prefill_up_tolerance: 10.0,
+        prefill_down_tolerance: 0.99,
+        decode_up_tolerance: 10.0,
+        decode_down_tolerance: 0.99,
+        decode_down_enabled: false,
+    };
+
+    /// One boundary run through the official gate: the candidate's per-token times are POWERS OF
+    /// TWO and the denominator is that time scaled by the wanted speedup, so `baseline / candidate`
+    /// is EXACTLY the literal asked for (scaling by a power of two is exact in binary floating
+    /// point). Only the floors can fail the run.
+    fn floor_boundary_run(
+        golden: &GoldenFixture,
+        decode_speedup: f64,
+        prefill_speedup: f64,
+        floors: SpeedupFloors,
+    ) -> ScorePayload {
+        const CANDIDATE_DECODE_SPT: f64 = 0.125; // 2^-3
+        const CANDIDATE_PREFILL_SPT: f64 = 0.0078125; // 2^-7
+        let timing = TimingResult {
+            prefill_seconds_per_token: CANDIDATE_PREFILL_SPT,
+            decode_seconds_per_token: CANDIDATE_DECODE_SPT,
+            decode_steps: BENCHMARK_DECODE_STEPS,
+            prefill_prompt_tokens: BENCHMARK_PREFILL_PROMPT_TOKENS,
+            prefill_elapsed_seconds: CANDIDATE_PREFILL_SPT * 512.0,
+            decode_elapsed_seconds: CANDIDATE_DECODE_SPT * BENCHMARK_DECODE_STEPS as f64,
+            peak_ram_gb: 20.25,
+            effective_spec: None,
+            free_run_audit: Some(audit_for_test(vec![4, 4, 4, 5], 0, 0)),
+        };
+        finish_official(
+            golden,
+            ScoringInputs {
+                baseline_prefill_spt: CANDIDATE_PREFILL_SPT * prefill_speedup,
+                baseline_decode_spt: CANDIDATE_DECODE_SPT * decode_speedup,
+                floors,
+            },
+            FLOOR_ONLY_BANDS,
+            RunDigests::for_test(&DirDigest::empty()),
+            "deadbeef",
+            &timing,
+            || Session::connect(conformant_engine()).map(|(s, _)| s),
+        )
+    }
+
+    /// DAVID 2026-09-09 — THE FLOORS ARE THE TRACK'S, THEY ARE ENFORCED ON BOTH AXES, AND WHAT IS
+    /// SEALED IS WHAT WAS ENFORCED.
+    ///
+    /// Decode and prefill are gated separately at the boundary (0.949 refused, exactly 0.95
+    /// accepted), the refusal names the floor the run carried, and `metrics.*_speedup_floor` is
+    /// that same value on the passing and the failing payload alike.
+    ///
+    /// REVERT-PROOF: put `SCORE_*_SPEEDUP_FLOOR` back into the gate or the seal and the 0.90 arm
+    /// goes red; drop either axis and its own arm goes red.
+    #[test]
+    fn official_enforces_and_seals_the_contract_speedup_floors() {
+        let golden = official_golden(None);
+
+        // DECODE, one thousandth below the ruled floor: refused, and the message names 0.95.
+        let below = floor_boundary_run(&golden, 0.949, 1.0, SpeedupFloors::DEFAULT);
+        assert!(!below.passed);
+        assert!(below.score.is_none());
+        assert!(
+            below
+                .metrics
+                .error
+                .contains("decode_speedup=0.949000 floor=0.950000"),
+            "{}",
+            below.metrics.error
+        );
+        assert_eq!(below.metrics.decode_speedup_floor, 0.95);
+        assert_eq!(below.metrics.prefill_speedup_floor, 0.95);
+        assert!(!below.metrics.passed_decode_speedup_floor);
+        assert!(below.metrics.passed_prefill_speedup_floor);
+
+        // DECODE, exactly ON the floor: accepted (the gate is `>=`, not `>`).
+        let at = floor_boundary_run(&golden, 0.95, 1.0, SpeedupFloors::DEFAULT);
+        assert!(at.passed, "at the floor must pass: {}", at.metrics.error);
+        assert!(at.score.is_some());
+        assert!(at.metrics.passed_decode_speedup_floor);
+        assert_eq!(at.metrics.decode_speedup_floor, 0.95);
+
+        // PREFILL is a floor of its own: the same 0.949, on the other axis, refuses the run even
+        // with decode exactly at parity.
+        let prefill_below = floor_boundary_run(&golden, 1.0, 0.949, SpeedupFloors::DEFAULT);
+        assert!(!prefill_below.passed);
+        assert!(
+            prefill_below
+                .metrics
+                .error
+                .contains("prefill_speedup=0.949000 floor=0.950000"),
+            "{}",
+            prefill_below.metrics.error
+        );
+        assert!(!prefill_below.metrics.passed_prefill_speedup_floor);
+        assert!(prefill_below.metrics.passed_decode_speedup_floor);
+        assert!(floor_boundary_run(&golden, 1.0, 0.95, SpeedupFloors::DEFAULT).passed);
+
+        // PER PROJECT: a track whose fixture declares 0.90 is enforced at 0.90 and SEALS 0.90 —
+        // the constants are not consulted anywhere on this path.
+        let looser = SpeedupFloors {
+            decode: 0.90,
+            prefill: 0.90,
+        };
+        let ninety = floor_boundary_run(&golden, 0.949, 0.949, looser);
+        assert!(
+            ninety.passed,
+            "0.949 clears a 0.90 floor: {}",
+            ninety.metrics.error
+        );
+        assert_eq!(ninety.metrics.decode_speedup_floor, 0.90);
+        assert_eq!(ninety.metrics.prefill_speedup_floor, 0.90);
+        assert!(ninety.metrics.passed_decode_speedup_floor);
+        assert!(ninety.metrics.passed_prefill_speedup_floor);
+        // And that same fixture still refuses below ITS floor, naming ITS floor.
+        let under_ninety = floor_boundary_run(&golden, 0.899, 1.0, looser);
+        assert!(!under_ninety.passed);
+        assert!(
+            under_ninety
+                .metrics
+                .error
+                .contains("decode_speedup=0.899000 floor=0.900000"),
+            "{}",
+            under_ninety.metrics.error
+        );
+        assert_eq!(under_ninety.metrics.decode_speedup_floor, 0.90);
     }
 
     #[test]
@@ -3419,7 +3519,7 @@ mod tests {
         timing.decode_seconds_per_token = TEST_BASELINE.decode_seconds_per_token * 1.10;
         let payload = finish_official(
             &golden,
-            (
+            ScoringInputs::local(
                 TEST_BASELINE.prefill_seconds_per_token,
                 TEST_BASELINE.decode_seconds_per_token,
             ),
@@ -3586,7 +3686,7 @@ mod tests {
         let golden = official_golden(None);
         let failed = official_gates_failed(
             &golden,
-            (
+            ScoringInputs::local(
                 TEST_BASELINE.prefill_seconds_per_token,
                 TEST_BASELINE.decode_seconds_per_token,
             ),
@@ -3690,8 +3790,10 @@ mod tests {
         };
         official_core_windowed(
             golden,
-            TEST_BASELINE.prefill_seconds_per_token,
-            TEST_BASELINE.decode_seconds_per_token,
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
             TEST_BASELINE.bands,
             RunDigests::for_test(&DirDigest::empty()),
             "deadbeef",
@@ -3833,8 +3935,10 @@ mod tests {
         };
         let payload = official_core_windowed(
             &golden,
-            TEST_BASELINE.prefill_seconds_per_token,
-            TEST_BASELINE.decode_seconds_per_token,
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
             TEST_BASELINE.bands,
             RunDigests::for_test(&DirDigest::empty()),
             "deadbeef",
@@ -3905,8 +4009,10 @@ mod tests {
         };
         let payload = official_core_windowed(
             &golden,
-            TEST_BASELINE.prefill_seconds_per_token,
-            TEST_BASELINE.decode_seconds_per_token,
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
             TEST_BASELINE.bands,
             RunDigests::for_test(&DirDigest::empty()),
             "deadbeef",
@@ -4203,14 +4309,18 @@ mod tests {
             Mode::Official,
             &golden,
             RunDigests::for_test(&DirDigest::empty()),
-            TEST_BASELINE.prefill_seconds_per_token,
-            TEST_BASELINE.decode_seconds_per_token,
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
         );
         apply_timing_metrics(
             &mut metrics,
             &timing,
-            TEST_BASELINE.prefill_seconds_per_token,
-            TEST_BASELINE.decode_seconds_per_token,
+            ScoringInputs::local(
+                TEST_BASELINE.prefill_seconds_per_token,
+                TEST_BASELINE.decode_seconds_per_token,
+            ),
         );
         seal_official_per_prompt(&mut metrics, &golden, &timing);
         let sealed = ScorePayload {
@@ -4235,7 +4345,7 @@ mod tests {
         let golden = official_golden(None);
         let payload = official_gates_failed(
             &golden,
-            (
+            ScoringInputs::local(
                 TEST_BASELINE.prefill_seconds_per_token,
                 TEST_BASELINE.decode_seconds_per_token,
             ),
@@ -4325,6 +4435,8 @@ mod tests {
             platform: Platform::Mlx,
             cool_gate,
             pairs: 1,
+            // The tests drive the ruled floors; the per-project arms set their own.
+            floors: SpeedupFloors::DEFAULT,
         }
     }
 
@@ -4944,7 +5056,7 @@ mod tests {
         candidate.decode_seconds_per_token = control.decode_seconds_per_token;
         let mut payload = finish_official(
             &golden,
-            (
+            ScoringInputs::local(
                 control.prefill_seconds_per_token,
                 control.decode_seconds_per_token,
             ),

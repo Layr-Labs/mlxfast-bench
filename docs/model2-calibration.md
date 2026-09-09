@@ -1,5 +1,11 @@
 # Model-2 New-Series Calibration Plan
 
+**Track: `qwen3.8-27b-mtp-v1`.** This page governs the decode-only paired flow that
+`benchd measure-job` drives, and every number on it — the `0.90` floor, the `5.0` ceiling, the
+`8.0` per-pair bound, the teacher-forced and free-run series tags — belongs to that track. The
+Qwen 3.8 125B-A6B tracks score on the paired per-box path and read none of it; see
+[`qwen38-125b-a6b-baseline-capture.md`](qwen38-125b-a6b-baseline-capture.md).
+
 Status: IMPLEMENTED. Cycle-4 item 4. The mechanisms specified here are live in
 `crates/benchd/src/measure_job.rs` — the series fence, the native-vs-model-2 segregation
 rule (§1), and the series-scoped band gate (§3a) are all enforced in code and cite this

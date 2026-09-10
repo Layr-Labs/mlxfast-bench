@@ -1,12 +1,12 @@
 {
   "version": "0.0.0",
   "branch": "qwen3.8-125b-a6b-v1",
-  "source_commit": "ff999e37e33001634e85d447e1dbfbe6d17abf45",
+  "source_commit": "25540a86adb1c18b919454fcf90e3fc4bafc7cb7",
   "target_triple": "aarch64-apple-darwin",
-  "sha256": "d3b1e9a8c6e8a5f8d3cc06ac8e1280119c6887bf4a9bde6ff15001ef5e5e03af",
+  "sha256": "4852fba054eb50a480506b9da44aedcb6eb9a2bb7ceb438c0c689a05adea9adf",
   "bytes": 3117104,
   "binaries": {
-    "benchd": {"sha256": "d3b1e9a8c6e8a5f8d3cc06ac8e1280119c6887bf4a9bde6ff15001ef5e5e03af", "bytes": 3117104},
-    "record-correctness-golden": {"sha256": "cf6bd3334f4a022312a180cda1c6db575a3427925f69e81e4e8ef023b099da34", "bytes": 1415072}
+    "benchd": {"sha256": "4852fba054eb50a480506b9da44aedcb6eb9a2bb7ceb438c0c689a05adea9adf", "bytes": 3117104},
+    "record-correctness-golden": {"sha256": "d9e9262659cf460a702a97abcb3d3fc3198b3f0a36008ccac9c06121d11ff390", "bytes": 1415072}
   }
 }

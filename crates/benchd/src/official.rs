@@ -3372,6 +3372,7 @@ mod tests {
         decode_up_tolerance: 10.0,
         decode_down_tolerance: 0.99,
         decode_down_enabled: false,
+        prefill_down_enabled: false,
     };
 
     /// One boundary run through the official gate: the candidate's per-token times are POWERS OF

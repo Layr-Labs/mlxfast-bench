@@ -106,6 +106,12 @@ pub struct AcceptanceBands {
     /// decode axis needs. When `false`, [`crate::score::evaluate_timed_run`]/`check` skip the
     /// decode lower-bound test and keep the decode UP bound. `decode_down_tolerance` is then inert.
     pub decode_down_enabled: bool,
+    /// Whether the prefill band enforces its LOWER bound. `false` on the paired design: the
+    /// serial-control leg is measured live in the same run and carries its own health band
+    /// (`benchd::baseline::check_band`), so a candidate prefill far below the control's is a
+    /// faster engine, not a lottery, and the -tolerance% "improvement too large" guard would refuse
+    /// exactly the submissions the track exists to reward. The prefill UP bound stays.
+    pub prefill_down_enabled: bool,
 }
 
 /// The official serial baseline for the LOCAL-ITERATE / OFFICIAL scoring denominator
@@ -170,6 +176,7 @@ pub const MTP_SINGLE_LEG_BANDS: AcceptanceBands = AcceptanceBands {
     decode_up_tolerance: 0.02,
     decode_down_tolerance: 0.05,
     decode_down_enabled: false,
+    prefill_down_enabled: false,
 };
 
 /// The tracks whose ranked run measures its OWN denominator: a SERIAL-CONTROL LEG on the
@@ -354,6 +361,7 @@ pub const LEGACY_TWO_SIDED_BANDS: AcceptanceBands = AcceptanceBands {
     decode_up_tolerance: DECODE_BAND_UP_TOLERANCE,
     decode_down_tolerance: DECODE_BAND_DOWN_TOLERANCE,
     decode_down_enabled: true,
+    prefill_down_enabled: true,
 };
 
 /// The EXACT-MATCH name of the state "this track has no captured official baseline". It is a

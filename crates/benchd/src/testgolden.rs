@@ -31,6 +31,7 @@ pub const TEST_BASELINE: OfficialBaseline = OfficialBaseline {
         decode_up_tolerance: 0.01,
         decode_down_tolerance: 0.025,
         decode_down_enabled: true,
+        prefill_down_enabled: true,
     },
 };
 use bench_core::golden::{load_golden_fixture, GoldenFixture};

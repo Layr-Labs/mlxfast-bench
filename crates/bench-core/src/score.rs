@@ -285,15 +285,17 @@ pub fn evaluate_timed_run(
     );
     let decode_speedup = speedup(baseline_decode_spt, decode_spt);
     let prefill_speedup = speedup(baseline_prefill_spt, prefill_spt);
-    // Prefill is ALWAYS two-sided (±tolerance symmetric health gate). The decode LOWER bound is
-    // conditional: the MTP timed leg disables it (`decode_down_enabled == false`), leaving only the
-    // decode UP bound and the 0.95 decode speedup floor as guards.
+    // Each LOWER bound is conditional. The MTP timed leg disables decode's
+    // (`decode_down_enabled == false`); the paired design disables prefill's too
+    // (`prefill_down_enabled == false`), because the control leg is measured live and carries its
+    // own health band, so a candidate far faster than the control is the point, not a lottery.
+    // The UP bounds and the speedup floors remain the guards.
     let prefill_band = check(
         prefill_spt,
         baseline_prefill_spt,
         bands.prefill_up_tolerance,
         bands.prefill_down_tolerance,
-        true,
+        bands.prefill_down_enabled,
         "prefill",
     );
     let decode_band = check(
@@ -740,7 +742,62 @@ prefill_speedup=0.800000 floor=0.950000"
         decode_up_tolerance: 0.01,
         decode_down_tolerance: 0.025,
         decode_down_enabled: true,
+        prefill_down_enabled: true,
     };
+
+    /// PAIRED DESIGN: a candidate prefill 13% faster than the live serial control passes the
+    /// prefill band when the lower bound is disabled (`prefill_down_enabled == false`), and is
+    /// refused as "improvement too large" by the same evaluation with the bound on. The UP bound
+    /// and the floors are unchanged either way.
+    #[test]
+    fn evaluate_timed_run_prefill_lower_bound_disabled_accepts_large_prefill_gain() {
+        let control_decode = 0.0661;
+        let control_prefill = 0.0022372;
+        let candidate_prefill = 0.0019238; // the refused 2026-09-10 measurement: -14%
+        let paired = AcceptanceBands {
+            prefill_down_enabled: false,
+            decode_down_enabled: false,
+            ..TEST_BANDS
+        };
+        let e = evaluate_timed_run(
+            control_decode * 0.85,
+            candidate_prefill,
+            control_decode,
+            control_prefill,
+            paired,
+            SpeedupFloors::DEFAULT,
+        );
+        assert!(e.prefill_band.passed, "{}", e.prefill_band.reason);
+        assert!(e.passes_acceptance_bands());
+        assert!(e.passes_floors);
+        let two_sided = evaluate_timed_run(
+            control_decode * 0.85,
+            candidate_prefill,
+            control_decode,
+            control_prefill,
+            AcceptanceBands {
+                decode_down_enabled: false,
+                ..TEST_BANDS
+            },
+            SpeedupFloors::DEFAULT,
+        );
+        assert!(!two_sided.prefill_band.passed);
+        assert!(two_sided
+            .prefill_band
+            .reason
+            .contains("improvement too large"));
+        // A prefill slowdown past the UP bound is still refused with the lower bound off.
+        let slow = evaluate_timed_run(
+            control_decode * 0.85,
+            control_prefill * 1.04,
+            control_decode,
+            control_prefill,
+            paired,
+            SpeedupFloors::DEFAULT,
+        );
+        assert!(!slow.prefill_band.passed);
+        assert!(slow.prefill_band.reason.contains("slowdown/regression"));
+    }
 
     #[test]
     fn evaluate_timed_run_all_pass() {

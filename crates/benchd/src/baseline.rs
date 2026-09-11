@@ -295,23 +295,25 @@ impl BaselineCalibration {
         Ok(())
     }
 
-    /// The HEALTH GATE on the serial-control leg: `mean * low <= measured <= mean * high` on BOTH
-    /// axes. Nothing here reaches the score — a leg inside the band is scored by its own measured
-    /// value, and a leg outside it seals no score at all.
+    /// The HEALTH GATE on the serial-control leg: `measured <= mean * high` on both axes. It is
+    /// regression detection only: a control leg SLOWER than the band says the box is not well
+    /// (thermal, contention, a wrong tree) and the run seals no score. A leg FASTER than its
+    /// calibration is a well box and passes; the candidate is scored against that same live leg,
+    /// so a fast box hands the candidate nothing. `*_band_low` is recorded by the calibrator and
+    /// never read here. Nothing here reaches the score — a leg inside the band is scored by its
+    /// own measured value.
     pub fn check_band(&self, prefill_spt: f64, decode_spt: f64) -> Result<(), String> {
-        for (axis, measured, mean, low, high) in [
+        for (axis, measured, mean, high) in [
             (
                 "prefill",
                 prefill_spt,
                 self.prefill_seconds_per_token_mean,
-                self.prefill_band_low,
                 self.prefill_band_high,
             ),
             (
                 "decode",
                 decode_spt,
                 self.decode_seconds_per_token_mean,
-                self.decode_band_low,
                 self.decode_band_high,
             ),
         ] {
@@ -322,13 +324,13 @@ impl BaselineCalibration {
                      finite positive number"
                 ));
             }
-            let (lo, hi) = (mean * low, mean * high);
-            if measured < lo || measured > hi {
+            let hi = mean * high;
+            if measured > hi {
                 return Err(format!(
                     "{SERIAL_CONTROL_LEG_OUTSIDE_BAND}: serial-control leg outside this box's \
                      band: the {axis} leg measured {measured} seconds per token, and box {:?} is \
-                     calibrated at {mean} with a band of [{lo}, {hi}] ([{low}, {high}] of the \
-                     mean); refusing to seal a score",
+                     calibrated at {mean} with a ceiling of {hi} ({high} of the mean); the box \
+                     is slower than when it was calibrated; refusing to seal a score",
                     self.box_name
                 ));
             }
@@ -958,23 +960,27 @@ mod tests {
     }
 
     #[test]
-    fn the_band_check_holds_on_both_axes_and_in_both_directions() {
+    fn the_band_check_refuses_only_a_slower_leg_on_either_axis() {
         let cal = parse(&valid_document()).unwrap();
         let (p, d) = (
             cal.prefill_seconds_per_token_mean,
             cal.decode_seconds_per_token_mean,
         );
-        // Dead centre, and each edge of each band, are INSIDE.
+        // Dead centre and the ceiling of each band are INSIDE.
         assert!(cal.check_band(p, d).is_ok());
-        assert!(cal.check_band(p * 0.95, d * 0.98).is_ok());
         assert!(cal.check_band(p * 1.05, d * 1.02).is_ok());
+        // A FASTER leg is a well box: below `*_band_low`, and far below it, both pass. The
+        // low bound is recorded, never read.
+        assert!(cal.check_band(p * 0.95, d * 0.98).is_ok());
+        assert!(cal.check_band(p * 0.9, d).is_ok());
+        assert!(cal.check_band(p, d * 0.9).is_ok());
+        assert!(cal.check_band(p * 0.5, d * 0.5).is_ok());
 
-        // Outside, on each axis, in each direction.
+        // A SLOWER leg, on either axis, refuses by name.
         for (label, prefill, decode) in [
-            ("prefill low", p * 0.9, d),
             ("prefill high", p * 1.1, d),
-            ("decode low", p, d * 0.9),
             ("decode high", p, d * 1.1),
+            ("decode just over", p, d * 1.0201),
         ] {
             let err = cal.check_band(prefill, decode).unwrap_err();
             assert!(

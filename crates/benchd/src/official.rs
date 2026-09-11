@@ -4398,10 +4398,12 @@ mod tests {
 
     /// A calibration the mock's measurement can never satisfy: a mean of one second per token with
     /// the shipped band literals.
+    /// A calibration every real leg is SLOWER than: means of a nanosecond per token, so the
+    /// control leg lands above the band's ceiling and the health gate refuses.
     fn narrow_calibration() -> crate::baseline::BaselineCalibration {
         crate::baseline::BaselineCalibration {
-            prefill_seconds_per_token_mean: 1.0,
-            decode_seconds_per_token_mean: 1.0,
+            prefill_seconds_per_token_mean: 1e-9,
+            decode_seconds_per_token_mean: 1e-9,
             prefill_band_low: crate::baseline::DEFAULT_PREFILL_BAND_LOW,
             prefill_band_high: crate::baseline::DEFAULT_PREFILL_BAND_HIGH,
             decode_band_low: crate::baseline::DEFAULT_DECODE_BAND_LOW,

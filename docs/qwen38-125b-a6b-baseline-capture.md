@@ -32,9 +32,10 @@ on its own. The score is the live ratio of those aggregates:
 ```
 
 The speedup floors and the acceptance bands do not change. The band shape is
-prefill +/-5 % symmetric, decode +2 % up, with the decode down band DISABLED.
-What changed is the reference the shape is applied to. It is a live measurement,
-not a stored pair.
+prefill +5 % up, decode +2 % up. The down bands are DISABLED on both axes: a
+control leg faster than its calibration is a well box and passes. What changed
+is the reference the shape is applied to. It is a live measurement, not a
+stored pair.
 
 Leg 1 runs the reference tree's OWN engine and the reference tree's OWN weights.
 benchd finds both by re-rooting the candidate's own root-relative path into the
@@ -49,8 +50,13 @@ can reach it.
 
 The calibration file is a HEALTH BAND for leg 1 only. It says what a control leg
 costs on this box when the box is well. A ranked run compares its measured
-control leg against that band, and refuses the run when the leg falls outside
-it. No number in the file is ever a denominator.
+control leg against that band, and refuses the run when the leg is SLOWER than
+the band's ceiling (`mean * band_high` on either axis). This is regression
+detection only: a slow control leg means the box is not well. A control leg
+faster than the calibration passes; the candidate is scored against that same
+live leg, so a fast box hands the candidate nothing. The `*_band_low` values are
+recorded by the calibrator and never read. No number in the file is ever a
+denominator.
 
 Each ranked box carries its own file. A file captured on another box is refused
 by name.
@@ -245,7 +251,7 @@ inherited socket is used as before.
 | `CONTROL-GOLDEN-PROMPT-MISMATCH` | `--control-golden` names another prompt than `--golden` |
 | `CONTROL-GOLDEN-WITHOUT-PAIRED-PATH` | `--control-golden` was given on a run that measures no control leg |
 | `SERIAL-CONTROL-LEG-FAILED` | the control leg did not complete |
-| `SERIAL-CONTROL-LEG-OUTSIDE-BAND` | the control leg is outside this box's band |
+| `SERIAL-CONTROL-LEG-OUTSIDE-BAND` | the control leg is slower than this box's band ceiling |
 | `GOLDEN-CARRIES-STORED-BASELINE` | the golden still declares a baseline pair |
 | `STORED-BASELINE-OVERRIDE-REFUSED` | `MLXFAST_PAIRED_BASELINE_*` or `--baseline-*` reached the ranked path |
 | `CALIBRATION-CV-EXCEEDED` | the calibration passes vary by more than 1 % |
